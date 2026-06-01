@@ -74,6 +74,9 @@
 "UPLOAD_CUSTOM_VOICE_OPTION_TITLE" = "音声ツイート";
 "UPLOAD_CUSTOM_VOICE_OPTION_DETAIL_TITLE" = "音声ツイートをオンまたはオフにします (iOS のみ)。";
 
+"AUTO_STREAM_TIMELINE_OPTION_TITLE" = "TL自動更新（垂れ流し）";
+"AUTO_STREAM_TIMELINE_OPTION_DETAIL_TITLE" = "タイムラインの先頭にいる間、新着ツイートを自動で読み込み続けます。フォロー中タブで最も効果的です。";
+
 "HIDE_TOPICS_OPTION_TITLE" = "トピックツイートを非表示";
 "HIDE_TOPICS_OPTION_DETAIL_TITLE" = "「おすすめトピック」に関連付けられたツイートを非表示にします。";
 

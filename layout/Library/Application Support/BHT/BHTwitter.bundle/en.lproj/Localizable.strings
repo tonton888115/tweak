@@ -74,6 +74,9 @@
 "UPLOAD_CUSTOM_VOICE_OPTION_TITLE" = "Voice Tweets";
 "UPLOAD_CUSTOM_VOICE_OPTION_DETAIL_TITLE" = "Turn Voice Tweets on or off (iOS only).";
 
+"AUTO_STREAM_TIMELINE_OPTION_TITLE" = "Auto-refresh timeline (streaming)";
+"AUTO_STREAM_TIMELINE_OPTION_DETAIL_TITLE" = "Automatically loads new Tweets while you stay at the top of the timeline, like a live stream. Works best on the Following tab.";
+
 "HIDE_TOPICS_OPTION_TITLE" = "No topic Tweets";
 "HIDE_TOPICS_OPTION_DETAIL_TITLE" = "Remove Tweets tied to suggested topics.";
 

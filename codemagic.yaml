@@ -1,0 +1,66 @@
+# codemagic.yaml — builds the NeoFreeBird (BHTwitter) tweak on Codemagic's macOS runner.
+#
+# Output: a .deb that contains the freshly-built Frameworks/BHTwitter.dylib and the
+# updated BHTwitter.bundle (with the new "TL auto-refresh / 垂れ流し" strings).
+# The existing NeoFreeBird IPA already loads @rpath/BHTwitter.dylib by name, so the
+# dylib from this build can simply be swapped into the IPA — no decrypted Twitter IPA
+# and no re-injection required.
+#
+# One-time setup in the Codemagic dashboard:
+#   1. Add YOUR fork of NeoFreeBird/tweak as the app (Codemagic needs push/read access).
+#   2. Nothing to sign — this workflow only compiles the tweak.
+#   3. Run the "build-neofreebird-tweak" workflow; grab the .deb from artifacts (also
+#      emailed on success).
+
+workflows:
+  build-neofreebird-tweak:
+    name: Build NeoFreeBird tweak (dylib)
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    environment:
+      vars:
+        THEOS: $CM_BUILD_DIR/theos
+        SDK_VERSION: "16.5"     # iOS SDK pulled for Theos
+        TARGET_VERSION: "14.0"  # minimum iOS, matches the repo Makefile
+    scripts:
+      - name: Install build tools
+        script: |
+          set -e
+          brew install make dpkg ldid xz
+          # Theos wants GNU make on PATH ahead of the macOS default.
+          echo "PATH=$(brew --prefix make)/libexec/gnubin:$PATH" >> $CM_ENV
+      - name: Fetch Theos
+        script: |
+          set -e
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+      - name: Fetch iOS SDK
+        script: |
+          set -e
+          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks.git sdks
+          cd sdks
+          git sparse-checkout set --no-cone "iPhoneOS${SDK_VERSION}.sdk"
+          git checkout
+          mv ./*.sdk "$THEOS/sdks/"
+      - name: Build tweak (.deb)
+        script: |
+          set -e
+          # Keep the Makefile target in sync with the SDK we fetched above.
+          sed -i '' "s/^TARGET.*/TARGET := iphone:clang:${SDK_VERSION}:${TARGET_VERSION}/" Makefile
+          make clean || true
+          make package FINALPACKAGE=1
+          mkdir -p out
+          cp packages/*.deb out/
+          # Also drop the bare dylib next to it for convenience.
+          dpkg-deb -x packages/*.deb out/debroot
+          find out/debroot -name "BHTwitter.dylib" -exec cp {} out/ \;
+          echo "=== Build artifacts ===" && ls -lh out
+    artifacts:
+      - out/*.deb
+      - out/BHTwitter.dylib
+    publishing:
+      email:
+        recipients:
+          - rinngo0626@gmail.com
+        notify:
+          success: true
+          failure: true

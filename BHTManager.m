@@ -383,5 +383,16 @@
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"disable_xchat"];
 }
 
+// Streaming timeline (native auto-refresh / 垂れ流し)
++ (BOOL)autoStreamTimeline {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"auto_stream_timeline"];
+}
++ (NSInteger)autoStreamInterval {
+    // Seconds between auto-refreshes. Default 20s; floor 10s to stay clear of
+    // X's timeline rate limits.
+    NSInteger seconds = [[NSUserDefaults standardUserDefaults] integerForKey:@"auto_stream_interval"];
+    return seconds >= 10 ? seconds : 20;
+}
+
 @end
 

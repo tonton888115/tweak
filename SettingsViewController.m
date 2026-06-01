@@ -396,6 +396,8 @@ PSSpecifier *photosVideosSection = [self newSectionWithTitle:[[BHTBundle sharedB
 
         PSSpecifier *customVoice = [self newSwitchCellWithTitle:[[BHTBundle sharedBundle] localizedStringForKey:@"UPLOAD_CUSTOM_VOICE_OPTION_TITLE"] detailTitle:[[BHTBundle sharedBundle] localizedStringForKey:@"UPLOAD_CUSTOM_VOICE_OPTION_DETAIL_TITLE"] key:@"custom_voice_upload" defaultValue:true changeAction:nil];
 
+        PSSpecifier *streamTimeline = [self newSwitchCellWithTitle:[[BHTBundle sharedBundle] localizedStringForKey:@"AUTO_STREAM_TIMELINE_OPTION_TITLE"] detailTitle:[[BHTBundle sharedBundle] localizedStringForKey:@"AUTO_STREAM_TIMELINE_OPTION_DETAIL_TITLE"] key:@"auto_stream_timeline" defaultValue:false changeAction:nil];
+
         PSSpecifier *hideTopics = [self newSwitchCellWithTitle:[[BHTBundle sharedBundle] localizedStringForKey:@"HIDE_TOPICS_OPTION_TITLE"] detailTitle:[[BHTBundle sharedBundle] localizedStringForKey:@"HIDE_TOPICS_OPTION_DETAIL_TITLE"] key:@"hide_topics" defaultValue:false changeAction:nil];
 
         PSSpecifier *hideTopicsToFollow = [self newSwitchCellWithTitle:[[BHTBundle sharedBundle] localizedStringForKey:@"HIDE_TOPICS_TO_FOLLOW_OPTION"] detailTitle:[[BHTBundle sharedBundle] localizedStringForKey:@"HIDE_TOPICS_TO_FOLLOW_OPTION_DETAIL_TITLE"] key:@"hide_topics_to_follow" defaultValue:false changeAction:nil];
@@ -579,6 +581,7 @@ PSSpecifier *photosVideosSection = [self newSectionWithTitle:[[BHTBundle sharedB
 
 
             mainSection, // 0
+            streamTimeline,
             customVoice,
             hideTopics,
             hideTopicsToFollow,
