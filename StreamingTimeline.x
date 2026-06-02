@@ -22,6 +22,14 @@ static void nfb_streamStop(UIViewController *vc);
 static void nfb_installButton(UIWindow *win);
 static void nfb_removeButton(void);
 
+// Minimal bases so `self.view` resolves; everything else goes through objc_msgSend.
+@interface THFHomeTimelineContainerViewController : UIViewController
+@end
+@interface THFHomeTimelineItemsViewController : UIViewController
+@end
+@interface T1HomeTimelineItemsViewController : UIViewController
+@end
+
 #pragma mark - refresh callers (no signature assumptions)
 
 static BOOL nfb_resp(id o, SEL s) { return o && [o respondsToSelector:s]; }
