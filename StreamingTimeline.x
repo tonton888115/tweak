@@ -23,6 +23,8 @@ static void nfb_streamStart(UIViewController *vc);
 static void nfb_streamStop(UIViewController *vc);
 static void nfb_installButton(UIWindow *win);
 static void nfb_removeButton(void);
+static UIViewController *nfb_selectedTimelineVC(UIViewController *vc);
+static void nfb_streamTrigger(UIViewController *vc);
 
 // Minimal bases so `self.view` resolves; everything else goes through objc_msgSend.
 @interface THFHomeTimelineContainerViewController : UIViewController
@@ -271,6 +273,19 @@ static id nfb_findResponder(UIViewController *vc, SEL sel, int depth) {
     }
     return nil;
 }
+
+static id nfb_findLeafResponder(UIViewController *vc, SEL sel, int depth) {
+    if (!vc || depth > 7) return nil;
+    for (UIViewController *c in vc.childViewControllers.reverseObjectEnumerator) {
+        id r = nfb_findLeafResponder(c, sel, depth + 1);
+        if (r) return r;
+    }
+    id tl = nfb_timelineOf(vc);
+    if (tl && [tl respondsToSelector:sel]) return tl;
+    if ([vc respondsToSelector:sel]) return vc;
+    return nil;
+}
+
 static id nfb_findHomeResponder(UIViewController *startVC, SEL sel) {
     id near = nfb_findResponder(startVC, sel, 0);
     if (near) return near;
@@ -458,10 +473,15 @@ static void nfb_revealTopAfterRefresh(UIViewController *vc) {
     __weak UIViewController *wvc = vc;
     void (^reveal)(void) = ^{
         UIViewController *s = wvc;
-        if (!s || s != gActiveItemsVC || ![s isViewLoaded] || s.view.window == nil) return;
+        if (!s || ![s isViewLoaded] || s.view.window == nil) return;
+        UIViewController *active = gActiveItemsVC;
+        if (active && s != active) {
+            UIViewController *selected = nfb_selectedTimelineVC(active);
+            if (s != selected) return;
+        }
         UIScrollView *sv = nfb_mainScrollViewOf(s);
         if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) return;
-        nfb_tapHomeTabLikeUser();
+        if (s == gActiveItemsVC) nfb_tapHomeTabLikeUser();
         nfb_scrollToTop(s, YES);
     };
     reveal();
@@ -537,6 +557,7 @@ static UIViewController *nfb_selectedTimelineVC(UIViewController *vc) {
 static void nfb_streamTrigger(UIViewController *vc) {
     // Refresh whatever timeline is actually on screen, not just the home items VC.
     UIViewController *target = nfb_selectedTimelineVC(vc) ?: vc;
+    if (nfb_isRecommendedHomeTimeline(target)) return;
 
     BOOL readingAway = nfb_isReadingAwayFromTop(target);
     if (!readingAway) {
@@ -544,29 +565,35 @@ static void nfb_streamTrigger(UIViewController *vc) {
         nfb_scrollToTop(target, NO);
     }
 
-    // Resolve the refresh entry point inside the TARGET's own subtree only, so a list
-    // refreshes itself (loadTop:) rather than the home timeline. For You/Following find
-    // refreshWithSource: on their TFNTwitterHomeTimeline; pinned lists find loadTop:.
-    id ctrlVC = nfb_findResponder(target, @selector(pullToLoadTopControl), 0);
+    // Resolve the refresh entry point inside the TARGET's own subtree only. Pinned
+    // timelines wrap the real URT controller, so prefer leaf responders for pull/loadTop.
+    id ctrlVC = nfb_findLeafResponder(target, @selector(pullToLoadTopControl), 0);
     id pullCtrl = ctrlVC ? ((id(*)(id, SEL))objc_msgSend)(ctrlVC, @selector(pullToLoadTopControl)) : nil;
 
     BOOL did = NO;
     id r;
+    // Following's clean path: refresh the TFNTwitterHomeTimeline directly.
     if (!did && (r = nfb_findResponder(target, @selector(refreshWithSource:completion:), 0))) {
         void (^completion)(void) = ^{};
         ((void(*)(id, SEL, NSInteger, id))objc_msgSend)(r, @selector(refreshWithSource:completion:), nfb_streamLoadSourceFromSender(pullCtrl), completion);
         did = YES;
     }
-    if (!did && (r = nfb_findResponder(target, @selector(loadTop:), 0))) {
-        ((void(*)(id, SEL, id))objc_msgSend)(r, @selector(loadTop:), pullCtrl);
-        did = YES;
-    }
-    if (!did && (r = nfb_findResponder(target, @selector(_tfn_dynamic_didPullToLoadTop:), 0))) {
+    // Pinned lists: the parent PinnedTimelineViewController also advertises loadTop:
+    // but can be a wrapper. The child T1URTViewController's pull handler is the useful one.
+    if (!did && (r = nfb_findLeafResponder(target, @selector(_tfn_dynamic_didPullToLoadTop:), 0)) && pullCtrl) {
         ((void(*)(id, SEL, id))objc_msgSend)(r, @selector(_tfn_dynamic_didPullToLoadTop:), pullCtrl);
         did = YES;
     }
-    if (!did && (r = nfb_findResponder(target, @selector(schedulePullToRefreshUpdate), 0))) {
+    if (!did && (r = nfb_findLeafResponder(target, @selector(loadTop:), 0))) {
+        ((void(*)(id, SEL, id))objc_msgSend)(r, @selector(loadTop:), pullCtrl);
+        did = YES;
+    }
+    if (!did && (r = nfb_findLeafResponder(target, @selector(schedulePullToRefreshUpdate), 0))) {
         ((void(*)(id, SEL))objc_msgSend)(r, @selector(schedulePullToRefreshUpdate));
+        did = YES;
+    }
+    if (!did && (r = nfb_findLeafResponder(target, @selector(clearTimelineCacheAndRefresh), 0))) {
+        ((void(*)(id, SEL))objc_msgSend)(r, @selector(clearTimelineCacheAndRefresh));
         did = YES;
     }
     if (did) nfb_afterRefresh(target);
