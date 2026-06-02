@@ -390,7 +390,7 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
 }
 - (void)showInterval {
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"更新間隔" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    for (NSNumber *n in @[@10, @15, @20, @30, @60]) {
+    for (NSNumber *n in @[@5, @10, @15, @20, @30, @60]) {
         NSInteger sec = n.integerValue;
         [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%ld秒", (long)sec] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_setStreamInterval(sec); UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamStart(vc); }]];
     }

@@ -388,10 +388,10 @@
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"auto_stream_timeline"];
 }
 + (NSInteger)autoStreamInterval {
-    // Seconds between auto-refreshes. Default 20s; floor 10s to stay clear of
+    // Seconds between auto-refreshes. Default 20s; floor 5s for fast streaming mode.
     // X's timeline rate limits.
     NSInteger seconds = [[NSUserDefaults standardUserDefaults] integerForKey:@"auto_stream_interval"];
-    return seconds >= 10 ? seconds : 20;
+    return seconds >= 5 ? seconds : 20;
 }
 
 @end
