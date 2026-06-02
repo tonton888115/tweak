@@ -31,8 +31,11 @@ static void nfb_removeButton(void);
 @end
 @interface T1HomeTimelineItemsViewController : UIViewController
 @end
+@class NFBStreamHandler;
 
 static __weak UIViewController *gActiveItemsVC = nil;   // the visible Home timeline list
+static __weak UIViewController *gPendingNewTweetsVC = nil;
+static UIButton *gNewTweetsPill = nil;
 
 #pragma mark - refresh callers (no signature assumptions)
 
@@ -90,34 +93,39 @@ static id nfb_findResponder(UIViewController *vc, SEL sel, int depth) {
     }
     return nil;
 }
+static id nfb_findHomeResponder(UIViewController *startVC, SEL sel) {
+    id near = nfb_findResponder(startVC, sel, 0);
+    if (near) return near;
+    return nfb_findResponder(nfb_homeRoot(startVC), sel, 0);
+}
 
 static BOOL nfb_doPull(id startVC) {
-    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(_t1_didPullToRefresh:), 0);
+    id t = nfb_findHomeResponder(startVC, @selector(_t1_didPullToRefresh:));
     if (t) { ((void(*)(id,SEL,id))objc_msgSend)(t, @selector(_t1_didPullToRefresh:), nil); return YES; }
     return NO;
 }
 static BOOL nfb_doLoadNewer(id startVC) {
-    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(loadNewer), 0);
+    id t = nfb_findHomeResponder(startVC, @selector(loadNewer));
     if (t) { ((void(*)(id,SEL))objc_msgSend)(t, @selector(loadNewer)); return YES; }
     return NO;
 }
 static BOOL nfb_doReloadTop(id startVC) {
-    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(reloadTop:), 0);
+    id t = nfb_findHomeResponder(startVC, @selector(reloadTop:));
     if (t) { ((void(*)(id,SEL,BOOL))objc_msgSend)(t, @selector(reloadTop:), YES); return YES; }
     return NO;
 }
 static BOOL nfb_doRefreshContent(id startVC) {
-    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(_refreshContent), 0);
+    id t = nfb_findHomeResponder(startVC, @selector(_refreshContent));
     if (t) { ((void(*)(id,SEL))objc_msgSend)(t, @selector(_refreshContent)); return YES; }
     return NO;
 }
 static BOOL nfb_doSchedulePullUpdate(id startVC) {
-    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(schedulePullToRefreshUpdate), 0);
+    id t = nfb_findHomeResponder(startVC, @selector(schedulePullToRefreshUpdate));
     if (t) { ((void(*)(id,SEL))objc_msgSend)(t, @selector(schedulePullToRefreshUpdate)); return YES; }
     return NO;
 }
 static BOOL nfb_doLoadTop(id startVC) {
-    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(loadTop:), 0);
+    id t = nfb_findHomeResponder(startVC, @selector(loadTop:));
     if (t) {
         id sender = nfb_findPullControl(startVC);
         ((void(*)(id,SEL,id))objc_msgSend)(t, @selector(loadTop:), sender);
@@ -126,7 +134,7 @@ static BOOL nfb_doLoadTop(id startVC) {
     return NO;
 }
 static BOOL nfb_doLoadTopNil(id startVC) {
-    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(loadTop:), 0);
+    id t = nfb_findHomeResponder(startVC, @selector(loadTop:));
     if (t) { ((void(*)(id,SEL,id))objc_msgSend)(t, @selector(loadTop:), nil); return YES; }
     return NO;
 }
@@ -136,7 +144,7 @@ static NSInteger nfb_streamLoadSourceFromSender(id sender) {
     return fromSender ? fromSender(sender) : 0;
 }
 static BOOL nfb_doTimelineRefreshWithSource(id startVC, NSInteger source) {
-    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(refreshWithSource:completion:), 0);
+    id t = nfb_findHomeResponder(startVC, @selector(refreshWithSource:completion:));
     if (t) {
         void (^completion)(void) = ^{};
         ((void(*)(id,SEL,NSInteger,id))objc_msgSend)(t, @selector(refreshWithSource:completion:), source, completion);
@@ -172,9 +180,9 @@ static id nfb_pullToLoadTopControlOf(id obj) {
 static id nfb_findPullControl(UIViewController *startVC) {
     id ctrl = nfb_pullToLoadTopControlOf(gActiveItemsVC);
     if (!ctrl) ctrl = nfb_pullToLoadTopControlOf(startVC);
-    if (!ctrl) ctrl = nfb_pullToLoadTopControlOf(nfb_findResponder(nfb_homeRoot(startVC), @selector(pullToLoadTopControl), 0));
+    if (!ctrl) ctrl = nfb_pullToLoadTopControlOf(nfb_findHomeResponder(startVC, @selector(pullToLoadTopControl)));
     if (!ctrl) ctrl = nfb_ivarOfType(gActiveItemsVC, "TFNPullToRefreshControl");
-    if (!ctrl) ctrl = nfb_ivarOfType(nfb_findResponder(nfb_homeRoot(startVC), @selector(_t1_didPullToRefresh:), 0), "TFNPullToRefreshControl");
+    if (!ctrl) ctrl = nfb_ivarOfType(nfb_findHomeResponder(startVC, @selector(_t1_didPullToRefresh:)), "TFNPullToRefreshControl");
     if (!ctrl) {
         UIScrollView *sv = nfb_scrollOf(gActiveItemsVC);
         Class cls = objc_getClass("TFNPullToRefreshControl");
@@ -184,7 +192,7 @@ static id nfb_findPullControl(UIViewController *startVC) {
 }
 // The pull handler lives on the container but needs the real control as its sender.
 static BOOL nfb_doPullWithControl(id startVC) {
-    id cont = nfb_findResponder(nfb_homeRoot(startVC), @selector(_t1_didPullToRefresh:), 0);
+    id cont = nfb_findHomeResponder(startVC, @selector(_t1_didPullToRefresh:));
     id ctrl = nfb_findPullControl(startVC);
     if (!cont || !ctrl) return NO;
     ((void(*)(id,SEL,id))objc_msgSend)(cont, @selector(_t1_didPullToRefresh:), ctrl);
@@ -193,7 +201,7 @@ static BOOL nfb_doPullWithControl(id startVC) {
 // Current Twitter builds expose this on the visible items VC; it is the native
 // pull-to-load-top action, with the real pull control as sender.
 static BOOL nfb_doDynamicPullToLoadTop(id startVC) {
-    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(_tfn_dynamic_didPullToLoadTop:), 0);
+    id t = nfb_findHomeResponder(startVC, @selector(_tfn_dynamic_didPullToLoadTop:));
     id ctrl = nfb_findPullControl(startVC);
     if (!t || !ctrl) return NO;
     ((void(*)(id,SEL,id))objc_msgSend)(t, @selector(_tfn_dynamic_didPullToLoadTop:), ctrl);
@@ -225,6 +233,12 @@ static BOOL nfb_scrollToTop(id vc, BOOL animated) {
     }
     return did;
 }
+static BOOL nfb_isReadingAwayFromTop(UIViewController *vc) {
+    UIScrollView *sv = nfb_mainScrollViewOf(vc);
+    if (!sv) return NO;
+    CGFloat topY = -sv.adjustedContentInset.top;
+    return sv.contentOffset.y > topY + 80.0;
+}
 static UIControl *nfb_findHomeTabControl(UIView *view, BOOL inTabBar, int depth) {
     if (!view || view.hidden || view.alpha < 0.01 || depth > 10) return nil;
     NSString *cls = NSStringFromClass([view class]);
@@ -254,6 +268,14 @@ static BOOL nfb_tapHomeTabLikeUser(void) {
     }
     return NO;
 }
+static void nfb_hideNewTweetsPill(void) {
+    if (!gNewTweetsPill) return;
+    [UIView animateWithDuration:0.16 animations:^{
+        gNewTweetsPill.alpha = 0.0;
+    } completion:^(BOOL finished) {
+        [gNewTweetsPill removeFromSuperview];
+    }];
+}
 static void nfb_revealTopAfterRefresh(UIViewController *vc) {
     __weak UIViewController *wvc = vc;
     void (^reveal)(void) = ^{
@@ -264,25 +286,73 @@ static void nfb_revealTopAfterRefresh(UIViewController *vc) {
         nfb_tapHomeTabLikeUser();
         nfb_scrollToTop(s, YES);
     };
+    reveal();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
 }
+static void nfb_showNewTweetsPill(UIViewController *vc) {
+    if (!vc || !vc.view.window) return;
+    gPendingNewTweetsVC = vc;
+    UIWindow *win = vc.view.window;
+    if (!gNewTweetsPill) {
+        gNewTweetsPill = [UIButton buttonWithType:UIButtonTypeSystem];
+        gNewTweetsPill.translatesAutoresizingMaskIntoConstraints = NO;
+        gNewTweetsPill.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+        gNewTweetsPill.contentEdgeInsets = UIEdgeInsetsMake(8, 16, 8, 16);
+        gNewTweetsPill.layer.cornerRadius = 18;
+        gNewTweetsPill.layer.masksToBounds = YES;
+        gNewTweetsPill.backgroundColor = UIColor.systemBlueColor;
+        [gNewTweetsPill setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        [gNewTweetsPill setTitle:@"新しいツイートがあります" forState:UIControlStateNormal];
+        Class handlerClass = objc_getClass("NFBStreamHandler");
+        id handler = (handlerClass && [handlerClass respondsToSelector:@selector(shared)]) ? ((id(*)(Class,SEL))objc_msgSend)(handlerClass, @selector(shared)) : nil;
+        if (handler) [gNewTweetsPill addTarget:handler action:@selector(newTweetsTap) forControlEvents:UIControlEventTouchUpInside];
+    }
+    [gNewTweetsPill removeFromSuperview];
+    [win addSubview:gNewTweetsPill];
+    UILayoutGuide *safe = win.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [gNewTweetsPill.topAnchor constraintEqualToAnchor:safe.topAnchor constant:48.0],
+        [gNewTweetsPill.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [gNewTweetsPill.heightAnchor constraintGreaterThanOrEqualToConstant:36.0]
+    ]];
+    gNewTweetsPill.alpha = 0.0;
+    [win bringSubviewToFront:gNewTweetsPill];
+    [UIView animateWithDuration:0.16 animations:^{ gNewTweetsPill.alpha = 1.0; }];
+}
+static void nfb_afterRefresh(UIViewController *vc) {
+    if (nfb_isReadingAwayFromTop(vc)) {
+        nfb_showNewTweetsPill(vc);
+    } else {
+        nfb_hideNewTweetsPill();
+        nfb_revealTopAfterRefresh(vc);
+    }
+}
 
 static void nfb_streamTrigger(UIViewController *vc) {
+    BOOL readingAway = nfb_isReadingAwayFromTop(vc);
+    if (!readingAway) {
+        nfb_hideNewTweetsPill();
+        nfb_scrollToTop(vc, NO);
+    }
+
+    BOOL did = nfb_doTimelineRefresh(vc);
     if (nfb_doLoadTop(vc)) {
         nfb_doSchedulePullUpdate(vc);
-        nfb_revealTopAfterRefresh(vc);
-        return;
+        did = YES;
     }
-    if (nfb_doSchedulePullUpdate(vc))   { nfb_revealTopAfterRefresh(vc); return; }
-    if (nfb_doDynamicPullToLoadTop(vc)) { nfb_revealTopAfterRefresh(vc); return; }
-    if (nfb_doPullWithControl(vc))      { nfb_revealTopAfterRefresh(vc); return; }
-    if (nfb_doPull(vc))                 { nfb_revealTopAfterRefresh(vc); return; }
-    if (nfb_doLoadNewer(vc))            { nfb_revealTopAfterRefresh(vc); return; }
-    if (nfb_doReloadTop(vc))            { nfb_revealTopAfterRefresh(vc); return; }
-    if (nfb_doRefreshContent(vc))       nfb_revealTopAfterRefresh(vc);
+    if (!did) {
+        if (nfb_doSchedulePullUpdate(vc))   did = YES;
+        else if (nfb_doDynamicPullToLoadTop(vc)) did = YES;
+        else if (nfb_doPullWithControl(vc))      did = YES;
+        else if (nfb_doPull(vc))                 did = YES;
+        else if (nfb_doLoadNewer(vc))            did = YES;
+        else if (nfb_doReloadTop(vc))            did = YES;
+        else if (nfb_doRefreshContent(vc))       did = YES;
+    }
+    if (did) nfb_afterRefresh(vc);
 }
 
 // List a class's own+inherited refresh-ish method names (for the diagnostic dump).
@@ -392,7 +462,6 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
 @end
 
 static NFBStreamButton *gStreamButton = nil;
-
 static void nfb_setStreamEnabled(BOOL on)    { [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"auto_stream_timeline"]; }
 static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDefaults] setInteger:s forKey:@"auto_stream_interval"]; }
 
@@ -401,6 +470,7 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
 @interface NFBStreamHandler : NSObject
 + (instancetype)shared;
 - (void)tap;
+- (void)newTweetsTap;
 - (void)longPress:(UILongPressGestureRecognizer *)g;
 @end
 
@@ -421,6 +491,12 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     [top presentViewController:ac animated:YES completion:nil];
 }
 - (void)tap { UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamTrigger(vc); }
+- (void)newTweetsTap {
+    UIViewController *vc = gPendingNewTweetsVC ?: gActiveItemsVC;
+    gPendingNewTweetsVC = nil;
+    nfb_hideNewTweetsPill();
+    if (vc) nfb_revealTopAfterRefresh(vc);
+}
 - (void)longPress:(UILongPressGestureRecognizer *)g { if (g.state == UIGestureRecognizerStateBegan) [self showMain]; }
 
 - (void)showMain {
@@ -524,6 +600,8 @@ static void nfb_installButton(UIWindow *win) {
 }
 static void nfb_removeButton(void) {
     if (gStreamButton) { [gStreamButton.gauge removeAnimationForKey:@"deplete"]; [gStreamButton removeFromSuperview]; }
+    nfb_hideNewTweetsPill();
+    gPendingNewTweetsVC = nil;
 }
 
 // Fade with the header: hide while scrolling down, show at top / scrolling up.
@@ -550,11 +628,9 @@ static BOOL nfb_streamShouldFire(UIViewController *vc) {
     if (![BHTManager autoStreamTimeline]) return NO;
     if (vc != gActiveItemsVC) return NO;                        // only the visible list
     if (![vc isViewLoaded] || vc.view.window == nil) return NO;
-    UIScrollView *sv = nfb_scrollOf(vc);
+    UIScrollView *sv = nfb_mainScrollViewOf(vc);
     if (sv) {
         if (sv.isDragging || sv.isDecelerating || sv.isTracking) return NO;
-        CGFloat topY = -sv.adjustedContentInset.top;
-        if (sv.contentOffset.y > topY + 600.0) return NO;      // far down -> leave it to the native pill
     }
     return YES;
 }

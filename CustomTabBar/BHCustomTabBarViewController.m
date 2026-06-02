@@ -254,9 +254,14 @@ static UIFont *TwitterChirpFont(TwitterFontStyle style) {
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_MESSAGES" pageID:@"messages"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_GROK" pageID:@"grok"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_PROFILE" pageID:@"profile"],
-            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_VIDEO" pageID:@"media"]
+            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_COLUMNS" pageID:@"media"]
         ] mutableCopy];
         self.enabledPageIDs = [NSMutableSet setWithArray:@[@"home", @"guide", @"ntab", @"messages"]];
+    }
+    for (BHCustomTabBarItem *item in self.allItems) {
+        if ([item.pageID isEqualToString:@"media"]) {
+            item.title = @"CUSTOM_TAB_BAR_COLUMNS";
+        }
     }
     
     // Store initial state for comparison later

@@ -624,6 +624,9 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
         if ([hiddenBars containsObject:tabView.scribePage]) {
             [tabView setHidden:true];
         }
+        if ([tabView respondsToSelector:@selector(bh_setupColumnsTabIfNeeded)]) {
+            [tabView performSelector:@selector(bh_setupColumnsTabIfNeeded)];
+        }
     }
 }
 %end
@@ -4116,6 +4119,41 @@ static char kManualRefreshInProgressKey;
 %end
 
 // MARK: - Classic Tab Bar Icon Theming
+static char kBHTColumnsTapGestureKey;
+
+static NSString *BHTColumnsTabTitle(void) {
+    NSString *title = [[BHTBundle sharedBundle] localizedStringForKey:@"CUSTOM_TAB_BAR_COLUMNS"];
+    if (!title.length || [title isEqualToString:@"CUSTOM_TAB_BAR_COLUMNS"]) return @"Columns";
+    return title;
+}
+
+static BOOL BHTIsColumnsTabView(T1TabView *tabView) {
+    if (!tabView) return NO;
+    NSString *page = nil;
+    @try {
+        page = tabView.scribePage ?: [tabView valueForKey:@"scribePage"];
+    } @catch (NSException *e) {
+        page = nil;
+    }
+    return [page isEqualToString:@"media"];
+}
+
+static void BHTPresentColumnsViewController(void) {
+    Class cls = NSClassFromString(@"NFBColumnsViewController");
+    if (!cls) return;
+
+    UIWindow *window = BHT_activeKeyWindow();
+    UIViewController *presenter = BHT_topViewController(window.rootViewController);
+    if (!presenter) return;
+    if ([presenter isKindOfClass:cls]) return;
+    if ([presenter.navigationController.viewControllers.firstObject isKindOfClass:cls]) return;
+
+    UIViewController *columns = [[cls alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:columns];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    [presenter presentViewController:nav animated:YES completion:nil];
+}
+
 %hook T1TabView
 
 %new
@@ -4158,6 +4196,32 @@ static char kManualRefreshInProgressKey;
     }
 }
 
+%new
+- (void)bh_openColumns:(UITapGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateEnded) return;
+    BHTPresentColumnsViewController();
+}
+
+%new
+- (void)bh_setupColumnsTabIfNeeded {
+    if (!BHTIsColumnsTabView((T1TabView *)self)) return;
+
+    UILabel *titleLabel = [self valueForKey:@"titleLabel"];
+    if (titleLabel) {
+        titleLabel.text = BHTColumnsTabTitle();
+        titleLabel.hidden = NO;
+    }
+    self.accessibilityLabel = BHTColumnsTabTitle();
+    self.userInteractionEnabled = YES;
+
+    if (!objc_getAssociatedObject(self, &kBHTColumnsTapGestureKey)) {
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bh_openColumns:)];
+        tap.cancelsTouchesInView = YES;
+        [self addGestureRecognizer:tap];
+        objc_setAssociatedObject(self, &kBHTColumnsTapGestureKey, tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 - (BOOL)_t1_showsTitle {
     if ([BHTManager restoreTabLabels]) {
         return true;
@@ -4175,6 +4239,7 @@ static char kManualRefreshInProgressKey;
             titleLabel.hidden = NO;
         }
     }
+    [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
 }
 
 - (void)_t1_updateImageViewAnimated:(_Bool)animated {
@@ -4182,6 +4247,7 @@ static char kManualRefreshInProgressKey;
 
     // Always apply theming logic (handles both enabled and disabled cases)
     [self performSelector:@selector(bh_applyCurrentThemeToIcon)];
+    [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
 }
 
 - (void)setSelected:(_Bool)selected {
@@ -4189,6 +4255,12 @@ static char kManualRefreshInProgressKey;
 
     // Always apply theming logic (handles both enabled and disabled cases)
     [self performSelector:@selector(bh_applyCurrentThemeToIcon)];
+    [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
+}
+
+- (void)didMoveToWindow {
+    %orig;
+    [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
 }
 
 %end
