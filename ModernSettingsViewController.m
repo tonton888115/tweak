@@ -2917,6 +2917,7 @@ if ([type isEqualToString:@"compactButton"]) {
 
 - (void)buildToggleList {
     self.toggles = @[
+        @{ @"key": @"auto_stream_timeline", @"titleKey": @"AUTO_STREAM_TIMELINE_OPTION_TITLE", @"subtitleKey": @"AUTO_STREAM_TIMELINE_OPTION_DETAIL_TITLE", @"default": @NO },
         @{ @"key": @"padlock", @"titleKey": @"PADLOCK_OPTION_TITLE", @"subtitleKey": @"PADLOCK_OPTION_DETAIL_TITLE", @"default": @NO },
         @{ @"key": @"hide_topics", @"titleKey": @"HIDE_TOPICS_OPTION_TITLE", @"subtitleKey": @"HIDE_TOPICS_OPTION_DETAIL_TITLE", @"default": @YES },
         @{ @"key": @"hide_topics_to_follow", @"titleKey": @"HIDE_TOPICS_TO_FOLLOW_OPTION", @"subtitleKey": @"HIDE_TOPICS_TO_FOLLOW_OPTION_DETAIL_TITLE", @"default": @YES },
