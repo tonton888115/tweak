@@ -15,6 +15,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <QuartzCore/QuartzCore.h>
+#import <dlfcn.h>
 #import <math.h>
 #import <string.h>
 
@@ -39,6 +40,36 @@ static BOOL nfb_resp(id o, SEL s) { return o && [o respondsToSelector:s]; }
 static id   nfb_timelineOf(id vc) { return nfb_resp(vc, @selector(timeline)) ? ((id(*)(id,SEL))objc_msgSend)(vc, @selector(timeline)) : nil; }
 static UIScrollView *nfb_scrollOf(id vc) { return nfb_resp(vc, @selector(scrollView)) ? ((id(*)(id,SEL))objc_msgSend)(vc, @selector(scrollView)) : nil; }
 static id nfb_findPullControl(UIViewController *startVC);
+
+static CGFloat nfb_scrollViewScore(UIScrollView *sv) {
+    if (!sv || sv.hidden || sv.alpha < 0.01 || sv.bounds.size.width < 100.0 || sv.bounds.size.height < 100.0) return 0;
+    CGFloat area = sv.bounds.size.width * sv.bounds.size.height;
+    BOOL vertical = sv.alwaysBounceVertical || sv.contentSize.height > sv.bounds.size.height + 80.0;
+    BOOL horizontalOnly = sv.contentSize.width > sv.bounds.size.width * 1.4 && sv.contentSize.height <= sv.bounds.size.height + 80.0;
+    if (horizontalOnly) area *= 0.2;
+    if (vertical) area *= 3.0;
+    return area;
+}
+static UIScrollView *nfb_findMainScrollViewInView(UIView *view, CGFloat *bestScore) {
+    if (!view || view.hidden || view.alpha < 0.01) return nil;
+    UIScrollView *best = nil;
+    if ([view isKindOfClass:UIScrollView.class]) {
+        CGFloat score = nfb_scrollViewScore((UIScrollView *)view);
+        if (score > *bestScore) { *bestScore = score; best = (UIScrollView *)view; }
+    }
+    for (UIView *sub in view.subviews) {
+        UIScrollView *candidate = nfb_findMainScrollViewInView(sub, bestScore);
+        if (candidate) best = candidate;
+    }
+    return best;
+}
+static UIScrollView *nfb_mainScrollViewOf(UIViewController *vc) {
+    UIScrollView *sv = nfb_scrollOf(vc);
+    if (nfb_scrollViewScore(sv) > 0) return sv;
+    if (![vc isViewLoaded]) return nil;
+    CGFloat bestScore = 0;
+    return nfb_findMainScrollViewInView(vc.view, &bestScore);
+}
 
 // Walk up to the Home container, then search the whole VC subtree (+ each VC's
 // `timeline`) for an object that responds to `sel`. The refresh entry point may live
@@ -99,14 +130,22 @@ static BOOL nfb_doLoadTopNil(id startVC) {
     if (t) { ((void(*)(id,SEL,id))objc_msgSend)(t, @selector(loadTop:), nil); return YES; }
     return NO;
 }
-static BOOL nfb_doTimelineRefresh(id startVC) {
+static NSInteger nfb_streamLoadSourceFromSender(id sender) {
+    NSInteger (*fromSender)(id) = (NSInteger(*)(id))dlsym(RTLD_DEFAULT, "TFSTwitterStreamLoadSourceFromSender");
+    if (!fromSender) fromSender = (NSInteger(*)(id))dlsym(RTLD_DEFAULT, "_TFSTwitterStreamLoadSourceFromSender");
+    return fromSender ? fromSender(sender) : 0;
+}
+static BOOL nfb_doTimelineRefreshWithSource(id startVC, NSInteger source) {
     id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(refreshWithSource:completion:), 0);
     if (t) {
         void (^completion)(void) = ^{};
-        ((void(*)(id,SEL,NSInteger,id))objc_msgSend)(t, @selector(refreshWithSource:completion:), 0, completion);
+        ((void(*)(id,SEL,NSInteger,id))objc_msgSend)(t, @selector(refreshWithSource:completion:), source, completion);
         return YES;
     }
     return NO;
+}
+static BOOL nfb_doTimelineRefresh(id startVC) {
+    return nfb_doTimelineRefreshWithSource(startVC, nfb_streamLoadSourceFromSender(nfb_findPullControl(startVC)));
 }
 
 // Find an instance variable of `obj` whose type encoding mentions `typeName`.
@@ -162,20 +201,29 @@ static BOOL nfb_doDynamicPullToLoadTop(id startVC) {
 }
 
 static BOOL nfb_scrollToTop(id vc, BOOL animated) {
+    BOOL did = NO;
+    if (nfb_resp(vc, @selector(scrollToTopAnimated:options:completion:))) {
+        ((void(*)(id,SEL,BOOL,NSUInteger,id))objc_msgSend)(vc, @selector(scrollToTopAnimated:options:completion:), animated, 0, nil);
+        did = YES;
+    }
     if (nfb_resp(vc, @selector(scrollToTop))) {
         ((void(*)(id,SEL))objc_msgSend)(vc, @selector(scrollToTop));
-        return YES;
+        did = YES;
     }
     if (nfb_resp(vc, @selector(scrollToTop:))) {
         ((void(*)(id,SEL,BOOL))objc_msgSend)(vc, @selector(scrollToTop:), animated);
-        return YES;
+        did = YES;
     }
-    UIScrollView *sv = nfb_scrollOf(vc);
-    if (!sv) return NO;
-    CGPoint p = sv.contentOffset;
-    p.y = -sv.adjustedContentInset.top;
-    [sv setContentOffset:p animated:animated];
-    return YES;
+    UIScrollView *sv = [vc isKindOfClass:UIViewController.class] ? nfb_mainScrollViewOf((UIViewController *)vc) : nil;
+    if (sv) {
+        CGPoint p = sv.contentOffset;
+        p.x = -sv.adjustedContentInset.left;
+        p.y = -sv.adjustedContentInset.top;
+        [sv setContentOffset:p animated:NO];
+        [sv setContentOffset:p animated:animated];
+        did = YES;
+    }
+    return did;
 }
 static UIControl *nfb_findHomeTabControl(UIView *view, BOOL inTabBar, int depth) {
     if (!view || view.hidden || view.alpha < 0.01 || depth > 10) return nil;
@@ -211,13 +259,15 @@ static void nfb_revealTopAfterRefresh(UIViewController *vc) {
     void (^reveal)(void) = ^{
         UIViewController *s = wvc;
         if (!s || s != gActiveItemsVC || ![s isViewLoaded] || s.view.window == nil) return;
-        UIScrollView *sv = nfb_scrollOf(s);
+        UIScrollView *sv = nfb_mainScrollViewOf(s);
         if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) return;
         nfb_tapHomeTabLikeUser();
         nfb_scrollToTop(s, YES);
     };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
 }
 
 static void nfb_streamTrigger(UIViewController *vc) {
@@ -268,6 +318,15 @@ static void nfb_appendMethodType(NSMutableString *s, NSString *ind, id obj, SEL 
     Method m = nfb_methodFor(obj, sel);
     const char *enc = m ? method_getTypeEncoding(m) : NULL;
     if (enc) [s appendFormat:@"%@   enc %@ = %s\n", ind, NSStringFromSelector(sel), enc];
+}
+static void nfb_appendScrollDiag(NSMutableString *s, UIViewController *vc) {
+    UIScrollView *sv = nfb_mainScrollViewOf(vc);
+    if (!sv) { [s appendString:@"scroll=(nil)\n"]; return; }
+    [s appendFormat:@"scroll=%@ offset=(%.1f,%.1f) size=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) bounceV=%d\n",
+        NSStringFromClass([sv class]), sv.contentOffset.x, sv.contentOffset.y,
+        sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height,
+        sv.adjustedContentInset.top, sv.adjustedContentInset.left, sv.adjustedContentInset.bottom, sv.adjustedContentInset.right,
+        sv.alwaysBounceVertical ? 1 : 0];
 }
 
 static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
@@ -382,6 +441,7 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     UIViewController *active = gActiveItemsVC;
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"active=%@\n", active ? NSStringFromClass([active class]) : @"(nil)"];
+    if (active) nfb_appendScrollDiag(s, active);
     nfb_dumpTree(nfb_homeRoot(active), 0, s);
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"診断情報" message:s preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"コピー" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIPasteboard.generalPasteboard.string = s; }]];
@@ -405,6 +465,7 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     [ac addAction:[UIAlertAction actionWithTitle:@"C: schedulePullUpdate" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc && nfb_doSchedulePullUpdate(vc)) nfb_revealTopAfterRefresh(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"D: dynamic pullToLoadTop" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc && nfb_doDynamicPullToLoadTop(vc)) nfb_revealTopAfterRefresh(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"E: legacy container pull" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc && nfb_doPullWithControl(vc)) nfb_revealTopAfterRefresh(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"F: timeline refresh" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc && nfb_doTimelineRefresh(vc)) nfb_revealTopAfterRefresh(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
