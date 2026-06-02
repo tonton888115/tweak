@@ -513,6 +513,19 @@ static void nfb_afterRefresh(UIViewController *vc) {
 // Following items VC, or a pinned-list PinnedTimelineViewController. The old code only
 // knew about the two home items VCs, so pinned lists (ニコニコ/投資) never refreshed.
 static UIViewController *nfb_selectedTimelineVC(UIViewController *vc) {
+    // The PAGING controller's selected page is the on-screen timeline, including pinned
+    // lists. (The home container's selectedTimelineViewController only tracks For You /
+    // Following, so it was wrong for ニコニコ/投資.)
+    UIViewController *paging = nfb_parentControllerNamed(vc, @"Paging");
+    if (paging) {
+        for (NSString *name in @[@"selectedViewController", @"visibleViewController", @"primaryViewController"]) {
+            SEL sel = NSSelectorFromString(name);
+            if ([paging respondsToSelector:sel]) {
+                id pageVC = ((id(*)(id, SEL))objc_msgSend)(paging, sel);
+                if ([pageVC isKindOfClass:UIViewController.class]) return (UIViewController *)pageVC;
+            }
+        }
+    }
     UIViewController *container = nfb_parentControllerNamed(vc, @"HomeTimelineContainer");
     if (container && nfb_resp(container, @selector(selectedTimelineViewController))) {
         id sel = ((id(*)(id, SEL))objc_msgSend)(container, @selector(selectedTimelineViewController));
@@ -595,17 +608,20 @@ static void nfb_appendMethodType(NSMutableString *s, NSString *ind, id obj, SEL 
 }
 static void nfb_appendScrollDiag(NSMutableString *s, UIViewController *vc) {
     UIScrollView *sv = nfb_mainScrollViewOf(vc);
-    if (!sv) { [s appendString:@"scroll=(nil)\n"]; return; }
     UIViewController *segmented = nfb_parentControllerNamed(vc, @"Segmented");
     NSString *selectedText = segmented ? nfb_selectedTextInView(segmented.view, 0) : nil;
     NSInteger pagingIndex = nfb_indexOfChildInPagingController(vc);
     NSString *tabIdentifier = nfb_homeTimelineTabIdentifier(vc);
     id timeline = nfb_timelineOf(vc);
-    [s appendFormat:@"scroll=%@ offset=(%.1f,%.1f) size=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) bounceV=%d\n",
-        NSStringFromClass([sv class]), sv.contentOffset.x, sv.contentOffset.y,
-        sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height,
-        sv.adjustedContentInset.top, sv.adjustedContentInset.left, sv.adjustedContentInset.bottom, sv.adjustedContentInset.right,
-        sv.alwaysBounceVertical ? 1 : 0];
+    if (sv) {
+        [s appendFormat:@"scroll=%@ offset=(%.1f,%.1f) size=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) bounceV=%d\n",
+            NSStringFromClass([sv class]), sv.contentOffset.x, sv.contentOffset.y,
+            sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height,
+            sv.adjustedContentInset.top, sv.adjustedContentInset.left, sv.adjustedContentInset.bottom, sv.adjustedContentInset.right,
+            sv.alwaysBounceVertical ? 1 : 0];
+    } else {
+        [s appendString:@"scroll=(nil)\n"];
+    }
     [s appendFormat:@"homeVariant recommended=%d pagingIndex=%ld selectedText=%@ tabIdentifier=%@ timeline=%@\n",
         nfb_isRecommendedHomeTimeline(vc) ? 1 : 0,
         (long)pagingIndex,
@@ -1004,7 +1020,10 @@ static void nfb_syncHomeTimelineTabIdentifierFromController(UIViewController *vc
 
 %hook THFHomeTimelineItemsViewController
 - (void)viewDidAppear:(BOOL)animated { %orig; nfb_syncHomeTimelineTabIdentifierFromController(nfb_parentControllerNamed(self, @"HomeTimelineContainer")); gActiveItemsVC = self; nfb_installButton(self.view.window); nfb_streamStart(self); }
-- (void)viewDidDisappear:(BOOL)animated { %orig; nfb_streamStop(self); }
+// NOTE: do NOT stop the timer on disappear. Switching to a pinned list (ニコニコ/投資)
+// disappears this home VC; the timer must keep running so it can refresh the list via
+// the paging controller's selectedViewController. It self-cleans on dealloc / when off.
+- (void)viewDidDisappear:(BOOL)animated { %orig; }
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_visibilityForScroll(scrollView); }
 %end
 
