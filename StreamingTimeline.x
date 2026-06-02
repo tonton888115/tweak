@@ -36,22 +36,44 @@ static BOOL nfb_resp(id o, SEL s) { return o && [o respondsToSelector:s]; }
 static id   nfb_timelineOf(id vc) { return nfb_resp(vc, @selector(timeline)) ? ((id(*)(id,SEL))objc_msgSend)(vc, @selector(timeline)) : nil; }
 static UIScrollView *nfb_scrollOf(id vc) { return nfb_resp(vc, @selector(scrollView)) ? ((id(*)(id,SEL))objc_msgSend)(vc, @selector(scrollView)) : nil; }
 
-static BOOL nfb_doPull(id vc) {
-    if (nfb_resp(vc, @selector(_t1_didPullToRefresh:))) { ((void(*)(id,SEL,id))objc_msgSend)(vc, @selector(_t1_didPullToRefresh:), nil); return YES; }
-    return NO;
+// Walk up to the Home container, then search the whole VC subtree (+ each VC's
+// `timeline`) for an object that responds to `sel`. The refresh entry point may live
+// on a child content/data controller, not on the list VC we hook.
+static UIViewController *nfb_homeRoot(UIViewController *vc) {
+    UIViewController *r = vc;
+    for (int i = 0; i < 5 && r.parentViewController; i++) r = r.parentViewController;
+    return r;
 }
-static BOOL nfb_doLoadNewer(id vc) {
-    if (nfb_resp(vc, @selector(loadNewer))) { ((void(*)(id,SEL))objc_msgSend)(vc, @selector(loadNewer)); return YES; }
+static id nfb_findResponder(UIViewController *vc, SEL sel, int depth) {
+    if (!vc || depth > 5) return nil;
+    if ([vc respondsToSelector:sel]) return vc;
     id tl = nfb_timelineOf(vc);
-    if (nfb_resp(tl, @selector(loadNewer))) { ((void(*)(id,SEL))objc_msgSend)(tl, @selector(loadNewer)); return YES; }
+    if (tl && [tl respondsToSelector:sel]) return tl;
+    for (UIViewController *c in vc.childViewControllers) {
+        id r = nfb_findResponder(c, sel, depth + 1);
+        if (r) return r;
+    }
+    return nil;
+}
+
+static BOOL nfb_doPull(id startVC) {
+    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(_t1_didPullToRefresh:), 0);
+    if (t) { ((void(*)(id,SEL,id))objc_msgSend)(t, @selector(_t1_didPullToRefresh:), nil); return YES; }
     return NO;
 }
-static BOOL nfb_doReloadTop(id vc) {
-    if (nfb_resp(vc, @selector(reloadTop:))) { ((void(*)(id,SEL,BOOL))objc_msgSend)(vc, @selector(reloadTop:), YES); return YES; }
+static BOOL nfb_doLoadNewer(id startVC) {
+    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(loadNewer), 0);
+    if (t) { ((void(*)(id,SEL))objc_msgSend)(t, @selector(loadNewer)); return YES; }
     return NO;
 }
-static BOOL nfb_doRefreshContent(id vc) {
-    if (nfb_resp(vc, @selector(_refreshContent))) { ((void(*)(id,SEL))objc_msgSend)(vc, @selector(_refreshContent)); return YES; }
+static BOOL nfb_doReloadTop(id startVC) {
+    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(reloadTop:), 0);
+    if (t) { ((void(*)(id,SEL,BOOL))objc_msgSend)(t, @selector(reloadTop:), YES); return YES; }
+    return NO;
+}
+static BOOL nfb_doRefreshContent(id startVC) {
+    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(_refreshContent), 0);
+    if (t) { ((void(*)(id,SEL))objc_msgSend)(t, @selector(_refreshContent)); return YES; }
     return NO;
 }
 static void nfb_streamTrigger(UIViewController *vc) {
@@ -59,6 +81,29 @@ static void nfb_streamTrigger(UIViewController *vc) {
     if (nfb_doPull(vc))      return;
     if (nfb_doReloadTop(vc)) return;
     nfb_doRefreshContent(vc);
+}
+
+static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
+    if (!vc || depth > 6) return;
+    NSString *ind = (depth > 0) ? [@"" stringByPaddingToLength:depth * 2 withString:@". " startingAtIndex:0] : @"";
+    NSMutableArray *r = [NSMutableArray array];
+    if ([vc respondsToSelector:@selector(loadNewer)]) [r addObject:@"loadNewer"];
+    if ([vc respondsToSelector:@selector(_t1_didPullToRefresh:)]) [r addObject:@"pull"];
+    if ([vc respondsToSelector:@selector(reloadTop:)]) [r addObject:@"reloadTop"];
+    if ([vc respondsToSelector:@selector(_refreshContent)]) [r addObject:@"refreshContent"];
+    if ([vc respondsToSelector:@selector(loadNewerWithSource:completion:)]) [r addObject:@"loadNewerSrc"];
+    if ([vc respondsToSelector:@selector(refreshWithLoadSource:completion:)]) [r addObject:@"refreshSrc"];
+    [s appendFormat:@"%@%@%@\n", ind, NSStringFromClass([vc class]),
+        r.count ? [NSString stringWithFormat:@"  <%@>", [r componentsJoinedByString:@","]] : @""];
+    id tl = nfb_timelineOf(vc);
+    if (tl) {
+        NSMutableArray *tr = [NSMutableArray array];
+        if ([tl respondsToSelector:@selector(loadNewer)]) [tr addObject:@"loadNewer"];
+        if ([tl respondsToSelector:@selector(loadNewerWithSource:completion:)]) [tr addObject:@"loadNewerSrc"];
+        if ([tl respondsToSelector:@selector(refreshWithLoadSource:completion:)]) [tr addObject:@"refreshSrc"];
+        [s appendFormat:@"%@  ⮡timeline=%@  <%@>\n", ind, NSStringFromClass([tl class]), [tr componentsJoinedByString:@","]];
+    }
+    for (UIViewController *c in vc.childViewControllers) nfb_dumpTree(c, depth + 1, s);
 }
 
 #pragma mark - gauge button
@@ -130,7 +175,18 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     [ac addAction:[UIAlertAction actionWithTitle:(on ? @"自動更新を OFF にする" : @"自動更新を ON にする") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_setStreamEnabled(!on); UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamStart(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"⏱ 更新間隔を変更…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showInterval]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🔧 更新方式テスト…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showTest]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🔍 診断情報（コピーして送って）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showDiag]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:ac];
+}
+- (void)showDiag {
+    UIViewController *active = gActiveItemsVC;
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"active=%@\n", active ? NSStringFromClass([active class]) : @"(nil)"];
+    nfb_dumpTree(nfb_homeRoot(active), 0, s);
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"診断情報" message:s preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"コピー" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIPasteboard.generalPasteboard.string = s; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
 - (void)showInterval {
