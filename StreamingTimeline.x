@@ -29,6 +29,7 @@ static void nfb_styleButton(BOOL on);
 static void nfb_updateGauge(BOOL on, NSTimeInterval interval);
 static void nfb_updateStreamStateIconForVC(UIViewController *vc);
 static BOOL nfb_homeTabSelectedOrUnknown(void);
+void NFBSetInlineColumnsEnabled(BOOL enabled);
 
 // Minimal bases so `self.view` resolves; everything else goes through objc_msgSend.
 @interface THFHomeTimelineContainerViewController : UIViewController
@@ -842,6 +843,7 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
         preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"🔄 今すぐ更新" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamTrigger(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:(on ? @"自動更新を OFF にする" : @"自動更新を ON にする") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_setStreamEnabled(!on); UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamStart(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:(gInlineColumnsEnabled ? @"カラムモードを OFF にする" : @"カラムモードを ON にする") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ NFBSetInlineColumnsEnabled(!gInlineColumnsEnabled); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"⏱ 更新間隔を変更…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showInterval]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🔧 更新方式テスト…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showTest]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🔍 診断情報（コピーして送って）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showDiag]; }]];

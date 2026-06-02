@@ -28,6 +28,7 @@
 #import "ModernSettingsViewController.h"
 
 extern void NFBSetInlineColumnsEnabled(BOOL enabled);
+extern BOOL NFBInlineColumnsEnabled(void);
 static BOOL gBHTSelectingHomeForColumns = NO;
 
 @class T1SettingsViewController;
@@ -4233,11 +4234,12 @@ static void BHTPresentColumnsViewController(void) {
 
     UIWindow *window = BHT_activeKeyWindow();
     if (!window.rootViewController) return;
-    NFBSetInlineColumnsEnabled(YES);
+    BOOL enableColumns = !NFBInlineColumnsEnabled();
+    NFBSetInlineColumnsEnabled(enableColumns);
     gBHTSelectingHomeForColumns = YES;
     BHTSelectTabPage(window.rootViewController, @"home");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NFBSetInlineColumnsEnabled(YES);
+        NFBSetInlineColumnsEnabled(enableColumns);
         gBHTSelectingHomeForColumns = NO;
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
