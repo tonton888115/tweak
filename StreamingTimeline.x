@@ -161,18 +161,78 @@ static BOOL nfb_doDynamicPullToLoadTop(id startVC) {
     return YES;
 }
 
+static BOOL nfb_scrollToTop(id vc, BOOL animated) {
+    if (nfb_resp(vc, @selector(scrollToTop))) {
+        ((void(*)(id,SEL))objc_msgSend)(vc, @selector(scrollToTop));
+        return YES;
+    }
+    if (nfb_resp(vc, @selector(scrollToTop:))) {
+        ((void(*)(id,SEL,BOOL))objc_msgSend)(vc, @selector(scrollToTop:), animated);
+        return YES;
+    }
+    UIScrollView *sv = nfb_scrollOf(vc);
+    if (!sv) return NO;
+    CGPoint p = sv.contentOffset;
+    p.y = -sv.adjustedContentInset.top;
+    [sv setContentOffset:p animated:animated];
+    return YES;
+}
+static UIControl *nfb_findHomeTabControl(UIView *view, BOOL inTabBar, int depth) {
+    if (!view || view.hidden || view.alpha < 0.01 || depth > 10) return nil;
+    NSString *cls = NSStringFromClass([view class]);
+    BOOL tabContext = inTabBar || [view isKindOfClass:UITabBar.class] || [cls containsString:@"TabBar"];
+    if (tabContext && [view isKindOfClass:UIControl.class]) {
+        UIControl *control = (UIControl *)view;
+        NSString *label = [control.accessibilityLabel ?: @"" lowercaseString];
+        NSString *identifier = [control.accessibilityIdentifier ?: @"" lowercaseString];
+        BOOL looksHome = [label containsString:@"home"] || [label containsString:@"ホーム"] ||
+                         [identifier containsString:@"home"] || [identifier containsString:@"timeline"];
+        if (looksHome || (control.selected && [cls containsString:@"TabBar"])) return control;
+    }
+    for (UIView *sub in view.subviews.reverseObjectEnumerator) {
+        UIControl *found = nfb_findHomeTabControl(sub, tabContext, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+static BOOL nfb_tapHomeTabLikeUser(void) {
+    NSArray<UIWindow *> *windows = UIApplication.sharedApplication.windows;
+    for (UIWindow *win in windows.reverseObjectEnumerator) {
+        if (win.hidden || win.alpha < 0.01) continue;
+        UIControl *control = nfb_findHomeTabControl(win, NO, 0);
+        if (!control) continue;
+        [control sendActionsForControlEvents:UIControlEventTouchUpInside];
+        return YES;
+    }
+    return NO;
+}
+static void nfb_revealTopAfterRefresh(UIViewController *vc) {
+    __weak UIViewController *wvc = vc;
+    void (^reveal)(void) = ^{
+        UIViewController *s = wvc;
+        if (!s || s != gActiveItemsVC || ![s isViewLoaded] || s.view.window == nil) return;
+        UIScrollView *sv = nfb_scrollOf(s);
+        if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) return;
+        nfb_tapHomeTabLikeUser();
+        nfb_scrollToTop(s, YES);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
+}
+
 static void nfb_streamTrigger(UIViewController *vc) {
     if (nfb_doLoadTop(vc)) {
         nfb_doSchedulePullUpdate(vc);
+        nfb_revealTopAfterRefresh(vc);
         return;
     }
-    if (nfb_doSchedulePullUpdate(vc))   return;
-    if (nfb_doDynamicPullToLoadTop(vc)) return;
-    if (nfb_doPullWithControl(vc))      return;
-    if (nfb_doPull(vc))                 return;
-    if (nfb_doLoadNewer(vc))            return;
-    if (nfb_doReloadTop(vc))            return;
-    nfb_doRefreshContent(vc);
+    if (nfb_doSchedulePullUpdate(vc))   { nfb_revealTopAfterRefresh(vc); return; }
+    if (nfb_doDynamicPullToLoadTop(vc)) { nfb_revealTopAfterRefresh(vc); return; }
+    if (nfb_doPullWithControl(vc))      { nfb_revealTopAfterRefresh(vc); return; }
+    if (nfb_doPull(vc))                 { nfb_revealTopAfterRefresh(vc); return; }
+    if (nfb_doLoadNewer(vc))            { nfb_revealTopAfterRefresh(vc); return; }
+    if (nfb_doReloadTop(vc))            { nfb_revealTopAfterRefresh(vc); return; }
+    if (nfb_doRefreshContent(vc))       nfb_revealTopAfterRefresh(vc);
 }
 
 // List a class's own+inherited refresh-ish method names (for the diagnostic dump).
@@ -340,11 +400,11 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
 - (void)showTest {
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"更新方式テスト"
         message:@"各ボタンでその方式の更新を1回試します。TLが更新された方式を教えてください。" preferredStyle:UIAlertControllerStyleActionSheet];
-    [ac addAction:[UIAlertAction actionWithTitle:@"A: loadTop(sender)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doLoadTop(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"B: loadTop:nil" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doLoadTopNil(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"C: schedulePullUpdate" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doSchedulePullUpdate(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"D: dynamic pullToLoadTop" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doDynamicPullToLoadTop(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"E: legacy container pull" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doPullWithControl(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"A: loadTop(sender)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc && nfb_doLoadTop(vc)) { nfb_doSchedulePullUpdate(vc); nfb_revealTopAfterRefresh(vc); } }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"B: loadTop:nil" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc && nfb_doLoadTopNil(vc)) nfb_revealTopAfterRefresh(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"C: schedulePullUpdate" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc && nfb_doSchedulePullUpdate(vc)) nfb_revealTopAfterRefresh(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"D: dynamic pullToLoadTop" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc && nfb_doDynamicPullToLoadTop(vc)) nfb_revealTopAfterRefresh(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"E: legacy container pull" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc && nfb_doPullWithControl(vc)) nfb_revealTopAfterRefresh(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
