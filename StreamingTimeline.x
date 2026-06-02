@@ -27,6 +27,8 @@ static UIViewController *nfb_selectedTimelineVC(UIViewController *vc);
 static void nfb_streamTrigger(UIViewController *vc);
 static void nfb_styleButton(BOOL on);
 static void nfb_updateGauge(BOOL on, NSTimeInterval interval);
+static void nfb_updateStreamStateIconForVC(UIViewController *vc);
+static BOOL nfb_homeTabSelectedOrUnknown(void);
 
 // Minimal bases so `self.view` resolves; everything else goes through objc_msgSend.
 @interface THFHomeTimelineContainerViewController : UIViewController
@@ -437,6 +439,12 @@ static BOOL nfb_isReadingAwayFromTop(UIViewController *vc) {
     CGFloat topY = -sv.adjustedContentInset.top;
     return sv.contentOffset.y > topY + 80.0;
 }
+static BOOL nfb_isTimelineAtTop(UIViewController *vc) {
+    UIScrollView *sv = nfb_mainScrollViewOf(vc);
+    if (!sv) return YES;
+    CGFloat topY = -sv.adjustedContentInset.top;
+    return sv.contentOffset.y <= topY + 8.0;
+}
 static UIControl *nfb_findHomeTabControl(UIView *view, BOOL inTabBar, int depth) {
     if (!view || view.hidden || view.alpha < 0.01 || depth > 10) return nil;
     NSString *cls = NSStringFromClass([view class]);
@@ -530,11 +538,15 @@ static void nfb_showNewTweetsPill(UIViewController *vc) {
     [UIView animateWithDuration:0.16 animations:^{ gNewTweetsPill.alpha = 1.0; }];
 }
 static void nfb_afterRefresh(UIViewController *vc) {
-    // The user wants streaming timelines to behave like a live feed: once an allowed
-    // timeline refreshes, return it to the newest content instead of leaving a pill.
+    if (!nfb_isTimelineAtTop(vc)) {
+        nfb_showNewTweetsPill(vc);
+        nfb_updateStreamStateIconForVC(vc);
+        return;
+    }
     nfb_hideNewTweetsPill();
     gPendingNewTweetsVC = nil;
     nfb_revealTopAfterRefresh(vc);
+    nfb_updateStreamStateIconForVC(vc);
 }
 
 // The Home container's currently-visible timeline VC: the For You items VC, the
@@ -567,11 +579,13 @@ static void nfb_streamTrigger(UIViewController *vc) {
     UIViewController *target = nfb_selectedTimelineVC(vc) ?: vc;
     if (nfb_isRecommendedHomeTimeline(target)) return;
 
-    BOOL readingAway = nfb_isReadingAwayFromTop(target);
-    if (!readingAway) {
-        nfb_hideNewTweetsPill();
-        nfb_scrollToTop(target, NO);
+    if (!nfb_isTimelineAtTop(target)) {
+        nfb_showNewTweetsPill(target);
+        nfb_updateStreamStateIconForVC(target);
+        return;
     }
+    nfb_hideNewTweetsPill();
+    nfb_scrollToTop(target, NO);
 
     // Resolve the refresh entry point inside the TARGET's own subtree only. Pinned
     // timelines wrap the real URT controller, so prefer leaf responders for pull/loadTop.
@@ -746,6 +760,7 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
 @end
 
 static NFBStreamButton *gStreamButton = nil;
+static UIImageView *gStreamStateIcon = nil;
 static void nfb_setStreamEnabled(BOOL on)    { [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"auto_stream_timeline"]; [[NSUserDefaults standardUserDefaults] synchronize]; }
 static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDefaults] setInteger:s forKey:@"auto_stream_interval"]; [[NSUserDefaults standardUserDefaults] synchronize]; }
 
@@ -849,6 +864,7 @@ static void nfb_styleButton(BOOL on) {
     [gStreamButton setImage:[[UIImage systemImageNamed:name withConfiguration:cfg] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
     gStreamButton.tintColor = on ? nil : [UIColor systemGrayColor];
     gStreamButton.gauge.hidden = !on;
+    nfb_updateStreamStateIconForVC(gActiveItemsVC);
 }
 static void nfb_updateGauge(BOOL on, NSTimeInterval interval) {
     if (!gStreamButton) return;
@@ -862,6 +878,32 @@ static void nfb_updateGauge(BOOL on, NSTimeInterval interval) {
     [g addAnimation:anim forKey:@"deplete"];
 }
 
+static BOOL nfb_streamCanRunForTarget(UIViewController *target) {
+    if (![BHTManager autoStreamTimeline]) return NO;
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return NO;
+    if (!nfb_homeTabSelectedOrUnknown()) return NO;
+    if (!target || ![target isViewLoaded] || target.view.window == nil) return NO;
+    if (nfb_isRecommendedHomeTimeline(target)) return NO;
+    UIScrollView *sv = nfb_mainScrollViewOf(target);
+    if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) return NO;
+    return nfb_isTimelineAtTop(target);
+}
+
+static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
+    if (!gStreamStateIcon) return;
+    UIViewController *target = vc ? (nfb_selectedTimelineVC(vc) ?: vc) : nil;
+    BOOL globalOn = [BHTManager autoStreamTimeline];
+    BOOL active = nfb_streamCanRunForTarget(target);
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightSemibold];
+    NSString *name = active ? @"bolt.circle.fill" : (globalOn ? @"pause.circle.fill" : @"power.circle");
+    UIImage *image = [UIImage systemImageNamed:name withConfiguration:cfg];
+    if (!image) image = [UIImage systemImageNamed:(active ? @"checkmark.circle.fill" : @"xmark.circle") withConfiguration:cfg];
+    gStreamStateIcon.image = [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    gStreamStateIcon.tintColor = active ? [UIColor systemGreenColor] : (globalOn ? [UIColor systemOrangeColor] : [UIColor systemGrayColor]);
+    gStreamStateIcon.accessibilityLabel = active ? @"ストリーミング有効" : @"ストリーミング一時停止";
+    gStreamStateIcon.hidden = NO;
+}
+
 static void nfb_installButton(UIWindow *win) {
     if (!win) return;
     if (!gStreamButton) {
@@ -872,6 +914,13 @@ static void nfb_installButton(UIWindow *win) {
         UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:[NFBStreamHandler shared] action:@selector(longPress:)];
         lp.minimumPressDuration = 0.4;
         [gStreamButton addGestureRecognizer:lp];
+    }
+    if (!gStreamStateIcon) {
+        gStreamStateIcon = [[UIImageView alloc] initWithFrame:CGRectZero];
+        gStreamStateIcon.translatesAutoresizingMaskIntoConstraints = NO;
+        gStreamStateIcon.contentMode = UIViewContentModeScaleAspectFit;
+        gStreamStateIcon.userInteractionEnabled = NO;
+        gStreamStateIcon.accessibilityElementsHidden = NO;
     }
     if (gStreamButton.superview != win) {
         [gStreamButton removeFromSuperview];
@@ -884,15 +933,29 @@ static void nfb_installButton(UIWindow *win) {
             [gStreamButton.heightAnchor constraintEqualToConstant:46.0],
         ]];
     }
+    if (gStreamStateIcon.superview != win) {
+        [gStreamStateIcon removeFromSuperview];
+        [win addSubview:gStreamStateIcon];
+        [NSLayoutConstraint activateConstraints:@[
+            [gStreamStateIcon.centerYAnchor constraintEqualToAnchor:gStreamButton.centerYAnchor],
+            [gStreamStateIcon.trailingAnchor constraintEqualToAnchor:gStreamButton.leadingAnchor constant:-1.0],
+            [gStreamStateIcon.widthAnchor constraintEqualToConstant:24.0],
+            [gStreamStateIcon.heightAnchor constraintEqualToConstant:24.0],
+        ]];
+    }
     [win bringSubviewToFront:gStreamButton];
+    [win bringSubviewToFront:gStreamStateIcon];
     gStreamButton.alpha = 1.0;
+    gStreamStateIcon.alpha = 1.0;
     gStreamButton.userInteractionEnabled = YES;
     BOOL on = [BHTManager autoStreamTimeline];
     nfb_styleButton(on);
     nfb_updateGauge(on, (NSTimeInterval)[BHTManager autoStreamInterval]);
+    nfb_updateStreamStateIconForVC(gActiveItemsVC);
 }
 static void nfb_removeButton(void) {
     if (gStreamButton) { [gStreamButton.gauge removeAnimationForKey:@"deplete"]; [gStreamButton removeFromSuperview]; }
+    if (gStreamStateIcon) [gStreamStateIcon removeFromSuperview];
     nfb_hideNewTweetsPill();
     gPendingNewTweetsVC = nil;
 }
@@ -900,17 +963,24 @@ static void nfb_removeButton(void) {
 // Fade with the header: hide while scrolling down, show at top / scrolling up.
 static void nfb_visibilityForScroll(UIScrollView *sv) {
     if (!gStreamButton || gStreamButton.window == nil) return;
+    nfb_updateStreamStateIconForVC(gActiveItemsVC);
     static CGFloat last = 0;
     CGFloat y = sv.contentOffset.y;
     CGFloat topY = -sv.adjustedContentInset.top;
     BOOL atTop = (y <= topY + 4.0);
+    if (atTop && gNewTweetsPill) {
+        nfb_hideNewTweetsPill();
+        gPendingNewTweetsVC = nil;
+    }
     CGFloat dy = y - last; last = y;
     CGFloat target = gStreamButton.alpha;
     if (atTop || dy < -2.0) target = 1.0;          // at top or scrolling up
     else if (dy > 2.0) target = 0.0;               // scrolling down
     if (fabs(gStreamButton.alpha - target) < 0.01) return;
-    [UIView animateWithDuration:0.2 animations:^{ gStreamButton.alpha = target; }
-                     completion:^(BOOL f){ gStreamButton.userInteractionEnabled = (target > 0.5); }];
+    [UIView animateWithDuration:0.2 animations:^{
+        gStreamButton.alpha = target;
+        if (gStreamStateIcon) gStreamStateIcon.alpha = target;
+    } completion:^(BOOL f){ gStreamButton.userInteractionEnabled = (target > 0.5); }];
 }
 
 static NSString *nfb_scribePageOfTabView(UIView *view) {
@@ -980,8 +1050,17 @@ static BOOL nfb_streamShouldFire(UIViewController *vc) {
     if (nfb_isRecommendedHomeTimeline(target)) return NO;       // For You -> never auto-refresh
     UIScrollView *sv = nfb_mainScrollViewOf(target);
     if (sv) {
-        if (sv.isDragging || sv.isDecelerating || sv.isTracking) return NO;
+        if (sv.isDragging || sv.isDecelerating || sv.isTracking) {
+            nfb_updateStreamStateIconForVC(target);
+            return NO;
+        }
     }
+    if (!nfb_isTimelineAtTop(target)) {
+        nfb_showNewTweetsPill(target);
+        nfb_updateStreamStateIconForVC(target);
+        return NO;
+    }
+    nfb_updateStreamStateIconForVC(target);
     return YES;
 }
 static void nfb_streamStop(UIViewController *vc) {
@@ -1000,7 +1079,7 @@ static void nfb_streamStart(UIViewController *vc) {
     NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:interval repeats:YES block:^(NSTimer *t) {
         UIViewController *s = wvc;
         if (!s) { [t invalidate]; return; }
-        if (![BHTManager autoStreamTimeline]) { nfb_streamStop(s); nfb_styleButton(NO); nfb_updateGauge(NO, 0); return; }
+        if (![BHTManager autoStreamTimeline]) { nfb_streamStop(s); nfb_styleButton(NO); nfb_updateGauge(NO, 0); nfb_updateStreamStateIconForVC(s); return; }
         if (nfb_streamShouldFire(s)) {
             // Both the For-You and Following home VCs run a timer; dedup so the visible
             // timeline isn't refreshed twice per interval.

@@ -28,7 +28,7 @@
 #import "ModernSettingsViewController.h"
 
 extern void NFBSetInlineColumnsEnabled(BOOL enabled);
-extern BOOL NFBInlineColumnsEnabled(void);
+static BOOL gBHTSelectingHomeForColumns = NO;
 
 @class T1SettingsViewController;
 
@@ -618,6 +618,23 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     } else {
         %orig(scrolling);
     }
+}
+
+- (void)setSelectedIndex:(NSInteger)selectedIndex {
+    if (!gBHTSelectingHomeForColumns) {
+        @try {
+            NSArray *tabViews = [self valueForKey:@"tabViews"];
+            if (selectedIndex >= 0 && selectedIndex < (NSInteger)tabViews.count) {
+                id tabView = tabViews[(NSUInteger)selectedIndex];
+                NSString *page = [tabView valueForKey:@"scribePage"];
+                if ([page isEqualToString:@"home"]) {
+                    NFBSetInlineColumnsEnabled(NO);
+                }
+            }
+        } @catch (NSException *e) {
+        }
+    }
+    %orig(selectedIndex);
 }
 
 - (void)loadView {
@@ -4127,7 +4144,7 @@ static char kManualRefreshInProgressKey;
 
 // MARK: - Classic Tab Bar Icon Theming
 static char kBHTColumnsTapGestureKey;
-static char kBHTHomeColumnsExitTapGestureKey;
+static NSTimeInterval gBHTLastColumnsOpen = 0;
 
 static NSString *BHTColumnsTabTitle(void) {
     NSString *title = [[BHTBundle sharedBundle] localizedStringForKey:@"CUSTOM_TAB_BAR_COLUMNS"];
@@ -4148,10 +4165,6 @@ static NSString *BHTPageOfTabView(T1TabView *tabView) {
 
 static BOOL BHTIsColumnsTabView(T1TabView *tabView) {
     return [BHTPageOfTabView(tabView) isEqualToString:@"communities"];
-}
-
-static BOOL BHTIsHomeTabView(T1TabView *tabView) {
-    return [BHTPageOfTabView(tabView) isEqualToString:@"home"];
 }
 
 static UIViewController *BHTFindControllerOfClass(UIViewController *root, Class targetClass, NSInteger depth) {
@@ -4214,17 +4227,22 @@ static void BHTSelectTabPage(UIViewController *root, NSString *pageID) {
 }
 
 static void BHTPresentColumnsViewController(void) {
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - gBHTLastColumnsOpen < 0.35) return;
+    gBHTLastColumnsOpen = now;
+
     UIWindow *window = BHT_activeKeyWindow();
     if (!window.rootViewController) return;
     NFBSetInlineColumnsEnabled(YES);
+    gBHTSelectingHomeForColumns = YES;
     BHTSelectTabPage(window.rootViewController, @"home");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NFBSetInlineColumnsEnabled(YES);
+        gBHTSelectingHomeForColumns = NO;
     });
-}
-
-static void BHTLeaveColumnsMode(void) {
-    if (NFBInlineColumnsEnabled()) NFBSetInlineColumnsEnabled(NO);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gBHTSelectingHomeForColumns = NO;
+    });
 }
 
 %hook T1TabView
@@ -4276,22 +4294,7 @@ static void BHTLeaveColumnsMode(void) {
 }
 
 %new
-- (void)bh_leaveColumnsForHomeTap:(UITapGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateEnded) return;
-    BHTLeaveColumnsMode();
-}
-
-%new
 - (void)bh_setupColumnsTabIfNeeded {
-    if (BHTIsHomeTabView((T1TabView *)self)) {
-        if (!objc_getAssociatedObject(self, &kBHTHomeColumnsExitTapGestureKey)) {
-            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bh_leaveColumnsForHomeTap:)];
-            tap.cancelsTouchesInView = NO;
-            [self addGestureRecognizer:tap];
-            objc_setAssociatedObject(self, &kBHTHomeColumnsExitTapGestureKey, tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        return;
-    }
     if (!BHTIsColumnsTabView((T1TabView *)self)) return;
 
     UILabel *titleLabel = [self valueForKey:@"titleLabel"];
@@ -4304,7 +4307,9 @@ static void BHTLeaveColumnsMode(void) {
 
     if (!objc_getAssociatedObject(self, &kBHTColumnsTapGestureKey)) {
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bh_openColumns:)];
-        tap.cancelsTouchesInView = YES;
+        tap.cancelsTouchesInView = NO;
+        tap.delaysTouchesBegan = NO;
+        tap.delaysTouchesEnded = NO;
         [self addGestureRecognizer:tap];
         objc_setAssociatedObject(self, &kBHTColumnsTapGestureKey, tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
@@ -4344,6 +4349,24 @@ static void BHTLeaveColumnsMode(void) {
     // Always apply theming logic (handles both enabled and disabled cases)
     [self performSelector:@selector(bh_applyCurrentThemeToIcon)];
     [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
+    if (selected && BHTIsColumnsTabView((T1TabView *)self)) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BHTPresentColumnsViewController();
+        });
+    }
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    BOOL isColumns = BHTIsColumnsTabView((T1TabView *)self);
+    BOOL isHome = [BHTPageOfTabView((T1TabView *)self) isEqualToString:@"home"];
+    %orig(touches, event);
+    if (isColumns) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BHTPresentColumnsViewController();
+        });
+    } else if (isHome) {
+        NFBSetInlineColumnsEnabled(NO);
+    }
 }
 
 - (void)didMoveToWindow {
