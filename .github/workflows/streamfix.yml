@@ -1,0 +1,82 @@
+name: Build sideload-ready dylib (rpath + ad-hoc signed)
+
+# Builds BHTwitter.dylib, rewrites the Cephei/CydiaSubstrate install names from the
+# jailbreak absolute paths to @rpath (so it loads from the app's own Frameworks/ in a
+# sideloaded / LiveContainer install), then re-signs ad-hoc with ldid so the signature
+# is valid. Uploads just the finished dylib for swapping into an existing IPA.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_version:
+        description: "iOS SDK Version"
+        default: "16.5"
+        required: true
+      target_version:
+        description: "Target iOS Version"
+        default: "14.0"
+        required: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: main
+          submodules: recursive
+
+      - name: Install dependencies
+        run: brew install make dpkg ldid
+
+      - name: Add GNU Make to PATH
+        run: echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Download Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          ref: master
+          path: theos
+          submodules: recursive
+
+      - name: Download iOS SDK
+        run: |
+          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks/
+          cd sdks
+          git sparse-checkout set --no-cone iPhoneOS${{ inputs.sdk_version }}.sdk
+          git checkout
+          mv ./*.sdk "${THEOS}/sdks"
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Build dylib
+        run: |
+          cd main
+          sed -i '' "s/^TARGET.*$/TARGET := iphone:clang:${{ inputs.sdk_version }}:${{ inputs.target_version }}/" Makefile
+          make clean || true
+          make
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Rewrite install names to @rpath and re-sign
+        run: |
+          cd main
+          DYLIB=$(find .theos -name 'BHTwitter.dylib' | head -n1)
+          echo "dylib: $DYLIB"
+          for fw in Cephei CepheiPrefs CepheiUI CydiaSubstrate; do
+            install_name_tool -change "/Library/Frameworks/$fw.framework/$fw" "@rpath/$fw.framework/$fw" "$DYLIB"
+          done
+          ldid -S "$DYLIB"
+          echo "=== resulting load commands (Cephei/Cydia) ==="
+          otool -L "$DYLIB" | grep -Ei 'cephei|cydia' || true
+          mkdir -p ../out
+          cp "$DYLIB" ../out/BHTwitter.dylib
+
+      - name: Upload fixed dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: BHTwitter-dylib-sideload
+          path: out/BHTwitter.dylib
+          if-no-files-found: error
