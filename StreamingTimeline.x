@@ -31,6 +31,8 @@ static void nfb_removeButton(void);
 @interface T1HomeTimelineItemsViewController : UIViewController
 @end
 
+static __weak UIViewController *gActiveItemsVC = nil;   // the visible Home timeline list
+
 #pragma mark - refresh callers (no signature assumptions)
 
 static BOOL nfb_resp(id o, SEL s) { return o && [o respondsToSelector:s]; }
@@ -191,7 +193,6 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
 @end
 
 static NFBStreamButton *gStreamButton = nil;
-static __weak UIViewController *gActiveItemsVC = nil;   // the visible Home timeline list
 
 static void nfb_setStreamEnabled(BOOL on)    { [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"auto_stream_timeline"]; }
 static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDefaults] setInteger:s forKey:@"auto_stream_interval"]; }
