@@ -38,6 +38,7 @@ static __weak UIViewController *gActiveItemsVC = nil;   // the visible Home time
 static BOOL nfb_resp(id o, SEL s) { return o && [o respondsToSelector:s]; }
 static id   nfb_timelineOf(id vc) { return nfb_resp(vc, @selector(timeline)) ? ((id(*)(id,SEL))objc_msgSend)(vc, @selector(timeline)) : nil; }
 static UIScrollView *nfb_scrollOf(id vc) { return nfb_resp(vc, @selector(scrollView)) ? ((id(*)(id,SEL))objc_msgSend)(vc, @selector(scrollView)) : nil; }
+static id nfb_findPullControl(UIViewController *startVC);
 
 // Walk up to the Home container, then search the whole VC subtree (+ each VC's
 // `timeline`) for an object that responds to `sel`. The refresh entry point may live
@@ -85,6 +86,15 @@ static BOOL nfb_doSchedulePullUpdate(id startVC) {
     return NO;
 }
 static BOOL nfb_doLoadTop(id startVC) {
+    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(loadTop:), 0);
+    if (t) {
+        id sender = nfb_findPullControl(startVC);
+        ((void(*)(id,SEL,id))objc_msgSend)(t, @selector(loadTop:), sender);
+        return YES;
+    }
+    return NO;
+}
+static BOOL nfb_doLoadTopNil(id startVC) {
     id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(loadTop:), 0);
     if (t) { ((void(*)(id,SEL,id))objc_msgSend)(t, @selector(loadTop:), nil); return YES; }
     return NO;
@@ -152,10 +162,12 @@ static BOOL nfb_doDynamicPullToLoadTop(id startVC) {
 }
 
 static void nfb_streamTrigger(UIViewController *vc) {
-    if (nfb_doDynamicPullToLoadTop(vc)) return;
-    if (nfb_doLoadTop(vc))              return;
-    if (nfb_doTimelineRefresh(vc))      return;
+    if (nfb_doLoadTop(vc)) {
+        nfb_doSchedulePullUpdate(vc);
+        return;
+    }
     if (nfb_doSchedulePullUpdate(vc))   return;
+    if (nfb_doDynamicPullToLoadTop(vc)) return;
     if (nfb_doPullWithControl(vc))      return;
     if (nfb_doPull(vc))                 return;
     if (nfb_doLoadNewer(vc))            return;
@@ -183,6 +195,20 @@ static NSString *nfb_refreshMethodsOf(Class cls) {
     }
     return [out componentsJoinedByString:@" "];
 }
+static Method nfb_methodFor(id obj, SEL sel) {
+    Class c = [obj class]; int guard = 0;
+    while (c && guard++ < 8) {
+        Method m = class_getInstanceMethod(c, sel);
+        if (m) return m;
+        c = class_getSuperclass(c);
+    }
+    return NULL;
+}
+static void nfb_appendMethodType(NSMutableString *s, NSString *ind, id obj, SEL sel) {
+    Method m = nfb_methodFor(obj, sel);
+    const char *enc = m ? method_getTypeEncoding(m) : NULL;
+    if (enc) [s appendFormat:@"%@   enc %@ = %s\n", ind, NSStringFromSelector(sel), enc];
+}
 
 static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
     if (!vc || depth > 6) return;
@@ -202,6 +228,9 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
         r.count ? [NSString stringWithFormat:@"  <%@>", [r componentsJoinedByString:@","]] : @""];
     NSString *meth = nfb_refreshMethodsOf([vc class]);
     if (meth.length) [s appendFormat:@"%@   m: %@\n", ind, meth];
+    if ([vc respondsToSelector:@selector(loadTop:)]) nfb_appendMethodType(s, ind, vc, @selector(loadTop:));
+    if ([vc respondsToSelector:@selector(_tfn_dynamic_didPullToLoadTop:)]) nfb_appendMethodType(s, ind, vc, @selector(_tfn_dynamic_didPullToLoadTop:));
+    if ([vc respondsToSelector:@selector(schedulePullToRefreshUpdate)]) nfb_appendMethodType(s, ind, vc, @selector(schedulePullToRefreshUpdate));
     id tl = nfb_timelineOf(vc);
     if (tl) {
         NSMutableArray *tr = [NSMutableArray array];
@@ -211,6 +240,8 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
             tr.count ? [NSString stringWithFormat:@"  <%@>", [tr componentsJoinedByString:@","]] : @""];
         NSString *tm = nfb_refreshMethodsOf([tl class]);
         if (tm.length) [s appendFormat:@"%@   tl.m: %@\n", ind, tm];
+        if ([tl respondsToSelector:@selector(refreshWithSource:completion:)]) nfb_appendMethodType(s, ind, tl, @selector(refreshWithSource:completion:));
+        if ([tl respondsToSelector:@selector(refreshWithSource:pushToHomeTweetId:completion:)]) nfb_appendMethodType(s, ind, tl, @selector(refreshWithSource:pushToHomeTweetId:completion:));
     }
     for (UIViewController *c in vc.childViewControllers) nfb_dumpTree(c, depth + 1, s);
 }
@@ -309,10 +340,10 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
 - (void)showTest {
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"更新方式テスト"
         message:@"各ボタンでその方式の更新を1回試します。TLが更新された方式を教えてください。" preferredStyle:UIAlertControllerStyleActionSheet];
-    [ac addAction:[UIAlertAction actionWithTitle:@"A: dynamic pullToLoadTop" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doDynamicPullToLoadTop(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"B: loadTop:nil" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doLoadTop(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"C: timeline refresh" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doTimelineRefresh(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"D: schedulePullUpdate" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doSchedulePullUpdate(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"A: loadTop(sender)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doLoadTop(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"B: loadTop:nil" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doLoadTopNil(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"C: schedulePullUpdate" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doSchedulePullUpdate(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"D: dynamic pullToLoadTop" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doDynamicPullToLoadTop(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"E: legacy container pull" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doPullWithControl(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
