@@ -51,6 +51,9 @@ static BOOL gInlineColumnsEnabled = NO;
 static BOOL gActiveTimelineAtTop = YES;
 static CGFloat gActiveTimelineOffsetY = 0.0;
 static CGFloat gActiveTimelineTopY = 0.0;
+static NSTimeInterval gLastUserTimelineScrollInteraction = 0.0;
+static NSTimeInterval gRefreshStartedAt = 0.0;
+static BOOL gRefreshStartedAtTop = NO;
 
 #pragma mark - refresh callers (no signature assumptions)
 
@@ -457,6 +460,9 @@ static void nfb_noteActiveTimelineScroll(UIScrollView *sv) {
     gActiveTimelineOffsetY = sv.contentOffset.y;
     gActiveTimelineTopY = -sv.adjustedContentInset.top;
     gActiveTimelineAtTop = (gActiveTimelineOffsetY <= gActiveTimelineTopY + 8.0);
+    if (sv.isDragging || sv.isTracking || sv.isDecelerating) {
+        gLastUserTimelineScrollInteraction = CACurrentMediaTime();
+    }
 }
 static BOOL nfb_visibleTimelineAtTop(UIViewController *vc) {
     UIScrollView *activeScroll = gActiveTimelineScrollView;
@@ -465,6 +471,18 @@ static BOOL nfb_visibleTimelineAtTop(UIViewController *vc) {
         return activeScroll.contentOffset.y <= topY + 8.0;
     }
     return nfb_isTimelineAtTop(vc);
+}
+static BOOL nfb_canRevealRefreshStartedAtTop(UIViewController *vc) {
+    if (!gRefreshStartedAtTop) return NO;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - gRefreshStartedAt > 12.0) return NO;
+    if (gLastUserTimelineScrollInteraction > gRefreshStartedAt + 0.05) return NO;
+    UIViewController *active = gActiveItemsVC;
+    if (active && vc && vc != active) {
+        UIViewController *selected = nfb_selectedTimelineVC(active);
+        if (selected && vc != selected) return NO;
+    }
+    return YES;
 }
 static UIControl *nfb_findHomeTabControl(UIView *view, BOOL inTabBar, int depth) {
     if (!view || view.hidden || view.alpha < 0.01 || depth > 10) return nil;
@@ -516,12 +534,12 @@ static void nfb_revealTopAfterRefresh(UIViewController *vc) {
         }
         UIScrollView *sv = nfb_mainScrollViewOf(s);
         if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) return;
-        if (!nfb_visibleTimelineAtTop(s)) {
+        if (!nfb_visibleTimelineAtTop(s) && !nfb_canRevealRefreshStartedAtTop(s)) {
             nfb_showNewTweetsPill(s);
             nfb_updateStreamStateIconForVC(s);
             return;
         }
-        if (!tappedHomeTab && s == gActiveItemsVC) {
+        if (!gInlineColumnsEnabled && !tappedHomeTab && s == gActiveItemsVC) {
             tappedHomeTab = nfb_tapHomeTabLikeUser();
         }
         nfb_scrollToTop(s, NO);
@@ -564,7 +582,7 @@ static void nfb_showNewTweetsPill(UIViewController *vc) {
     [UIView animateWithDuration:0.16 animations:^{ gNewTweetsPill.alpha = 1.0; }];
 }
 static void nfb_afterRefresh(UIViewController *vc) {
-    if (!nfb_visibleTimelineAtTop(vc)) {
+    if (!nfb_visibleTimelineAtTop(vc) && !nfb_canRevealRefreshStartedAtTop(vc)) {
         nfb_showNewTweetsPill(vc);
         nfb_updateStreamStateIconForVC(vc);
         return;
@@ -606,10 +624,13 @@ static void nfb_streamTrigger(UIViewController *vc) {
     if (nfb_isRecommendedHomeTimeline(target)) return;
 
     if (!nfb_visibleTimelineAtTop(target)) {
+        gRefreshStartedAtTop = NO;
         nfb_showNewTweetsPill(target);
         nfb_updateStreamStateIconForVC(target);
         return;
     }
+    gRefreshStartedAt = CACurrentMediaTime();
+    gRefreshStartedAtTop = YES;
     nfb_hideNewTweetsPill();
     nfb_scrollToTop(target, NO);
 
@@ -700,8 +721,9 @@ static void nfb_appendScrollDiag(NSMutableString *s, UIViewController *vc) {
             sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height,
             sv.adjustedContentInset.top, sv.adjustedContentInset.left, sv.adjustedContentInset.bottom, sv.adjustedContentInset.right,
             sv.alwaysBounceVertical ? 1 : 0];
-        [s appendFormat:@"streamGuard vcAtTop=%d visibleAtTop=%d activeOffsetY=%.1f activeTopY=%.1f\n",
+        [s appendFormat:@"streamGuard vcAtTop=%d visibleAtTop=%d refreshStartedAtTop=%d canRevealStartedAtTop=%d inlineColumns=%d activeOffsetY=%.1f activeTopY=%.1f\n",
             nfb_isTimelineAtTop(vc) ? 1 : 0, nfb_visibleTimelineAtTop(vc) ? 1 : 0,
+            gRefreshStartedAtTop ? 1 : 0, nfb_canRevealRefreshStartedAtTop(vc) ? 1 : 0, gInlineColumnsEnabled ? 1 : 0,
             gActiveTimelineOffsetY, gActiveTimelineTopY];
     } else {
         [s appendString:@"scroll=(nil)\n"];
@@ -916,7 +938,7 @@ static BOOL nfb_streamCanRunForTarget(UIViewController *target) {
     if (nfb_isRecommendedHomeTimeline(target)) return NO;
     UIScrollView *sv = nfb_mainScrollViewOf(target);
     if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) return NO;
-    return nfb_visibleTimelineAtTop(target);
+    return nfb_visibleTimelineAtTop(target) || nfb_canRevealRefreshStartedAtTop(target);
 }
 
 static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
@@ -1175,9 +1197,93 @@ static char kNFBInlineColumnsIndicatorKey;
 static char kNFBInlineColumnsClipsKey;
 static char kNFBInlineColumnsDirectionalLockKey;
 static char kNFBInlineColumnsContentSizeKey;
+static char kNFBInlineColumnsChromeSavedKey;
+static char kNFBInlineColumnsChromeHiddenKey;
+static char kNFBInlineColumnsChromeAlphaKey;
+static char kNFBInlineColumnsChromeInteractionKey;
 
 static BOOL nfb_isHomePagingController(UIViewController *vc) {
     return nfb_parentControllerNamed(vc, @"HomeTimelineContainer") != nil;
+}
+
+static BOOL nfb_viewContainsDescendant(UIView *root, UIView *descendant) {
+    if (!root || !descendant) return NO;
+    if (root == descendant) return YES;
+    for (UIView *subview in root.subviews) {
+        if (nfb_viewContainsDescendant(subview, descendant)) return YES;
+    }
+    return NO;
+}
+
+static void nfb_setColumnsChromeViewHidden(UIView *view, BOOL hidden) {
+    if (!view) return;
+    if (hidden) {
+        if (!objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey)) {
+            objc_setAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(view, &kNFBInlineColumnsChromeHiddenKey, @(view.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(view, &kNFBInlineColumnsChromeAlphaKey, @(view.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(view, &kNFBInlineColumnsChromeInteractionKey, @(view.userInteractionEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        view.hidden = YES;
+        view.alpha = 0.0;
+        view.userInteractionEnabled = NO;
+        return;
+    }
+    if (!objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey)) return;
+    NSNumber *wasHidden = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeHiddenKey);
+    NSNumber *alpha = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeAlphaKey);
+    NSNumber *interactive = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeInteractionKey);
+    view.hidden = wasHidden ? wasHidden.boolValue : NO;
+    view.alpha = alpha ? alpha.doubleValue : 1.0;
+    view.userInteractionEnabled = interactive ? interactive.boolValue : YES;
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeInteractionKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static BOOL nfb_columnsChromeCandidate(UIView *view, UIView *root) {
+    if (!view || !root || view == root || view.hidden || view.alpha < 0.01) return NO;
+    CGRect frame = [view.superview convertRect:view.frame toView:root];
+    if (frame.size.width < 80.0 || frame.size.height < 8.0 || frame.size.height > 140.0) return NO;
+    if (CGRectGetMinY(frame) > 180.0) return NO;
+    NSString *cls = NSStringFromClass(view.class);
+    if ([cls containsString:@"Segment"] || [cls containsString:@"Tab"] || [cls containsString:@"LabelBar"]) return YES;
+    if ([cls containsString:@"Bar"] && frame.size.height <= 120.0) return YES;
+    return CGRectGetMaxY(frame) <= 140.0 && view.subviews.count > 0;
+}
+
+static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView *root, int depth) {
+    if (!view || !root || depth > 8) return NO;
+    if (view == pagingView) return NO;
+    BOOL containsPaging = nfb_viewContainsDescendant(view, pagingView);
+    if (!containsPaging && nfb_columnsChromeCandidate(view, root)) {
+        nfb_setColumnsChromeViewHidden(view, YES);
+        return YES;
+    }
+    BOOL did = NO;
+    for (UIView *subview in view.subviews) {
+        did = nfb_hideColumnsChromeInView(subview, pagingView, root, depth + 1) || did;
+    }
+    return did;
+}
+
+static void nfb_restoreColumnsChromeInView(UIView *view, int depth) {
+    if (!view || depth > 10) return;
+    nfb_setColumnsChromeViewHidden(view, NO);
+    for (UIView *subview in view.subviews) {
+        nfb_restoreColumnsChromeInView(subview, depth + 1);
+    }
+}
+
+static void nfb_setColumnsSegmentedHiddenForPaging(UIViewController *paging, BOOL hidden) {
+    UIViewController *segmented = nfb_parentControllerNamed(paging, @"Segmented");
+    if (!segmented || ![segmented isViewLoaded] || ![paging isViewLoaded]) return;
+    if (hidden) {
+        nfb_hideColumnsChromeInView(segmented.view, paging.view, segmented.view, 0);
+    } else {
+        nfb_restoreColumnsChromeInView(segmented.view, 0);
+    }
 }
 
 static CGFloat nfb_horizontalScrollScore(UIScrollView *sv) {
@@ -1246,6 +1352,7 @@ static void nfb_rememberInlineColumnsOriginals(UIScrollView *scrollView) {
 
 static void nfb_restoreInlineColumns(UIViewController *paging) {
     if (!nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    nfb_setColumnsSegmentedHiddenForPaging(paging, NO);
     UIScrollView *scrollView = nfb_horizontalPagingScrollViewOf(paging);
     if (!scrollView || !objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey)) return;
 
@@ -1283,6 +1390,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
 
 static void nfb_applyInlineColumns(UIViewController *paging) {
     if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
     UIScrollView *scrollView = nfb_horizontalPagingScrollViewOf(paging);
     if (!scrollView || scrollView.bounds.size.width < 100.0 || scrollView.bounds.size.height < 100.0) return;
 

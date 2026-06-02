@@ -28,8 +28,10 @@
 #import "ModernSettingsViewController.h"
 
 extern void NFBSetInlineColumnsEnabled(BOOL enabled);
-extern BOOL NFBInlineColumnsEnabled(void);
 static BOOL gBHTSelectingHomeForColumns = NO;
+static BOOL gBHTApplyingColumnsTabSelection = NO;
+static BOOL BHTIsColumnsPageID(NSString *page);
+static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSelected);
 
 @class T1SettingsViewController;
 
@@ -622,13 +624,14 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
 }
 
 - (void)setSelectedIndex:(NSInteger)selectedIndex {
+    NSString *page = nil;
     if (!gBHTSelectingHomeForColumns) {
         @try {
             NSArray *tabViews = [self valueForKey:@"tabViews"];
             if (selectedIndex >= 0 && selectedIndex < (NSInteger)tabViews.count) {
                 id tabView = tabViews[(NSUInteger)selectedIndex];
-                NSString *page = [tabView valueForKey:@"scribePage"];
-                if ([page isEqualToString:@"home"]) {
+                page = [tabView valueForKey:@"scribePage"];
+                if (!BHTIsColumnsPageID(page)) {
                     NFBSetInlineColumnsEnabled(NO);
                 }
             }
@@ -636,6 +639,9 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
         }
     }
     %orig(selectedIndex);
+    if (!gBHTSelectingHomeForColumns && !BHTIsColumnsPageID(page)) {
+        BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
+    }
 }
 
 - (void)loadView {
@@ -4164,8 +4170,21 @@ static NSString *BHTPageOfTabView(T1TabView *tabView) {
     return page;
 }
 
+static BOOL BHTIsColumnsPageID(NSString *page) {
+    return [page isEqualToString:@"communities"];
+}
+
 static BOOL BHTIsColumnsTabView(T1TabView *tabView) {
-    return [BHTPageOfTabView(tabView) isEqualToString:@"communities"];
+    if (BHTIsColumnsPageID(BHTPageOfTabView(tabView))) return YES;
+    NSString *title = nil;
+    @try {
+        UILabel *titleLabel = [tabView valueForKey:@"titleLabel"];
+        title = titleLabel.text ?: tabView.accessibilityLabel;
+    } @catch (NSException *e) {
+        title = tabView.accessibilityLabel;
+    }
+    NSString *lower = title.lowercaseString;
+    return [title isEqualToString:BHTColumnsTabTitle()] || [title containsString:@"カラム"] || [lower containsString:@"columns"];
 }
 
 static UIViewController *BHTFindControllerOfClass(UIViewController *root, Class targetClass, NSInteger depth) {
@@ -4227,6 +4246,35 @@ static void BHTSelectTabPage(UIViewController *root, NSString *pageID) {
     }
 }
 
+static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSelected) {
+    Class tabBarClass = NSClassFromString(@"T1TabBarViewController");
+    if (!root || !tabBarClass) return;
+    UIViewController *tabBarController = [root isKindOfClass:tabBarClass] ? root : BHTFindControllerOfClass(root, tabBarClass, 0);
+    NSArray *tabViews = nil;
+    @try {
+        tabViews = [tabBarController valueForKey:@"tabViews"];
+    } @catch (NSException *e) {
+        tabViews = nil;
+    }
+    if (!tabViews.count) return;
+
+    gBHTApplyingColumnsTabSelection = YES;
+    @try {
+        for (id tabView in tabViews) {
+            NSString *page = BHTPageOfTabView((T1TabView *)tabView);
+            BOOL isColumns = BHTIsColumnsTabView((T1TabView *)tabView);
+            BOOL shouldSelect = isColumns ? columnsSelected : NO;
+            if (columnsSelected && [page isEqualToString:@"home"]) shouldSelect = NO;
+            if (!columnsSelected && !isColumns) continue;
+            if ([tabView respondsToSelector:@selector(setSelected:)]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(tabView, @selector(setSelected:), shouldSelect);
+            }
+        }
+    } @finally {
+        gBHTApplyingColumnsTabSelection = NO;
+    }
+}
+
 static void BHTPresentColumnsViewController(void) {
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (now - gBHTLastColumnsOpen < 0.35) return;
@@ -4234,15 +4282,17 @@ static void BHTPresentColumnsViewController(void) {
 
     UIWindow *window = BHT_activeKeyWindow();
     if (!window.rootViewController) return;
-    BOOL enableColumns = !NFBInlineColumnsEnabled();
-    NFBSetInlineColumnsEnabled(enableColumns);
+    NFBSetInlineColumnsEnabled(YES);
     gBHTSelectingHomeForColumns = YES;
     BHTSelectTabPage(window.rootViewController, @"home");
+    BHTUpdateColumnsTabSelection(window.rootViewController, YES);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NFBSetInlineColumnsEnabled(enableColumns);
+        NFBSetInlineColumnsEnabled(YES);
+        BHTUpdateColumnsTabSelection(window.rootViewController, YES);
         gBHTSelectingHomeForColumns = NO;
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        BHTUpdateColumnsTabSelection(window.rootViewController, YES);
         gBHTSelectingHomeForColumns = NO;
     });
 }
@@ -4351,7 +4401,7 @@ static void BHTPresentColumnsViewController(void) {
     // Always apply theming logic (handles both enabled and disabled cases)
     [self performSelector:@selector(bh_applyCurrentThemeToIcon)];
     [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
-    if (selected && BHTIsColumnsTabView((T1TabView *)self)) {
+    if (!gBHTApplyingColumnsTabSelection && selected && BHTIsColumnsTabView((T1TabView *)self)) {
         dispatch_async(dispatch_get_main_queue(), ^{
             BHTPresentColumnsViewController();
         });
@@ -4368,6 +4418,8 @@ static void BHTPresentColumnsViewController(void) {
         });
     } else if (isHome) {
         NFBSetInlineColumnsEnabled(NO);
+        UIWindow *window = BHT_activeKeyWindow();
+        BHTUpdateColumnsTabSelection(window.rootViewController, NO);
     }
 }
 
