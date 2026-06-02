@@ -16,6 +16,7 @@
 #import <objc/message.h>
 #import <QuartzCore/QuartzCore.h>
 #import <math.h>
+#import <string.h>
 
 static void nfb_streamStart(UIViewController *vc);
 static void nfb_streamStop(UIViewController *vc);
@@ -76,11 +77,68 @@ static BOOL nfb_doRefreshContent(id startVC) {
     if (t) { ((void(*)(id,SEL))objc_msgSend)(t, @selector(_refreshContent)); return YES; }
     return NO;
 }
+
+// Find an instance variable of `obj` whose type encoding mentions `typeName`.
+static id nfb_ivarOfType(id obj, const char *typeName) {
+    if (!obj) return nil;
+    Class c = [obj class]; int guard = 0;
+    while (c && guard++ < 8) {
+        unsigned int n = 0; Ivar *ivars = class_copyIvarList(c, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            const char *enc = ivar_getTypeEncoding(ivars[i]);
+            if (enc && strstr(enc, typeName)) { id v = object_getIvar(obj, ivars[i]); free(ivars); return v; }
+        }
+        free(ivars);
+        c = class_getSuperclass(c);
+    }
+    return nil;
+}
+static id nfb_findPullControl(UIViewController *startVC) {
+    id ctrl = nfb_ivarOfType(gActiveItemsVC, "TFNPullToRefreshControl");
+    if (!ctrl) ctrl = nfb_ivarOfType(nfb_findResponder(nfb_homeRoot(startVC), @selector(_t1_didPullToRefresh:), 0), "TFNPullToRefreshControl");
+    if (!ctrl) {
+        UIScrollView *sv = nfb_scrollOf(gActiveItemsVC);
+        Class cls = objc_getClass("TFNPullToRefreshControl");
+        if (sv && cls) for (UIView *v in sv.subviews) if ([v isKindOfClass:cls]) { ctrl = v; break; }
+    }
+    return ctrl;
+}
+// The pull handler lives on the container but needs the real control as its sender.
+static BOOL nfb_doPullWithControl(id startVC) {
+    id cont = nfb_findResponder(nfb_homeRoot(startVC), @selector(_t1_didPullToRefresh:), 0);
+    id ctrl = nfb_findPullControl(startVC);
+    if (!cont || !ctrl) return NO;
+    ((void(*)(id,SEL,id))objc_msgSend)(cont, @selector(_t1_didPullToRefresh:), ctrl);
+    return YES;
+}
+
 static void nfb_streamTrigger(UIViewController *vc) {
-    if (nfb_doLoadNewer(vc)) return;
-    if (nfb_doPull(vc))      return;
-    if (nfb_doReloadTop(vc)) return;
+    if (nfb_doPullWithControl(vc)) return;
+    if (nfb_doPull(vc))            return;
+    if (nfb_doLoadNewer(vc))       return;
+    if (nfb_doReloadTop(vc))       return;
     nfb_doRefreshContent(vc);
+}
+
+// List a class's own+inherited refresh-ish method names (for the diagnostic dump).
+static NSString *nfb_refreshMethodsOf(Class cls) {
+    NSMutableArray *out = [NSMutableArray array];
+    Class c = cls; int guard = 0;
+    while (c && guard++ < 8) {
+        NSString *cn = NSStringFromClass(c);
+        unsigned int n = 0; Method *ms = class_copyMethodList(c, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            NSString *nm = NSStringFromSelector(method_getName(ms[i]));
+            NSString *low = nm.lowercaseString;
+            if ([low containsString:@"refresh"] || [low containsString:@"reload"] ||
+                [low containsString:@"loadtop"] || [low containsString:@"loadnewer"] ||
+                [low containsString:@"loadlatest"]) [out addObject:nm];
+        }
+        free(ms);
+        if ([cn hasPrefix:@"UI"] || [cn hasPrefix:@"NS"] || [cn hasPrefix:@"_UI"]) break;
+        c = class_getSuperclass(c);
+    }
+    return [out componentsJoinedByString:@" "];
 }
 
 static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
@@ -95,13 +153,13 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
     if ([vc respondsToSelector:@selector(refreshWithLoadSource:completion:)]) [r addObject:@"refreshSrc"];
     [s appendFormat:@"%@%@%@\n", ind, NSStringFromClass([vc class]),
         r.count ? [NSString stringWithFormat:@"  <%@>", [r componentsJoinedByString:@","]] : @""];
+    NSString *meth = nfb_refreshMethodsOf([vc class]);
+    if (meth.length) [s appendFormat:@"%@   m: %@\n", ind, meth];
     id tl = nfb_timelineOf(vc);
     if (tl) {
-        NSMutableArray *tr = [NSMutableArray array];
-        if ([tl respondsToSelector:@selector(loadNewer)]) [tr addObject:@"loadNewer"];
-        if ([tl respondsToSelector:@selector(loadNewerWithSource:completion:)]) [tr addObject:@"loadNewerSrc"];
-        if ([tl respondsToSelector:@selector(refreshWithLoadSource:completion:)]) [tr addObject:@"refreshSrc"];
-        [s appendFormat:@"%@  ⮡timeline=%@  <%@>\n", ind, NSStringFromClass([tl class]), [tr componentsJoinedByString:@","]];
+        [s appendFormat:@"%@  ⮡timeline=%@\n", ind, NSStringFromClass([tl class])];
+        NSString *tm = nfb_refreshMethodsOf([tl class]);
+        if (tm.length) [s appendFormat:@"%@   tl.m: %@\n", ind, tm];
     }
     for (UIViewController *c in vc.childViewControllers) nfb_dumpTree(c, depth + 1, s);
 }
@@ -205,6 +263,7 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     [ac addAction:[UIAlertAction actionWithTitle:@"B: loadNewer" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doLoadNewer(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"C: reloadTop" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doReloadTop(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"D: refreshContent" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doRefreshContent(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"E: pull + 本物のコントロール" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doPullWithControl(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
