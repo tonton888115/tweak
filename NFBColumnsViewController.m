@@ -12,6 +12,7 @@
 @property (nonatomic, copy) NSDictionary<NSString *, NSString *> *availableTitles;
 @property (nonatomic, strong) NSMutableArray<NSString *> *selectedPages;
 @property (nonatomic, strong) NSTimer *refreshTimer;
+@property (nonatomic, copy) NSString *lastNativeTabFailure;
 @end
 
 @implementation NFBColumnsViewController
@@ -262,14 +263,6 @@
     separator.backgroundColor = UIColor.separatorColor;
     [column addSubview:separator];
 
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectZero];
-    label.translatesAutoresizingMaskIntoConstraints = NO;
-    label.text = title;
-    label.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
-    label.textColor = UIColor.labelColor;
-    label.textAlignment = NSTextAlignmentCenter;
-    [column addSubview:label];
-
     UIView *content = [[UIView alloc] initWithFrame:CGRectZero];
     content.translatesAutoresizingMaskIntoConstraints = NO;
     [column addSubview:content];
@@ -279,11 +272,7 @@
         [separator.trailingAnchor constraintEqualToAnchor:column.trailingAnchor],
         [separator.bottomAnchor constraintEqualToAnchor:column.bottomAnchor],
         [separator.widthAnchor constraintEqualToConstant:1.0],
-        [label.topAnchor constraintEqualToAnchor:column.topAnchor constant:8.0],
-        [label.leadingAnchor constraintEqualToAnchor:column.leadingAnchor constant:10.0],
-        [label.trailingAnchor constraintEqualToAnchor:column.trailingAnchor constant:-10.0],
-        [label.heightAnchor constraintEqualToConstant:24.0],
-        [content.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:6.0],
+        [content.topAnchor constraintEqualToAnchor:column.topAnchor],
         [content.leadingAnchor constraintEqualToAnchor:column.leadingAnchor],
         [content.trailingAnchor constraintEqualToAnchor:column.trailingAnchor constant:-1.0],
         [content.bottomAnchor constraintEqualToAnchor:column.bottomAnchor]
@@ -291,12 +280,14 @@
 
     UIViewController *controller = [self newTabNavigationControllerForPage:page account:account tabs:tabs];
     if (!controller) {
-        [self addPlaceholderInView:content message:@"Unable to load native tab"];
+        NSString *reason = self.lastNativeTabFailure.length ? self.lastNativeTabFailure : @"Unable to load native tab";
+        [self addPlaceholderInView:content message:[NSString stringWithFormat:@"%@\n%@", title ?: page, reason]];
         return;
     }
 
     [self addChildViewController:controller];
     controller.view.translatesAutoresizingMaskIntoConstraints = NO;
+    controller.view.backgroundColor = UIColor.systemBackgroundColor;
     [content addSubview:controller.view];
     [NSLayoutConstraint activateConstraints:@[
         [controller.view.topAnchor constraintEqualToAnchor:content.topAnchor],
@@ -304,6 +295,7 @@
         [controller.view.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
         [controller.view.bottomAnchor constraintEqualToAnchor:content.bottomAnchor]
     ]];
+    [controller loadViewIfNeeded];
     [controller didMoveToParentViewController:self];
     [self.columnControllers addObject:controller];
 }
@@ -354,12 +346,32 @@
 }
 
 - (UIViewController *)newTabNavigationControllerForPage:(NSString *)page account:(id)account tabs:(NSDictionary<NSString *, id> *)tabs {
+    self.lastNativeTabFailure = nil;
     id tabView = tabs[page];
     Class cls = NSClassFromString(@"T1TabNavigationController");
     SEL initSel = @selector(initWithAccount:tabView:);
-    if (!cls || !account || !tabView || ![cls instancesRespondToSelector:initSel]) return nil;
+    if (!cls) {
+        self.lastNativeTabFailure = @"Missing T1TabNavigationController";
+        return nil;
+    }
+    if (!account) {
+        self.lastNativeTabFailure = @"Missing account";
+        return nil;
+    }
+    if (!tabView) {
+        self.lastNativeTabFailure = [NSString stringWithFormat:@"Missing tabView for %@", page ?: @"(nil)"];
+        return nil;
+    }
+    if (![cls instancesRespondToSelector:initSel]) {
+        self.lastNativeTabFailure = @"Missing initWithAccount:tabView:";
+        return nil;
+    }
 
     UIViewController *controller = ((id (*)(id, SEL, id, id))objc_msgSend)([cls alloc], initSel, account, tabView);
+    if (!controller) {
+        self.lastNativeTabFailure = @"Native tab init returned nil";
+        return nil;
+    }
     if ([controller respondsToSelector:@selector(setupForTabBarPresentation)]) {
         ((void (*)(id, SEL))objc_msgSend)(controller, @selector(setupForTabBarPresentation));
     }

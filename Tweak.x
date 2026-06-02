@@ -1703,6 +1703,10 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"ios_tab_bar_default_show_communities"];
     }
 
+    if ([key isEqualToString:@"ios_tab_bar_default_show_lists"]) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"ios_tab_bar_default_show_lists"];
+    }
+
     if ([key isEqualToString:@"ios_in_app_article_webview_enabled"]) {
         NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
         if ([d objectForKey:key] != nil) {

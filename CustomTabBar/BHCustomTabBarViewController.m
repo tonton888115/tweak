@@ -254,7 +254,8 @@ static UIFont *TwitterChirpFont(TwitterFontStyle style) {
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_MESSAGES" pageID:@"messages"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_GROK" pageID:@"grok"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_PROFILE" pageID:@"profile"],
-            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_VIDEO" pageID:@"media"]
+            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_VIDEO" pageID:@"media"],
+            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_LISTS" pageID:@"lists"]
         ] mutableCopy];
         self.enabledPageIDs = [NSMutableSet setWithArray:@[@"home", @"guide", @"ntab", @"messages"]];
     }
@@ -334,6 +335,8 @@ static UIFont *TwitterChirpFont(TwitterFontStyle style) {
     [[NSUserDefaults standardUserDefaults] setBool:profileEnabled forKey:@"ios_tab_bar_default_show_profile"];
     BOOL communitiesEnabled = [self.enabledPageIDs containsObject:@"communities"];
     [[NSUserDefaults standardUserDefaults] setBool: communitiesEnabled forKey:@"ios_tab_bar_default_show_communities"];
+    BOOL listsEnabled = [self.enabledPageIDs containsObject:@"lists"];
+    [[NSUserDefaults standardUserDefaults] setBool:listsEnabled forKey:@"ios_tab_bar_default_show_lists"];
     [[NSUserDefaults standardUserDefaults] synchronize];
 
     self.hasChanges = NO;
@@ -417,6 +420,8 @@ static UIFont *TwitterChirpFont(TwitterFontStyle style) {
         iconName = isEnabled ? @"grok_icon_blackhole" : @"grok_icon_blackhole_stroke";
     } else if ([item.pageID isEqualToString:@"media"]) {
         iconName = isEnabled ? @"media_tab" : @"media_tab_stroke";
+    } else if ([item.pageID isEqualToString:@"lists"]) {
+        iconName = isEnabled ? @"lists" : @"lists_stroke";
     }
     
     // Choose icon color based on light/dark mode, not selection state

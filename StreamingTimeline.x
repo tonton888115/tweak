@@ -112,6 +112,87 @@ static BOOL nfb_textLooksRecommendedTab(NSString *text) {
            [low containsString:@"recommended"];
 }
 
+static NSString *nfb_stringValueForKey(id obj, NSString *key) {
+    if (!obj || !key.length) return nil;
+    @try {
+        id value = [obj valueForKey:key];
+        if ([value isKindOfClass:NSString.class]) return value;
+        if ([value respondsToSelector:@selector(stringValue)]) return [value stringValue];
+    } @catch (NSException *e) {
+    }
+    return nil;
+}
+
+static BOOL nfb_homeTabIdentifierLooksRecommended(NSString *identifier) {
+    if (!identifier.length) return NO;
+    NSString *low = identifier.lowercaseString;
+    return [low isEqualToString:@"home"] ||
+           [low containsString:@"recommend"] ||
+           [low containsString:@"for_you"] ||
+           [low containsString:@"foryou"] ||
+           [low containsString:@"top"];
+}
+
+static BOOL nfb_homeTabIdentifierLooksChronological(NSString *identifier) {
+    if (!identifier.length) return NO;
+    NSString *low = identifier.lowercaseString;
+    return [low isEqualToString:@"latest"] ||
+           [low containsString:@"latest"] ||
+           [low containsString:@"following"] ||
+           [low containsString:@"list"] ||
+           [low containsString:@"communit"] ||
+           [low containsString:@"creator"] ||
+           [low containsString:@"subscription"];
+}
+
+static NSString *nfb_homeTimelineTabIdentifierFromDefaults(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSArray<NSString *> *keys = @[
+        @"THFHomeTimelineContainerViewController.lastSelectedTimelineTabIdentifier",
+        @"nfb_lastSelectedTimelineTabIdentifier",
+        @"lastSelectedTimelineTabIdentifier",
+        @"selectedTimelineTabIdentifier",
+        @"selectedHomeTimelineTabIdentifier"
+    ];
+    for (NSString *key in keys) {
+        id value = [defaults objectForKey:key];
+        if ([value isKindOfClass:NSString.class] && [value length]) return value;
+    }
+    return nil;
+}
+
+static NSString *nfb_homeTimelineTabIdentifierFromObject(id obj) {
+    NSArray<NSString *> *keys = @[
+        @"lastSelectedTimelineTabIdentifier",
+        @"selectedTimelineTabIdentifier",
+        @"selectedHomeTimelineTabIdentifier",
+        @"selectedTabIdentifier",
+        @"timelineTabIdentifier",
+        @"urtTimelineIdentifier"
+    ];
+    for (NSString *key in keys) {
+        NSString *value = nfb_stringValueForKey(obj, key);
+        if (nfb_homeTabIdentifierLooksRecommended(value) || nfb_homeTabIdentifierLooksChronological(value)) return value;
+    }
+    return nil;
+}
+
+static NSString *nfb_homeTimelineTabIdentifier(UIViewController *vc) {
+    NSString *saved = nfb_homeTimelineTabIdentifierFromDefaults();
+    if (saved.length) return saved;
+    UIViewController *segmented = nfb_parentControllerNamed(vc, @"Segmented");
+    UIViewController *container = nfb_parentControllerNamed(vc, @"HomeTimelineContainer");
+    NSMutableArray *objects = [NSMutableArray array];
+    if (vc) [objects addObject:vc];
+    if (segmented) [objects addObject:segmented];
+    if (container) [objects addObject:container];
+    for (id obj in objects) {
+        NSString *value = nfb_homeTimelineTabIdentifierFromObject(obj);
+        if (value.length) return value;
+    }
+    return nil;
+}
+
 static BOOL nfb_isRecommendedHomeTimeline(UIViewController *vc) {
     UIViewController *segmented = nfb_parentControllerNamed(vc, @"Segmented");
     NSString *selectedText = segmented ? nfb_selectedTextInView(segmented.view, 0) : nil;
@@ -119,7 +200,10 @@ static BOOL nfb_isRecommendedHomeTimeline(UIViewController *vc) {
     id timeline = nfb_timelineOf(vc);
     NSString *timelineClass = timeline ? NSStringFromClass([timeline class]) : @"";
     if (![timelineClass isEqualToString:@"TFNTwitterHomeTimeline"]) return NO;
-    return nfb_indexOfChildInPagingController(vc) == 1;
+    NSString *identifier = nfb_homeTimelineTabIdentifier(vc);
+    if (nfb_homeTabIdentifierLooksRecommended(identifier)) return YES;
+    if (nfb_homeTabIdentifierLooksChronological(identifier)) return NO;
+    return NO;
 }
 
 static CGFloat nfb_scrollViewScore(UIScrollView *sv) {
@@ -473,16 +557,18 @@ static void nfb_appendScrollDiag(NSMutableString *s, UIViewController *vc) {
     UIViewController *segmented = nfb_parentControllerNamed(vc, @"Segmented");
     NSString *selectedText = segmented ? nfb_selectedTextInView(segmented.view, 0) : nil;
     NSInteger pagingIndex = nfb_indexOfChildInPagingController(vc);
+    NSString *tabIdentifier = nfb_homeTimelineTabIdentifier(vc);
     id timeline = nfb_timelineOf(vc);
     [s appendFormat:@"scroll=%@ offset=(%.1f,%.1f) size=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) bounceV=%d\n",
         NSStringFromClass([sv class]), sv.contentOffset.x, sv.contentOffset.y,
         sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height,
         sv.adjustedContentInset.top, sv.adjustedContentInset.left, sv.adjustedContentInset.bottom, sv.adjustedContentInset.right,
         sv.alwaysBounceVertical ? 1 : 0];
-    [s appendFormat:@"homeVariant recommended=%d pagingIndex=%ld selectedText=%@ timeline=%@\n",
+    [s appendFormat:@"homeVariant recommended=%d pagingIndex=%ld selectedText=%@ tabIdentifier=%@ timeline=%@\n",
         nfb_isRecommendedHomeTimeline(vc) ? 1 : 0,
         (long)pagingIndex,
         selectedText ?: @"(nil)",
+        tabIdentifier ?: @"(nil)",
         timeline ? NSStringFromClass([timeline class]) : @"(nil)"];
 }
 
@@ -507,6 +593,7 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
     if ([vc respondsToSelector:@selector(loadTop:)]) nfb_appendMethodType(s, ind, vc, @selector(loadTop:));
     if ([vc respondsToSelector:@selector(_tfn_dynamic_didPullToLoadTop:)]) nfb_appendMethodType(s, ind, vc, @selector(_tfn_dynamic_didPullToLoadTop:));
     if ([vc respondsToSelector:@selector(schedulePullToRefreshUpdate)]) nfb_appendMethodType(s, ind, vc, @selector(schedulePullToRefreshUpdate));
+    if ([vc respondsToSelector:@selector(selectTimelineVariant:shouldRefresh:)]) nfb_appendMethodType(s, ind, vc, @selector(selectTimelineVariant:shouldRefresh:));
     id tl = nfb_timelineOf(vc);
     if (tl) {
         NSMutableArray *tr = [NSMutableArray array];
@@ -797,16 +884,61 @@ static void nfb_streamStart(UIViewController *vc) {
     objc_setAssociatedObject(vc, &kNFBStreamTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static NSString *nfb_identifierForTimelineVariantArgument(id variant) {
+    uintptr_t raw = (uintptr_t)variant;
+    if (raw < 8) {
+        if (raw == 0) return @"home";
+        if (raw == 1) return @"latest";
+        if (raw == 2) return @"creatorSubscriptions";
+        return nil;
+    }
+    NSString *value = nil;
+    @try {
+        if ([variant isKindOfClass:NSString.class]) {
+            value = (NSString *)variant;
+        } else if ([variant respondsToSelector:@selector(identifier)]) {
+            id identifier = ((id (*)(id, SEL))objc_msgSend)(variant, @selector(identifier));
+            if ([identifier isKindOfClass:NSString.class]) value = identifier;
+        }
+        if (!value.length) {
+            NSString *description = [variant description];
+            if ([description isKindOfClass:NSString.class]) value = description;
+        }
+    } @catch (NSException *e) {
+        value = nil;
+    }
+    if (!value.length) return nil;
+    if (nfb_homeTabIdentifierLooksRecommended(value) || nfb_homeTabIdentifierLooksChronological(value)) return value;
+    return nil;
+}
+
+static void nfb_persistHomeTimelineTabIdentifier(NSString *identifier) {
+    if (!identifier.length) return;
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setObject:identifier forKey:@"THFHomeTimelineContainerViewController.lastSelectedTimelineTabIdentifier"];
+    [defaults setObject:identifier forKey:@"nfb_lastSelectedTimelineTabIdentifier"];
+    [defaults synchronize];
+}
+
+static void nfb_syncHomeTimelineTabIdentifierFromController(UIViewController *vc) {
+    NSString *identifier = nfb_homeTimelineTabIdentifierFromObject(vc);
+    if (identifier.length) nfb_persistHomeTimelineTabIdentifier(identifier);
+}
+
 #pragma mark - Hooks
 
 // Button lifecycle on the stable Home container.
 %hook THFHomeTimelineContainerViewController
-- (void)viewDidAppear:(BOOL)animated { %orig; nfb_installButton(self.view.window); }
+- (void)viewDidAppear:(BOOL)animated { %orig; nfb_syncHomeTimelineTabIdentifierFromController(self); nfb_installButton(self.view.window); }
 - (void)viewDidDisappear:(BOOL)animated { %orig; nfb_removeButton(); }
+- (void)selectTimelineVariant:(id)variant shouldRefresh:(BOOL)shouldRefresh {
+    nfb_persistHomeTimelineTabIdentifier(nfb_identifierForTimelineVariantArgument(variant));
+    %orig(variant, shouldRefresh);
+}
 %end
 
 %hook THFHomeTimelineItemsViewController
-- (void)viewDidAppear:(BOOL)animated { %orig; gActiveItemsVC = self; nfb_installButton(self.view.window); nfb_streamStart(self); }
+- (void)viewDidAppear:(BOOL)animated { %orig; nfb_syncHomeTimelineTabIdentifierFromController(nfb_parentControllerNamed(self, @"HomeTimelineContainer")); gActiveItemsVC = self; nfb_installButton(self.view.window); nfb_streamStart(self); }
 - (void)viewDidDisappear:(BOOL)animated { %orig; nfb_streamStop(self); }
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_visibilityForScroll(scrollView); }
 %end
