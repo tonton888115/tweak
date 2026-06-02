@@ -509,25 +509,54 @@ static void nfb_afterRefresh(UIViewController *vc) {
     }
 }
 
+// The Home container's currently-visible timeline VC: the For You items VC, the
+// Following items VC, or a pinned-list PinnedTimelineViewController. The old code only
+// knew about the two home items VCs, so pinned lists (ニコニコ/投資) never refreshed.
+static UIViewController *nfb_selectedTimelineVC(UIViewController *vc) {
+    UIViewController *container = nfb_parentControllerNamed(vc, @"HomeTimelineContainer");
+    if (container && nfb_resp(container, @selector(selectedTimelineViewController))) {
+        id sel = ((id(*)(id, SEL))objc_msgSend)(container, @selector(selectedTimelineViewController));
+        if ([sel isKindOfClass:UIViewController.class]) return (UIViewController *)sel;
+    }
+    return nil;
+}
+
 static void nfb_streamTrigger(UIViewController *vc) {
-    BOOL readingAway = nfb_isReadingAwayFromTop(vc);
+    // Refresh whatever timeline is actually on screen, not just the home items VC.
+    UIViewController *target = nfb_selectedTimelineVC(vc) ?: vc;
+
+    BOOL readingAway = nfb_isReadingAwayFromTop(target);
     if (!readingAway) {
         nfb_hideNewTweetsPill();
-        nfb_scrollToTop(vc, NO);
+        nfb_scrollToTop(target, NO);
     }
 
-    // All of C/D/F are confirmed working on-device; fire ONLY ONE per trigger so the
-    // auto-timer (every few seconds) doesn't hit the timeline endpoint 3x -> rate limits.
-    BOOL did = nfb_doTimelineRefresh(vc)            // F: TFNTwitterHomeTimeline refreshWithSource:completion:
-            || nfb_doSchedulePullUpdate(vc)         // C: schedulePullToRefreshUpdate
-            || nfb_doDynamicPullToLoadTop(vc)       // D: native pull-to-load-top (real control as sender)
-            || nfb_doLoadTop(vc)                    // A: loadTop:
-            || nfb_doPullWithControl(vc)
-            || nfb_doPull(vc)
-            || nfb_doLoadNewer(vc)
-            || nfb_doReloadTop(vc)
-            || nfb_doRefreshContent(vc);
-    if (did) nfb_afterRefresh(vc);
+    // Resolve the refresh entry point inside the TARGET's own subtree only, so a list
+    // refreshes itself (loadTop:) rather than the home timeline. For You/Following find
+    // refreshWithSource: on their TFNTwitterHomeTimeline; pinned lists find loadTop:.
+    id ctrlVC = nfb_findResponder(target, @selector(pullToLoadTopControl), 0);
+    id pullCtrl = ctrlVC ? ((id(*)(id, SEL))objc_msgSend)(ctrlVC, @selector(pullToLoadTopControl)) : nil;
+
+    BOOL did = NO;
+    id r;
+    if (!did && (r = nfb_findResponder(target, @selector(refreshWithSource:completion:), 0))) {
+        void (^completion)(void) = ^{};
+        ((void(*)(id, SEL, NSInteger, id))objc_msgSend)(r, @selector(refreshWithSource:completion:), nfb_streamLoadSourceFromSender(pullCtrl), completion);
+        did = YES;
+    }
+    if (!did && (r = nfb_findResponder(target, @selector(loadTop:), 0))) {
+        ((void(*)(id, SEL, id))objc_msgSend)(r, @selector(loadTop:), pullCtrl);
+        did = YES;
+    }
+    if (!did && (r = nfb_findResponder(target, @selector(_tfn_dynamic_didPullToLoadTop:), 0))) {
+        ((void(*)(id, SEL, id))objc_msgSend)(r, @selector(_tfn_dynamic_didPullToLoadTop:), pullCtrl);
+        did = YES;
+    }
+    if (!did && (r = nfb_findResponder(target, @selector(schedulePullToRefreshUpdate), 0))) {
+        ((void(*)(id, SEL))objc_msgSend)(r, @selector(schedulePullToRefreshUpdate));
+        did = YES;
+    }
+    if (did) nfb_afterRefresh(target);
 }
 
 // List a class's own+inherited refresh-ish method names (for the diagnostic dump).
@@ -590,6 +619,10 @@ static void nfb_appendScrollDiag(NSMutableString *s, UIViewController *vc) {
         ? ((id(*)(id, SEL))objc_msgSend)(container, @selector(latestTimelineViewController)) : nil;
     [s appendFormat:@"identity isForYou=%d isFollowing=%d (homeVC=%p latestVC=%p self=%p)\n",
         (vc == homeVC) ? 1 : 0, (vc == latestVC) ? 1 : 0, homeVC, latestVC, vc];
+    UIViewController *selected = nfb_selectedTimelineVC(vc);
+    [s appendFormat:@"selectedTimelineVC=%@ (refreshTarget; recommended=%d)\n",
+        selected ? NSStringFromClass([selected class]) : @"(nil)",
+        selected ? (nfb_isRecommendedHomeTimeline(selected) ? 1 : 0) : -1];
 }
 
 static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
@@ -868,14 +901,18 @@ static BOOL nfb_homeTabSelectedOrUnknown(void) {
 
 static char kNFBStreamTimerKey;
 
+static NSTimeInterval gLastStreamFire = 0;   // dedup across the two home-VC timers
+
 static BOOL nfb_streamShouldFire(UIViewController *vc) {
     if (![BHTManager autoStreamTimeline]) return NO;
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return NO;
-    if (vc != gActiveItemsVC) return NO;                        // only the visible list
-    if (![vc isViewLoaded] || vc.view.window == nil) return NO;
     if (!nfb_homeTabSelectedOrUnknown()) return NO;
-    if (nfb_isRecommendedHomeTimeline(vc)) return NO;
-    UIScrollView *sv = nfb_mainScrollViewOf(vc);
+    // Gate on whatever timeline is actually on screen (For You / Following / pinned list),
+    // not on the timer's own home items VC — that's how pinned lists get refreshed.
+    UIViewController *target = nfb_selectedTimelineVC(vc) ?: vc;
+    if (![target isViewLoaded] || target.view.window == nil) return NO;
+    if (nfb_isRecommendedHomeTimeline(target)) return NO;       // For You -> never auto-refresh
+    UIScrollView *sv = nfb_mainScrollViewOf(target);
     if (sv) {
         if (sv.isDragging || sv.isDecelerating || sv.isTracking) return NO;
     }
@@ -898,7 +935,15 @@ static void nfb_streamStart(UIViewController *vc) {
         UIViewController *s = wvc;
         if (!s) { [t invalidate]; return; }
         if (![BHTManager autoStreamTimeline]) { nfb_streamStop(s); nfb_styleButton(NO); nfb_updateGauge(NO, 0); return; }
-        if (nfb_streamShouldFire(s)) nfb_streamTrigger(s);
+        if (nfb_streamShouldFire(s)) {
+            // Both the For-You and Following home VCs run a timer; dedup so the visible
+            // timeline isn't refreshed twice per interval.
+            NSTimeInterval now = CACurrentMediaTime();
+            if (now - gLastStreamFire >= interval * 0.6) {
+                gLastStreamFire = now;
+                nfb_streamTrigger(s);
+            }
+        }
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:UITrackingRunLoopMode];
     objc_setAssociatedObject(vc, &kNFBStreamTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
