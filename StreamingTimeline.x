@@ -471,6 +471,7 @@ static void nfb_hideNewTweetsPill(void) {
 }
 static void nfb_revealTopAfterRefresh(UIViewController *vc) {
     __weak UIViewController *wvc = vc;
+    __block BOOL tappedHomeTab = NO;
     void (^reveal)(void) = ^{
         UIViewController *s = wvc;
         if (!s || ![s isViewLoaded] || s.view.window == nil) return;
@@ -481,14 +482,17 @@ static void nfb_revealTopAfterRefresh(UIViewController *vc) {
         }
         UIScrollView *sv = nfb_mainScrollViewOf(s);
         if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) return;
-        if (s == gActiveItemsVC) nfb_tapHomeTabLikeUser();
-        nfb_scrollToTop(s, YES);
+        if (!tappedHomeTab && s == gActiveItemsVC) {
+            tappedHomeTab = nfb_tapHomeTabLikeUser();
+        }
+        nfb_scrollToTop(s, NO);
     };
     reveal();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), reveal);
 }
 static void nfb_showNewTweetsPill(UIViewController *vc) {
     if (!vc || !vc.view.window) return;
@@ -521,12 +525,11 @@ static void nfb_showNewTweetsPill(UIViewController *vc) {
     [UIView animateWithDuration:0.16 animations:^{ gNewTweetsPill.alpha = 1.0; }];
 }
 static void nfb_afterRefresh(UIViewController *vc) {
-    if (nfb_isReadingAwayFromTop(vc)) {
-        nfb_showNewTweetsPill(vc);
-    } else {
-        nfb_hideNewTweetsPill();
-        nfb_revealTopAfterRefresh(vc);
-    }
+    // The user wants streaming timelines to behave like a live feed: once an allowed
+    // timeline refreshes, return it to the newest content instead of leaving a pill.
+    nfb_hideNewTweetsPill();
+    gPendingNewTweetsVC = nil;
+    nfb_revealTopAfterRefresh(vc);
 }
 
 // The Home container's currently-visible timeline VC: the For You items VC, the
@@ -571,12 +574,18 @@ static void nfb_streamTrigger(UIViewController *vc) {
     id pullCtrl = ctrlVC ? ((id(*)(id, SEL))objc_msgSend)(ctrlVC, @selector(pullToLoadTopControl)) : nil;
 
     BOOL did = NO;
+    BOOL willRevealFromCompletion = NO;
     id r;
     // Following's clean path: refresh the TFNTwitterHomeTimeline directly.
     if (!did && (r = nfb_findResponder(target, @selector(refreshWithSource:completion:), 0))) {
-        void (^completion)(void) = ^{};
+        __weak UIViewController *weakTarget = target;
+        void (^completion)(void) = [^{
+            UIViewController *strongTarget = weakTarget;
+            if (strongTarget) nfb_afterRefresh(strongTarget);
+        } copy];
         ((void(*)(id, SEL, NSInteger, id))objc_msgSend)(r, @selector(refreshWithSource:completion:), nfb_streamLoadSourceFromSender(pullCtrl), completion);
         did = YES;
+        willRevealFromCompletion = YES;
     }
     // Pinned lists: the parent PinnedTimelineViewController also advertises loadTop:
     // but can be a wrapper. The child T1URTViewController's pull handler is the useful one.
@@ -596,7 +605,7 @@ static void nfb_streamTrigger(UIViewController *vc) {
         ((void(*)(id, SEL))objc_msgSend)(r, @selector(clearTimelineCacheAndRefresh));
         did = YES;
     }
-    if (did) nfb_afterRefresh(target);
+    if (did && !willRevealFromCompletion) nfb_afterRefresh(target);
 }
 
 // List a class's own+inherited refresh-ish method names (for the diagnostic dump).
