@@ -116,12 +116,7 @@ static BOOL nfb_isRecommendedHomeTimeline(UIViewController *vc) {
     UIViewController *segmented = nfb_parentControllerNamed(vc, @"Segmented");
     NSString *selectedText = segmented ? nfb_selectedTextInView(segmented.view, 0) : nil;
     if (nfb_textLooksRecommendedTab(selectedText)) return YES;
-    if (selectedText.length) return NO;
-
-    id timeline = nfb_timelineOf(vc);
-    NSString *timelineClass = timeline ? NSStringFromClass([timeline class]) : @"";
-    if (![timelineClass isEqualToString:@"TFNTwitterHomeTimeline"]) return NO;
-    return nfb_indexOfChildInPagingController(vc) == 0;
+    return NO;
 }
 
 static CGFloat nfb_scrollViewScore(UIScrollView *sv) {
