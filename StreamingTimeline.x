@@ -43,8 +43,12 @@ static BOOL nfb_homeTabSelectedOrUnknown(void);
 
 static __weak UIViewController *gActiveItemsVC = nil;   // the visible Home timeline list
 static __weak UIViewController *gPendingNewTweetsVC = nil;
+static __weak UIScrollView *gActiveTimelineScrollView = nil;
 static UIButton *gNewTweetsPill = nil;
 static BOOL gInlineColumnsEnabled = NO;
+static BOOL gActiveTimelineAtTop = YES;
+static CGFloat gActiveTimelineOffsetY = 0.0;
+static CGFloat gActiveTimelineTopY = 0.0;
 
 #pragma mark - refresh callers (no signature assumptions)
 
@@ -441,9 +445,24 @@ static BOOL nfb_isReadingAwayFromTop(UIViewController *vc) {
 }
 static BOOL nfb_isTimelineAtTop(UIViewController *vc) {
     UIScrollView *sv = nfb_mainScrollViewOf(vc);
-    if (!sv) return YES;
+    if (!sv) return gActiveTimelineAtTop;
     CGFloat topY = -sv.adjustedContentInset.top;
     return sv.contentOffset.y <= topY + 8.0;
+}
+static void nfb_noteActiveTimelineScroll(UIScrollView *sv) {
+    if (!sv) return;
+    gActiveTimelineScrollView = sv;
+    gActiveTimelineOffsetY = sv.contentOffset.y;
+    gActiveTimelineTopY = -sv.adjustedContentInset.top;
+    gActiveTimelineAtTop = (gActiveTimelineOffsetY <= gActiveTimelineTopY + 8.0);
+}
+static BOOL nfb_visibleTimelineAtTop(UIViewController *vc) {
+    UIScrollView *activeScroll = gActiveTimelineScrollView;
+    if (activeScroll && activeScroll.window && activeScroll.bounds.size.height > 100.0) {
+        CGFloat topY = -activeScroll.adjustedContentInset.top;
+        return activeScroll.contentOffset.y <= topY + 8.0;
+    }
+    return nfb_isTimelineAtTop(vc);
 }
 static UIControl *nfb_findHomeTabControl(UIView *view, BOOL inTabBar, int depth) {
     if (!view || view.hidden || view.alpha < 0.01 || depth > 10) return nil;
@@ -495,6 +514,11 @@ static void nfb_revealTopAfterRefresh(UIViewController *vc) {
         }
         UIScrollView *sv = nfb_mainScrollViewOf(s);
         if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) return;
+        if (!nfb_visibleTimelineAtTop(s)) {
+            nfb_showNewTweetsPill(s);
+            nfb_updateStreamStateIconForVC(s);
+            return;
+        }
         if (!tappedHomeTab && s == gActiveItemsVC) {
             tappedHomeTab = nfb_tapHomeTabLikeUser();
         }
@@ -538,7 +562,7 @@ static void nfb_showNewTweetsPill(UIViewController *vc) {
     [UIView animateWithDuration:0.16 animations:^{ gNewTweetsPill.alpha = 1.0; }];
 }
 static void nfb_afterRefresh(UIViewController *vc) {
-    if (!nfb_isTimelineAtTop(vc)) {
+    if (!nfb_visibleTimelineAtTop(vc)) {
         nfb_showNewTweetsPill(vc);
         nfb_updateStreamStateIconForVC(vc);
         return;
@@ -579,7 +603,7 @@ static void nfb_streamTrigger(UIViewController *vc) {
     UIViewController *target = nfb_selectedTimelineVC(vc) ?: vc;
     if (nfb_isRecommendedHomeTimeline(target)) return;
 
-    if (!nfb_isTimelineAtTop(target)) {
+    if (!nfb_visibleTimelineAtTop(target)) {
         nfb_showNewTweetsPill(target);
         nfb_updateStreamStateIconForVC(target);
         return;
@@ -674,6 +698,9 @@ static void nfb_appendScrollDiag(NSMutableString *s, UIViewController *vc) {
             sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height,
             sv.adjustedContentInset.top, sv.adjustedContentInset.left, sv.adjustedContentInset.bottom, sv.adjustedContentInset.right,
             sv.alwaysBounceVertical ? 1 : 0];
+        [s appendFormat:@"streamGuard vcAtTop=%d visibleAtTop=%d activeOffsetY=%.1f activeTopY=%.1f\n",
+            nfb_isTimelineAtTop(vc) ? 1 : 0, nfb_visibleTimelineAtTop(vc) ? 1 : 0,
+            gActiveTimelineOffsetY, gActiveTimelineTopY];
     } else {
         [s appendString:@"scroll=(nil)\n"];
     }
@@ -886,7 +913,7 @@ static BOOL nfb_streamCanRunForTarget(UIViewController *target) {
     if (nfb_isRecommendedHomeTimeline(target)) return NO;
     UIScrollView *sv = nfb_mainScrollViewOf(target);
     if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) return NO;
-    return nfb_isTimelineAtTop(target);
+    return nfb_visibleTimelineAtTop(target);
 }
 
 static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
@@ -963,6 +990,7 @@ static void nfb_removeButton(void) {
 // Fade with the header: hide while scrolling down, show at top / scrolling up.
 static void nfb_visibilityForScroll(UIScrollView *sv) {
     if (!gStreamButton || gStreamButton.window == nil) return;
+    nfb_noteActiveTimelineScroll(sv);
     nfb_updateStreamStateIconForVC(gActiveItemsVC);
     static CGFloat last = 0;
     CGFloat y = sv.contentOffset.y;
@@ -1055,7 +1083,7 @@ static BOOL nfb_streamShouldFire(UIViewController *vc) {
             return NO;
         }
     }
-    if (!nfb_isTimelineAtTop(target)) {
+    if (!nfb_visibleTimelineAtTop(target)) {
         nfb_showNewTweetsPill(target);
         nfb_updateStreamStateIconForVC(target);
         return NO;
@@ -1178,6 +1206,30 @@ static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc) {
     return nfb_findHorizontalScrollViewInView(vc.view, &bestScore);
 }
 
+static UIViewController *nfb_findHomePagingControllerInTree(UIViewController *root, int depth) {
+    if (!root || depth > 14) return nil;
+    if ([NSStringFromClass(root.class) containsString:@"Paging"] && nfb_isHomePagingController(root)) return root;
+    UIViewController *presented = nfb_findHomePagingControllerInTree(root.presentedViewController, depth + 1);
+    if (presented) return presented;
+    for (UIViewController *child in root.childViewControllers) {
+        UIViewController *found = nfb_findHomePagingControllerInTree(child, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static UIViewController *nfb_findVisibleHomePagingController(void) {
+    UIViewController *active = gActiveItemsVC;
+    UIViewController *paging = active ? nfb_parentControllerNamed(active, @"Paging") : nil;
+    if (paging) return paging;
+    for (UIWindow *window in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
+        if (window.hidden || window.alpha < 0.01) continue;
+        UIViewController *found = nfb_findHomePagingControllerInTree(window.rootViewController, 0);
+        if (found) return found;
+    }
+    return nil;
+}
+
 static void nfb_rememberInlineColumnsOriginals(UIScrollView *scrollView) {
     if (objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey)) return;
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1210,6 +1262,12 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     if (scrollView.contentOffset.x != 0.0) {
         [scrollView setContentOffset:CGPointMake(0.0, scrollView.contentOffset.y) animated:NO];
     }
+    for (UIViewController *child in paging.childViewControllers) {
+        if ([child isViewLoaded]) {
+            child.view.hidden = NO;
+            child.view.alpha = 1.0;
+        }
+    }
 
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1229,10 +1287,14 @@ static void nfb_applyInlineColumns(UIViewController *paging) {
     for (UIViewController *child in paging.childViewControllers) {
         NSString *cls = NSStringFromClass(child.class);
         if ([cls containsString:@"HomeTimelineItemsViewController"] || [cls containsString:@"PinnedTimelineViewController"]) {
+            if (nfb_isRecommendedHomeTimeline(child)) {
+                if ([child isViewLoaded]) child.view.hidden = YES;
+                continue;
+            }
             [pages addObject:child];
         }
     }
-    if (pages.count < 2) return;
+    if (pages.count < 1) return;
 
     BOOL firstApply = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) == nil;
     nfb_rememberInlineColumnsOriginals(scrollView);
@@ -1268,8 +1330,7 @@ static void nfb_applyInlineColumns(UIViewController *paging) {
 }
 
 static void nfb_layoutActiveHomePaging(void) {
-    UIViewController *active = gActiveItemsVC;
-    UIViewController *paging = active ? nfb_parentControllerNamed(active, @"Paging") : nil;
+    UIViewController *paging = nfb_findVisibleHomePagingController();
     if (!paging || ![paging isViewLoaded]) return;
     [paging.view setNeedsLayout];
     [paging.view layoutIfNeeded];
@@ -1308,14 +1369,14 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 // disappears this home VC; the timer must keep running so it can refresh the list via
 // the paging controller's selectedViewController. It self-cleans on dealloc / when off.
 - (void)viewDidDisappear:(BOOL)animated { %orig; }
-- (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_visibilityForScroll(scrollView); }
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_noteActiveTimelineScroll(scrollView); nfb_visibilityForScroll(scrollView); }
 %end
 
 // Older app versions.
 %hook T1HomeTimelineItemsViewController
 - (void)viewDidAppear:(BOOL)animated { %orig; gActiveItemsVC = self; nfb_installButton(self.view.window); nfb_streamStart(self); }
 - (void)viewDidDisappear:(BOOL)animated { %orig; nfb_streamStop(self); }
-- (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_visibilityForScroll(scrollView); }
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_noteActiveTimelineScroll(scrollView); nfb_visibilityForScroll(scrollView); }
 %end
 
 %hook TFNPagingViewController
