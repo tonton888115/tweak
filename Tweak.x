@@ -27,6 +27,9 @@
 #import <Preferences/PSSpecifier.h>
 #import "ModernSettingsViewController.h"
 
+extern void NFBSetInlineColumnsEnabled(BOOL enabled);
+extern BOOL NFBInlineColumnsEnabled(void);
+
 @class T1SettingsViewController;
 
 // Forward declarations
@@ -4124,6 +4127,7 @@ static char kManualRefreshInProgressKey;
 
 // MARK: - Classic Tab Bar Icon Theming
 static char kBHTColumnsTapGestureKey;
+static char kBHTHomeColumnsExitTapGestureKey;
 
 static NSString *BHTColumnsTabTitle(void) {
     NSString *title = [[BHTBundle sharedBundle] localizedStringForKey:@"CUSTOM_TAB_BAR_COLUMNS"];
@@ -4131,15 +4135,23 @@ static NSString *BHTColumnsTabTitle(void) {
     return title;
 }
 
-static BOOL BHTIsColumnsTabView(T1TabView *tabView) {
-    if (!tabView) return NO;
+static NSString *BHTPageOfTabView(T1TabView *tabView) {
+    if (!tabView) return nil;
     NSString *page = nil;
     @try {
         page = tabView.scribePage ?: [tabView valueForKey:@"scribePage"];
     } @catch (NSException *e) {
         page = nil;
     }
-    return [page isEqualToString:@"communities"];
+    return page;
+}
+
+static BOOL BHTIsColumnsTabView(T1TabView *tabView) {
+    return [BHTPageOfTabView(tabView) isEqualToString:@"communities"];
+}
+
+static BOOL BHTIsHomeTabView(T1TabView *tabView) {
+    return [BHTPageOfTabView(tabView) isEqualToString:@"home"];
 }
 
 static UIViewController *BHTFindControllerOfClass(UIViewController *root, Class targetClass, NSInteger depth) {
@@ -4170,34 +4182,49 @@ static id BHTFindValueInControllerTree(UIViewController *root, NSString *key, NS
     return nil;
 }
 
-static void BHTPresentColumnsViewController(void) {
-    Class cls = NSClassFromString(@"NFBColumnsViewController");
-    if (!cls) return;
-
-    UIWindow *window = BHT_activeKeyWindow();
-    UIViewController *presenter = BHT_topViewController(window.rootViewController);
-    if (!presenter) return;
-    if ([presenter isKindOfClass:cls]) return;
-    if ([presenter.navigationController.viewControllers.firstObject isKindOfClass:cls]) return;
-
-    UIViewController *tabBarController = BHTFindControllerOfClass(window.rootViewController, NSClassFromString(@"T1TabBarViewController"), 0);
-    id account = BHTFindValueInControllerTree(window.rootViewController, @"account", 0);
+static NSInteger BHTTabIndexForPage(UIViewController *tabBarController, NSString *pageID) {
     NSArray *tabViews = nil;
     @try {
         tabViews = [tabBarController valueForKey:@"tabViews"];
     } @catch (NSException *e) {
         tabViews = nil;
     }
-
-    UIViewController *columns = [[cls alloc] init];
-    @try {
-        [columns setValue:account forKey:@"sourceAccount"];
-        [columns setValue:tabViews forKey:@"sourceTabViews"];
-    } @catch (NSException *e) {
+    NSInteger index = 0;
+    for (id tabView in tabViews) {
+        NSString *page = nil;
+        @try {
+            page = [tabView valueForKey:@"scribePage"];
+        } @catch (NSException *e) {
+            page = nil;
+        }
+        if ([page isEqualToString:pageID]) return index;
+        index++;
     }
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:columns];
-    nav.modalPresentationStyle = UIModalPresentationFullScreen;
-    [presenter presentViewController:nav animated:YES completion:nil];
+    return NSNotFound;
+}
+
+static void BHTSelectTabPage(UIViewController *root, NSString *pageID) {
+    UIViewController *tabBarController = BHTFindControllerOfClass(root, NSClassFromString(@"T1TabBarViewController"), 0);
+    NSInteger index = BHTTabIndexForPage(tabBarController, pageID);
+    if (index == NSNotFound) return;
+    SEL sel = @selector(setSelectedIndex:);
+    if ([tabBarController respondsToSelector:sel]) {
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(tabBarController, sel, index);
+    }
+}
+
+static void BHTPresentColumnsViewController(void) {
+    UIWindow *window = BHT_activeKeyWindow();
+    if (!window.rootViewController) return;
+    NFBSetInlineColumnsEnabled(YES);
+    BHTSelectTabPage(window.rootViewController, @"home");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NFBSetInlineColumnsEnabled(YES);
+    });
+}
+
+static void BHTLeaveColumnsMode(void) {
+    if (NFBInlineColumnsEnabled()) NFBSetInlineColumnsEnabled(NO);
 }
 
 %hook T1TabView
@@ -4249,7 +4276,22 @@ static void BHTPresentColumnsViewController(void) {
 }
 
 %new
+- (void)bh_leaveColumnsForHomeTap:(UITapGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateEnded) return;
+    BHTLeaveColumnsMode();
+}
+
+%new
 - (void)bh_setupColumnsTabIfNeeded {
+    if (BHTIsHomeTabView((T1TabView *)self)) {
+        if (!objc_getAssociatedObject(self, &kBHTHomeColumnsExitTapGestureKey)) {
+            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bh_leaveColumnsForHomeTap:)];
+            tap.cancelsTouchesInView = NO;
+            [self addGestureRecognizer:tap];
+            objc_setAssociatedObject(self, &kBHTHomeColumnsExitTapGestureKey, tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        return;
+    }
     if (!BHTIsColumnsTabView((T1TabView *)self)) return;
 
     UILabel *titleLabel = [self valueForKey:@"titleLabel"];

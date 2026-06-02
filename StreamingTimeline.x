@@ -4,7 +4,7 @@
 //
 //  Native Home-timeline auto-refresh ("streaming" / 垂れ流し). A floating control sits
 //  top-right (beside the logo row); a countdown gauge ring depletes each interval and at
-//  0 the timeline reloads. TAP = refresh now. LONG-PRESS = options (on/off, interval, and
+//  0 the timeline reloads. TAP = on/off. LONG-PRESS = options (refresh now, interval, and
 //  refresh-method tests, since Twitter's refresh entry point varies by build).
 //  The control is owned by the Home *container* (stable across For-You/Following switches)
 //  and fades away while scrolling down, like the header.
@@ -25,6 +25,8 @@ static void nfb_installButton(UIWindow *win);
 static void nfb_removeButton(void);
 static UIViewController *nfb_selectedTimelineVC(UIViewController *vc);
 static void nfb_streamTrigger(UIViewController *vc);
+static void nfb_styleButton(BOOL on);
+static void nfb_updateGauge(BOOL on, NSTimeInterval interval);
 
 // Minimal bases so `self.view` resolves; everything else goes through objc_msgSend.
 @interface THFHomeTimelineContainerViewController : UIViewController
@@ -33,11 +35,14 @@ static void nfb_streamTrigger(UIViewController *vc);
 @end
 @interface T1HomeTimelineItemsViewController : UIViewController
 @end
+@interface TFNPagingViewController : UIViewController
+@end
 @class NFBStreamHandler;
 
 static __weak UIViewController *gActiveItemsVC = nil;   // the visible Home timeline list
 static __weak UIViewController *gPendingNewTweetsVC = nil;
 static UIButton *gNewTweetsPill = nil;
+static BOOL gInlineColumnsEnabled = NO;
 
 #pragma mark - refresh callers (no signature assumptions)
 
@@ -741,8 +746,8 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
 @end
 
 static NFBStreamButton *gStreamButton = nil;
-static void nfb_setStreamEnabled(BOOL on)    { [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"auto_stream_timeline"]; }
-static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDefaults] setInteger:s forKey:@"auto_stream_interval"]; }
+static void nfb_setStreamEnabled(BOOL on)    { [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"auto_stream_timeline"]; [[NSUserDefaults standardUserDefaults] synchronize]; }
+static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDefaults] setInteger:s forKey:@"auto_stream_interval"]; [[NSUserDefaults standardUserDefaults] synchronize]; }
 
 #pragma mark - tap / long-press handler (reliable action sheets)
 
@@ -769,7 +774,16 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     if (ac.popoverPresentationController) { ac.popoverPresentationController.sourceView = gStreamButton; ac.popoverPresentationController.sourceRect = gStreamButton.bounds; }
     [top presentViewController:ac animated:YES completion:nil];
 }
-- (void)tap { UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamTrigger(vc); }
+- (void)tap {
+    BOOL on = ![BHTManager autoStreamTimeline];
+    nfb_setStreamEnabled(on);
+    UIViewController *vc = gActiveItemsVC;
+    if (vc) nfb_streamStart(vc);
+    else {
+        nfb_styleButton(on);
+        nfb_updateGauge(on, on ? (NSTimeInterval)[BHTManager autoStreamInterval] : 0);
+    }
+}
 - (void)newTweetsTap {
     UIViewController *vc = gPendingNewTweetsVC ?: gActiveItemsVC;
     gPendingNewTweetsVC = nil;
@@ -1042,6 +1056,161 @@ static void nfb_syncHomeTimelineTabIdentifierFromController(UIViewController *vc
     if (identifier.length) nfb_persistHomeTimelineTabIdentifier(identifier);
 }
 
+#pragma mark - inline columns
+
+static char kNFBInlineColumnsAppliedKey;
+static char kNFBInlineColumnsPagingKey;
+static char kNFBInlineColumnsBounceHKey;
+static char kNFBInlineColumnsIndicatorKey;
+static char kNFBInlineColumnsClipsKey;
+static char kNFBInlineColumnsDirectionalLockKey;
+static char kNFBInlineColumnsContentSizeKey;
+
+static BOOL nfb_isHomePagingController(UIViewController *vc) {
+    return nfb_parentControllerNamed(vc, @"HomeTimelineContainer") != nil;
+}
+
+static CGFloat nfb_horizontalScrollScore(UIScrollView *sv) {
+    if (!sv || sv.hidden || sv.alpha < 0.01 || sv.bounds.size.width < 100.0 || sv.bounds.size.height < 100.0) return 0;
+    CGFloat score = sv.bounds.size.width * sv.bounds.size.height;
+    BOOL horizontal = sv.pagingEnabled || sv.alwaysBounceHorizontal || sv.contentSize.width > sv.bounds.size.width * 1.2;
+    if (!horizontal) return 0;
+    if (sv.contentSize.height > sv.bounds.size.height * 1.4 && !sv.pagingEnabled) score *= 0.2;
+    return score;
+}
+
+static UIScrollView *nfb_findHorizontalScrollViewInView(UIView *view, CGFloat *bestScore) {
+    if (!view || view.hidden || view.alpha < 0.01) return nil;
+    UIScrollView *best = nil;
+    if ([view isKindOfClass:UIScrollView.class]) {
+        CGFloat score = nfb_horizontalScrollScore((UIScrollView *)view);
+        if (score > *bestScore) { *bestScore = score; best = (UIScrollView *)view; }
+    }
+    for (UIView *subview in view.subviews) {
+        UIScrollView *candidate = nfb_findHorizontalScrollViewInView(subview, bestScore);
+        if (candidate) best = candidate;
+    }
+    return best;
+}
+
+static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc) {
+    if (![vc isViewLoaded]) return nil;
+    CGFloat bestScore = 0;
+    return nfb_findHorizontalScrollViewInView(vc.view, &bestScore);
+}
+
+static void nfb_rememberInlineColumnsOriginals(UIScrollView *scrollView) {
+    if (objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey)) return;
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey, @(scrollView.pagingEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsBounceHKey, @(scrollView.alwaysBounceHorizontal), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsIndicatorKey, @(scrollView.showsHorizontalScrollIndicator), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsClipsKey, @(scrollView.clipsToBounds), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsDirectionalLockKey, @(scrollView.directionalLockEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsContentSizeKey, [NSValue valueWithCGSize:scrollView.contentSize], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void nfb_restoreInlineColumns(UIViewController *paging) {
+    if (!nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    UIScrollView *scrollView = nfb_horizontalPagingScrollViewOf(paging);
+    if (!scrollView || !objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey)) return;
+
+    NSNumber *pagingEnabled = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey);
+    NSNumber *bounceH = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsBounceHKey);
+    NSNumber *indicator = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsIndicatorKey);
+    NSNumber *clips = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsClipsKey);
+    NSNumber *directionalLock = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsDirectionalLockKey);
+    NSValue *contentSize = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsContentSizeKey);
+
+    if (pagingEnabled) scrollView.pagingEnabled = pagingEnabled.boolValue;
+    if (bounceH) scrollView.alwaysBounceHorizontal = bounceH.boolValue;
+    if (indicator) scrollView.showsHorizontalScrollIndicator = indicator.boolValue;
+    if (clips) scrollView.clipsToBounds = clips.boolValue;
+    if (directionalLock) scrollView.directionalLockEnabled = directionalLock.boolValue;
+    if (contentSize) scrollView.contentSize = contentSize.CGSizeValue;
+    if (scrollView.contentOffset.x != 0.0) {
+        [scrollView setContentOffset:CGPointMake(0.0, scrollView.contentOffset.y) animated:NO];
+    }
+
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsBounceHKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsIndicatorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsClipsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsDirectionalLockKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsContentSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void nfb_applyInlineColumns(UIViewController *paging) {
+    if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    UIScrollView *scrollView = nfb_horizontalPagingScrollViewOf(paging);
+    if (!scrollView || scrollView.bounds.size.width < 100.0 || scrollView.bounds.size.height < 100.0) return;
+
+    NSMutableArray<UIViewController *> *pages = [NSMutableArray array];
+    for (UIViewController *child in paging.childViewControllers) {
+        NSString *cls = NSStringFromClass(child.class);
+        if ([cls containsString:@"HomeTimelineItemsViewController"] || [cls containsString:@"PinnedTimelineViewController"]) {
+            [pages addObject:child];
+        }
+    }
+    if (pages.count < 2) return;
+
+    BOOL firstApply = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) == nil;
+    nfb_rememberInlineColumnsOriginals(scrollView);
+
+    CGFloat viewportWidth = scrollView.bounds.size.width;
+    CGFloat columnWidth = viewportWidth >= 1000.0 ? floor((viewportWidth - 2.0) / 3.0) :
+                          (viewportWidth >= 700.0 ? floor((viewportWidth - 1.0) / 2.0) : MIN(viewportWidth, 390.0));
+    columnWidth = MAX(320.0, MIN(430.0, columnWidth));
+    CGFloat height = scrollView.bounds.size.height;
+
+    scrollView.pagingEnabled = NO;
+    scrollView.alwaysBounceHorizontal = YES;
+    scrollView.directionalLockEnabled = YES;
+    scrollView.showsHorizontalScrollIndicator = YES;
+    scrollView.clipsToBounds = YES;
+    scrollView.contentSize = CGSizeMake(columnWidth * pages.count, height);
+
+    NSUInteger idx = 0;
+    for (UIViewController *page in pages) {
+        [page loadViewIfNeeded];
+        UIView *pageView = page.view;
+        if (!pageView.superview) [scrollView addSubview:pageView];
+        if (pageView.superview != scrollView) { idx++; continue; }
+        pageView.hidden = NO;
+        pageView.alpha = 1.0;
+        pageView.frame = CGRectMake(columnWidth * idx, 0.0, columnWidth, height);
+        pageView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
+        idx++;
+    }
+    if (firstApply) {
+        [scrollView setContentOffset:CGPointMake(0.0, scrollView.contentOffset.y) animated:NO];
+    }
+}
+
+static void nfb_layoutActiveHomePaging(void) {
+    UIViewController *active = gActiveItemsVC;
+    UIViewController *paging = active ? nfb_parentControllerNamed(active, @"Paging") : nil;
+    if (!paging || ![paging isViewLoaded]) return;
+    [paging.view setNeedsLayout];
+    [paging.view layoutIfNeeded];
+    if (gInlineColumnsEnabled) nfb_applyInlineColumns(paging);
+    else nfb_restoreInlineColumns(paging);
+}
+
+BOOL NFBInlineColumnsEnabled(void) {
+    return gInlineColumnsEnabled;
+}
+
+void NFBSetInlineColumnsEnabled(BOOL enabled) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ NFBSetInlineColumnsEnabled(enabled); });
+        return;
+    }
+    gInlineColumnsEnabled = enabled;
+    nfb_layoutActiveHomePaging();
+}
+
 #pragma mark - Hooks
 
 // Button lifecycle on the stable Home container.
@@ -1068,4 +1237,17 @@ static void nfb_syncHomeTimelineTabIdentifierFromController(UIViewController *vc
 - (void)viewDidAppear:(BOOL)animated { %orig; gActiveItemsVC = self; nfb_installButton(self.view.window); nfb_streamStart(self); }
 - (void)viewDidDisappear:(BOOL)animated { %orig; nfb_streamStop(self); }
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_visibilityForScroll(scrollView); }
+%end
+
+%hook TFNPagingViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (gInlineColumnsEnabled) nfb_applyInlineColumns(self);
+    else nfb_restoreInlineColumns(self);
+}
+- (void)viewDidLayoutSubviews {
+    %orig;
+    if (gInlineColumnsEnabled) nfb_applyInlineColumns(self);
+    else nfb_restoreInlineColumns(self);
+}
 %end
