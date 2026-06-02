@@ -4138,6 +4138,34 @@ static BOOL BHTIsColumnsTabView(T1TabView *tabView) {
     return [page isEqualToString:@"communities"];
 }
 
+static UIViewController *BHTFindControllerOfClass(UIViewController *root, Class targetClass, NSInteger depth) {
+    if (!root || !targetClass || depth > 12) return nil;
+    if ([root isKindOfClass:targetClass]) return root;
+    UIViewController *presented = BHTFindControllerOfClass(root.presentedViewController, targetClass, depth + 1);
+    if (presented) return presented;
+    for (UIViewController *child in root.childViewControllers) {
+        UIViewController *found = BHTFindControllerOfClass(child, targetClass, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static id BHTFindValueInControllerTree(UIViewController *root, NSString *key, NSInteger depth) {
+    if (!root || !key.length || depth > 12) return nil;
+    @try {
+        id value = [root valueForKey:key];
+        if (value) return value;
+    } @catch (NSException *e) {
+    }
+    id presented = BHTFindValueInControllerTree(root.presentedViewController, key, depth + 1);
+    if (presented) return presented;
+    for (UIViewController *child in root.childViewControllers) {
+        id value = BHTFindValueInControllerTree(child, key, depth + 1);
+        if (value) return value;
+    }
+    return nil;
+}
+
 static void BHTPresentColumnsViewController(void) {
     Class cls = NSClassFromString(@"NFBColumnsViewController");
     if (!cls) return;
@@ -4148,7 +4176,21 @@ static void BHTPresentColumnsViewController(void) {
     if ([presenter isKindOfClass:cls]) return;
     if ([presenter.navigationController.viewControllers.firstObject isKindOfClass:cls]) return;
 
+    UIViewController *tabBarController = BHTFindControllerOfClass(window.rootViewController, NSClassFromString(@"T1TabBarViewController"), 0);
+    id account = BHTFindValueInControllerTree(window.rootViewController, @"account", 0);
+    NSArray *tabViews = nil;
+    @try {
+        tabViews = [tabBarController valueForKey:@"tabViews"];
+    } @catch (NSException *e) {
+        tabViews = nil;
+    }
+
     UIViewController *columns = [[cls alloc] init];
+    @try {
+        [columns setValue:account forKey:@"sourceAccount"];
+        [columns setValue:tabViews forKey:@"sourceTabViews"];
+    } @catch (NSException *e) {
+    }
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:columns];
     nav.modalPresentationStyle = UIModalPresentationFullScreen;
     [presenter presentViewController:nav animated:YES completion:nil];

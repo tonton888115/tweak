@@ -6,6 +6,12 @@
 @property (nonatomic, strong) UIStackView *stackView;
 @property (nonatomic, strong) NSMutableArray<NSLayoutConstraint *> *widthConstraints;
 @property (nonatomic, strong) NSMutableArray<UIViewController *> *columnControllers;
+@property (nonatomic, strong) id sourceAccount;
+@property (nonatomic, copy) NSArray *sourceTabViews;
+@property (nonatomic, copy) NSDictionary<NSString *, id> *availableTabs;
+@property (nonatomic, copy) NSDictionary<NSString *, NSString *> *availableTitles;
+@property (nonatomic, strong) NSMutableArray<NSString *> *selectedPages;
+@property (nonatomic, strong) NSTimer *refreshTimer;
 @end
 
 @implementation NFBColumnsViewController
@@ -17,12 +23,17 @@
     self.widthConstraints = [NSMutableArray array];
     self.columnControllers = [NSMutableArray array];
 
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
-                                                                                          target:self
-                                                                                          action:@selector(closeColumns)];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
-                                                                                           target:self
-                                                                                           action:@selector(reloadColumns)];
+    UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                                          target:self
+                                                                          action:@selector(closeColumns)];
+    UIBarButtonItem *refresh = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
+                                                                             target:self
+                                                                             action:@selector(reloadColumns)];
+    self.navigationItem.leftBarButtonItems = @[done, refresh];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"編集"
+                                                                              style:UIBarButtonItemStylePlain
+                                                                             target:self
+                                                                             action:@selector(showColumnEditor)];
 
     self.scrollView = [[UIScrollView alloc] initWithFrame:CGRectZero];
     self.scrollView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -52,21 +63,26 @@
     ]];
 
     UIViewController *tabBarController = [self activeTabBarController];
-    id account = [self accountFromControllerTree:tabBarController];
-    NSDictionary<NSString *, id> *tabs = [self tabViewsByPageFromTabBarController:tabBarController];
+    id account = self.sourceAccount ?: [self accountFromControllerTree:tabBarController];
+    self.sourceAccount = account;
+    self.availableTabs = [self tabViewsByPageFromTabBarController:tabBarController];
+    self.availableTitles = [self titlesByPageFromTabs:self.availableTabs];
+    self.selectedPages = [[self loadSelectedPages] mutableCopy];
+    [self rebuildColumns];
+}
 
-    NSArray<NSDictionary<NSString *, NSString *> *> *columns = @[
-        @{@"title": @"Home", @"page": @"home"},
-        @{@"title": @"Search", @"page": @"guide"},
-        @{@"title": @"Notifications", @"page": @"ntab"},
-        @{@"title": @"Messages", @"page": @"messages"}
-    ];
-    for (NSDictionary<NSString *, NSString *> *column in columns) {
-        [self addNativeColumnWithTitle:column[@"title"]
-                                  page:column[@"page"]
-                               account:account
-                                  tabs:tabs];
-    }
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    [self startColumnRefreshTimer];
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    [self stopColumnRefreshTimer];
+}
+
+- (void)dealloc {
+    [self stopColumnRefreshTimer];
 }
 
 - (void)viewDidLayoutSubviews {
@@ -117,9 +133,9 @@
 
 - (NSDictionary<NSString *, id> *)tabViewsByPageFromTabBarController:(UIViewController *)tabBarController {
     NSMutableDictionary<NSString *, id> *result = [NSMutableDictionary dictionary];
-    NSArray *tabViews = nil;
+    NSArray *tabViews = self.sourceTabViews;
     @try {
-        tabViews = [tabBarController valueForKey:@"tabViews"];
+        if (!tabViews) tabViews = [tabBarController valueForKey:@"tabViews"];
     } @catch (NSException *e) {
         tabViews = nil;
     }
@@ -133,6 +149,102 @@
         if (page.length && !result[page]) result[page] = tabView;
     }
     return result;
+}
+
+- (NSDictionary<NSString *, NSString *> *)titlesByPageFromTabs:(NSDictionary<NSString *, id> *)tabs {
+    NSDictionary<NSString *, NSString *> *defaults = @{
+        @"home": @"Home",
+        @"guide": @"Search",
+        @"ntab": @"Notifications",
+        @"messages": @"Messages",
+        @"grok": @"Grok",
+        @"profile": @"Profile",
+        @"audiospace": @"Spaces",
+        @"media": @"Video",
+        @"lists": @"Lists"
+    };
+    NSMutableDictionary<NSString *, NSString *> *titles = [NSMutableDictionary dictionary];
+    for (NSString *page in tabs) {
+        if ([page isEqualToString:@"communities"]) continue;
+        NSString *title = defaults[page] ?: page;
+        id tabView = tabs[page];
+        @try {
+            UILabel *label = [tabView valueForKey:@"titleLabel"];
+            if (label.text.length && ![label.text isEqualToString:@"カラム"] && ![label.text isEqualToString:@"Columns"]) title = label.text;
+        } @catch (NSException *e) {
+        }
+        titles[page] = title;
+    }
+    return titles;
+}
+
+- (NSArray<NSString *> *)preferredPageOrder {
+    NSMutableArray<NSString *> *order = [@[@"home", @"guide", @"ntab", @"messages", @"grok", @"profile", @"audiospace", @"media", @"lists"] mutableCopy];
+    NSArray *extra = [[self.availableTitles allKeys] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    for (NSString *page in extra) {
+        if (![order containsObject:page]) [order addObject:page];
+    }
+    return order;
+}
+
+- (NSArray<NSString *> *)defaultPages {
+    NSArray *preferred = @[@"home", @"guide", @"ntab", @"messages"];
+    NSMutableArray<NSString *> *pages = [NSMutableArray array];
+    for (NSString *page in preferred) {
+        if (self.availableTabs[page] && self.availableTitles[page]) [pages addObject:page];
+    }
+    if (pages.count == 0) {
+        for (NSString *page in [self preferredPageOrder]) {
+            if (self.availableTabs[page] && self.availableTitles[page]) {
+                [pages addObject:page];
+                break;
+            }
+        }
+    }
+    return pages;
+}
+
+- (NSArray<NSString *> *)loadSelectedPages {
+    NSArray *saved = [[NSUserDefaults standardUserDefaults] objectForKey:@"nfb_columns_pages"];
+    NSMutableArray<NSString *> *pages = [NSMutableArray array];
+    if ([saved isKindOfClass:NSArray.class]) {
+        for (id value in saved) {
+            if ([value isKindOfClass:NSString.class] && self.availableTabs[value] && self.availableTitles[value] && ![pages containsObject:value]) {
+                [pages addObject:value];
+            }
+        }
+    }
+    return pages.count ? pages : [self defaultPages];
+}
+
+- (void)persistSelectedPages {
+    [[NSUserDefaults standardUserDefaults] setObject:self.selectedPages ?: @[] forKey:@"nfb_columns_pages"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)rebuildColumns {
+    for (UIViewController *controller in [self.columnControllers copy]) {
+        [controller willMoveToParentViewController:nil];
+        [controller.view removeFromSuperview];
+        [controller removeFromParentViewController];
+    }
+    [self.columnControllers removeAllObjects];
+    [self.widthConstraints removeAllObjects];
+
+    for (UIView *view in [self.stackView.arrangedSubviews copy]) {
+        [self.stackView removeArrangedSubview:view];
+        [view removeFromSuperview];
+    }
+
+    for (NSString *page in self.selectedPages) {
+        id tabView = self.availableTabs[page];
+        NSString *title = self.availableTitles[page];
+        if (!tabView || !title.length) continue;
+        [self addNativeColumnWithTitle:title page:page account:self.sourceAccount tabs:self.availableTabs];
+    }
+    if (self.stackView.arrangedSubviews.count == 0) {
+        [self addPlaceholderColumnWithTitle:@"Columns" message:@"No native tabs are available."];
+    }
 }
 
 - (void)addNativeColumnWithTitle:(NSString *)title page:(NSString *)page account:(id)account tabs:(NSDictionary<NSString *, id> *)tabs {
@@ -179,18 +291,7 @@
 
     UIViewController *controller = [self newTabNavigationControllerForPage:page account:account tabs:tabs];
     if (!controller) {
-        UILabel *fallback = [[UILabel alloc] initWithFrame:CGRectZero];
-        fallback.translatesAutoresizingMaskIntoConstraints = NO;
-        fallback.text = @"Unable to load native tab";
-        fallback.textColor = UIColor.secondaryLabelColor;
-        fallback.textAlignment = NSTextAlignmentCenter;
-        fallback.numberOfLines = 0;
-        [content addSubview:fallback];
-        [NSLayoutConstraint activateConstraints:@[
-            [fallback.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:16.0],
-            [fallback.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-16.0],
-            [fallback.centerYAnchor constraintEqualToAnchor:content.centerYAnchor]
-        ]];
+        [self addPlaceholderInView:content message:@"Unable to load native tab"];
         return;
     }
 
@@ -205,6 +306,51 @@
     ]];
     [controller didMoveToParentViewController:self];
     [self.columnControllers addObject:controller];
+}
+
+- (void)addPlaceholderColumnWithTitle:(NSString *)title message:(NSString *)message {
+    UIView *column = [[UIView alloc] initWithFrame:CGRectZero];
+    column.translatesAutoresizingMaskIntoConstraints = NO;
+    column.backgroundColor = UIColor.systemBackgroundColor;
+    [self.stackView addArrangedSubview:column];
+    NSLayoutConstraint *width = [column.widthAnchor constraintEqualToConstant:360.0];
+    width.active = YES;
+    [self.widthConstraints addObject:width];
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectZero];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    label.text = title;
+    label.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
+    label.textAlignment = NSTextAlignmentCenter;
+    [column addSubview:label];
+    UIView *content = [[UIView alloc] initWithFrame:CGRectZero];
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+    [column addSubview:content];
+    [NSLayoutConstraint activateConstraints:@[
+        [label.topAnchor constraintEqualToAnchor:column.topAnchor constant:8.0],
+        [label.leadingAnchor constraintEqualToAnchor:column.leadingAnchor],
+        [label.trailingAnchor constraintEqualToAnchor:column.trailingAnchor],
+        [label.heightAnchor constraintEqualToConstant:24.0],
+        [content.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:6.0],
+        [content.leadingAnchor constraintEqualToAnchor:column.leadingAnchor],
+        [content.trailingAnchor constraintEqualToAnchor:column.trailingAnchor],
+        [content.bottomAnchor constraintEqualToAnchor:column.bottomAnchor]
+    ]];
+    [self addPlaceholderInView:content message:message];
+}
+
+- (void)addPlaceholderInView:(UIView *)view message:(NSString *)message {
+    UILabel *fallback = [[UILabel alloc] initWithFrame:CGRectZero];
+    fallback.translatesAutoresizingMaskIntoConstraints = NO;
+    fallback.text = message;
+    fallback.textColor = UIColor.secondaryLabelColor;
+    fallback.textAlignment = NSTextAlignmentCenter;
+    fallback.numberOfLines = 0;
+    [view addSubview:fallback];
+    [NSLayoutConstraint activateConstraints:@[
+        [fallback.leadingAnchor constraintEqualToAnchor:view.leadingAnchor constant:16.0],
+        [fallback.trailingAnchor constraintEqualToAnchor:view.trailingAnchor constant:-16.0],
+        [fallback.centerYAnchor constraintEqualToAnchor:view.centerYAnchor]
+    ]];
 }
 
 - (UIViewController *)newTabNavigationControllerForPage:(NSString *)page account:(id)account tabs:(NSDictionary<NSString *, id> *)tabs {
@@ -228,6 +374,17 @@
 
 - (void)reloadControllerTree:(UIViewController *)controller {
     if (!controller) return;
+    id timeline = nil;
+    @try {
+        if ([controller respondsToSelector:@selector(timeline)]) timeline = ((id (*)(id, SEL))objc_msgSend)(controller, @selector(timeline));
+    } @catch (NSException *e) {
+        timeline = nil;
+    }
+    id refreshTarget = timeline ?: controller;
+    if ([refreshTarget respondsToSelector:@selector(refreshWithSource:completion:)]) {
+        void (^completion)(void) = ^{};
+        ((void (*)(id, SEL, NSInteger, id))objc_msgSend)(refreshTarget, @selector(refreshWithSource:completion:), 0, completion);
+    }
     SEL selectors[] = {
         @selector(reloadViewControllerData),
         @selector(_tfn_reloadViewControllerDataIfNeeded),
@@ -243,6 +400,95 @@
     for (UIViewController *child in controller.childViewControllers) {
         [self reloadControllerTree:child];
     }
+}
+
+- (BOOL)columnsAutoRefreshEnabled {
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"auto_stream_timeline"]) return NO;
+    return UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+}
+
+- (NSTimeInterval)columnsRefreshInterval {
+    NSInteger seconds = [[NSUserDefaults standardUserDefaults] integerForKey:@"auto_stream_interval"];
+    return (NSTimeInterval)(seconds >= 5 ? seconds : 20);
+}
+
+- (void)startColumnRefreshTimer {
+    [self stopColumnRefreshTimer];
+    if (![self columnsAutoRefreshEnabled]) return;
+    __weak typeof(self) weakSelf = self;
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:[self columnsRefreshInterval] repeats:YES block:^(NSTimer *t) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) { [t invalidate]; return; }
+        if (![strongSelf columnsAutoRefreshEnabled]) return;
+        [strongSelf reloadColumns];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:UITrackingRunLoopMode];
+    self.refreshTimer = timer;
+}
+
+- (void)stopColumnRefreshTimer {
+    [self.refreshTimer invalidate];
+    self.refreshTimer = nil;
+}
+
+- (void)showColumnEditor {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Columns" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"すべて更新" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self reloadColumns];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"リセット" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        self.selectedPages = [[self defaultPages] mutableCopy];
+        [self persistSelectedPages];
+        [self rebuildColumns];
+    }]];
+
+    for (NSString *page in [self.selectedPages copy]) {
+        NSString *title = self.availableTitles[page] ?: page;
+        NSUInteger index = [self.selectedPages indexOfObject:page];
+        if (index != NSNotFound && index > 0) {
+            [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"← %@", title] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+                NSUInteger i = [self.selectedPages indexOfObject:page];
+                if (i != NSNotFound && i > 0) {
+                    [self.selectedPages exchangeObjectAtIndex:i withObjectAtIndex:i - 1];
+                    [self persistSelectedPages];
+                    [self rebuildColumns];
+                }
+            }]];
+        }
+        if (index != NSNotFound && index + 1 < self.selectedPages.count) {
+            [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@ →", title] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+                NSUInteger i = [self.selectedPages indexOfObject:page];
+                if (i != NSNotFound && i + 1 < self.selectedPages.count) {
+                    [self.selectedPages exchangeObjectAtIndex:i withObjectAtIndex:i + 1];
+                    [self persistSelectedPages];
+                    [self rebuildColumns];
+                }
+            }]];
+        }
+        if (self.selectedPages.count > 1) {
+            [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"削除: %@", title] style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+                [self.selectedPages removeObject:page];
+                [self persistSelectedPages];
+                [self rebuildColumns];
+            }]];
+        }
+    }
+
+    for (NSString *page in [self preferredPageOrder]) {
+        if (!self.availableTabs[page] || !self.availableTitles[page] || [self.selectedPages containsObject:page]) continue;
+        NSString *title = self.availableTitles[page] ?: page;
+        [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"追加: %@", title] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            [self.selectedPages addObject:page];
+            [self persistSelectedPages];
+            [self rebuildColumns];
+        }]];
+    }
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
+    if (sheet.popoverPresentationController) {
+        sheet.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 - (void)closeColumns {
