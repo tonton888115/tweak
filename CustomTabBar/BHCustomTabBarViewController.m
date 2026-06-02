@@ -249,19 +249,29 @@ static UIFont *TwitterChirpFont(TwitterFontStyle style) {
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_HOME" pageID:@"home"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_EXPLORE" pageID:@"guide"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_SPACES" pageID:@"audiospace"],
-            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_COMMUNITIES" pageID:@"communities"],
+            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_COLUMNS" pageID:@"communities"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_NOTIFICATIONS" pageID:@"ntab"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_MESSAGES" pageID:@"messages"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_GROK" pageID:@"grok"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_PROFILE" pageID:@"profile"],
-            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_COLUMNS" pageID:@"media"]
+            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_VIDEO" pageID:@"media"]
         ] mutableCopy];
         self.enabledPageIDs = [NSMutableSet setWithArray:@[@"home", @"guide", @"ntab", @"messages"]];
     }
+    BOOL migrateColumnsFromMedia = NO;
+    BOOL mediaWasEnabled = [self.enabledPageIDs containsObject:@"media"];
     for (BHCustomTabBarItem *item in self.allItems) {
-        if ([item.pageID isEqualToString:@"media"]) {
+        if ([item.pageID isEqualToString:@"communities"]) {
             item.title = @"CUSTOM_TAB_BAR_COLUMNS";
+        } else if ([item.pageID isEqualToString:@"media"]) {
+            migrateColumnsFromMedia = [item.title isEqualToString:@"CUSTOM_TAB_BAR_COLUMNS"];
+            item.title = @"CUSTOM_TAB_BAR_VIDEO";
         }
+    }
+    if (migrateColumnsFromMedia || mediaWasEnabled) {
+        [self.enabledPageIDs removeObject:@"media"];
+        [self.enabledPageIDs addObject:@"communities"];
+        [self persistChanges];
     }
     
     // Store initial state for comparison later

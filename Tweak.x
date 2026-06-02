@@ -4135,7 +4135,7 @@ static BOOL BHTIsColumnsTabView(T1TabView *tabView) {
     } @catch (NSException *e) {
         page = nil;
     }
-    return [page isEqualToString:@"media"];
+    return [page isEqualToString:@"communities"];
 }
 
 static void BHTPresentColumnsViewController(void) {

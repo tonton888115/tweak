@@ -44,6 +44,86 @@ static id   nfb_timelineOf(id vc) { return nfb_resp(vc, @selector(timeline)) ? (
 static UIScrollView *nfb_scrollOf(id vc) { return nfb_resp(vc, @selector(scrollView)) ? ((id(*)(id,SEL))objc_msgSend)(vc, @selector(scrollView)) : nil; }
 static id nfb_findPullControl(UIViewController *startVC);
 
+static NSString *nfb_textOfView(UIView *view) {
+    if (!view) return nil;
+    NSString *text = nil;
+    @try {
+        if ([view isKindOfClass:UILabel.class]) text = ((UILabel *)view).text;
+        else if ([view isKindOfClass:UIButton.class]) text = [((UIButton *)view) titleForState:UIControlStateNormal];
+        if (!text.length) {
+            id value = [view valueForKey:@"text"];
+            if ([value isKindOfClass:NSString.class]) text = value;
+        }
+        if (!text.length) text = view.accessibilityLabel;
+    } @catch (NSException *e) {
+        text = nil;
+    }
+    return text;
+}
+
+static BOOL nfb_viewOrAncestorSelected(UIView *view) {
+    UIView *current = view;
+    for (int i = 0; current && i < 4; i++, current = current.superview) {
+        if ((current.accessibilityTraits & UIAccessibilityTraitSelected) == UIAccessibilityTraitSelected) return YES;
+        @try {
+            id selected = [current valueForKey:@"selected"];
+            if ([selected respondsToSelector:@selector(boolValue)] && [selected boolValue]) return YES;
+        } @catch (NSException *e) {
+        }
+    }
+    return NO;
+}
+
+static NSString *nfb_selectedTextInView(UIView *view, int depth) {
+    if (!view || view.hidden || view.alpha < 0.01 || depth > 10) return nil;
+    NSString *text = nfb_textOfView(view);
+    if (text.length && nfb_viewOrAncestorSelected(view)) return text;
+    for (UIView *subview in view.subviews) {
+        NSString *found = nfb_selectedTextInView(subview, depth + 1);
+        if (found.length) return found;
+    }
+    return nil;
+}
+
+static UIViewController *nfb_parentControllerNamed(UIViewController *vc, NSString *needle) {
+    UIViewController *current = vc;
+    for (int i = 0; current && i < 8; i++, current = current.parentViewController) {
+        if ([NSStringFromClass(current.class) containsString:needle]) return current;
+    }
+    return nil;
+}
+
+static NSInteger nfb_indexOfChildInPagingController(UIViewController *vc) {
+    UIViewController *paging = nfb_parentControllerNamed(vc, @"Paging");
+    if (!paging) return NSNotFound;
+    NSInteger index = 0;
+    for (UIViewController *child in paging.childViewControllers) {
+        if (child == vc) return index;
+        index++;
+    }
+    return NSNotFound;
+}
+
+static BOOL nfb_textLooksRecommendedTab(NSString *text) {
+    NSString *low = text.lowercaseString;
+    return [text containsString:@"おすすめ"] ||
+           [low containsString:@"for you"] ||
+           [low containsString:@"foryou"] ||
+           [low containsString:@"recommended"];
+}
+
+static BOOL nfb_isRecommendedHomeTimeline(UIViewController *vc) {
+    UIViewController *segmented = nfb_parentControllerNamed(vc, @"Segmented");
+    NSString *selectedText = segmented ? nfb_selectedTextInView(segmented.view, 0) : nil;
+    if (nfb_textLooksRecommendedTab(selectedText)) return YES;
+    if (selectedText.length) return NO;
+
+    id timeline = nfb_timelineOf(vc);
+    NSString *timelineClass = timeline ? NSStringFromClass([timeline class]) : @"";
+    if (![timelineClass isEqualToString:@"TFNTwitterHomeTimeline"]) return NO;
+    return nfb_indexOfChildInPagingController(vc) == 0;
+}
+
 static CGFloat nfb_scrollViewScore(UIScrollView *sv) {
     if (!sv || sv.hidden || sv.alpha < 0.01 || sv.bounds.size.width < 100.0 || sv.bounds.size.height < 100.0) return 0;
     CGFloat area = sv.bounds.size.width * sv.bounds.size.height;
@@ -392,11 +472,20 @@ static void nfb_appendMethodType(NSMutableString *s, NSString *ind, id obj, SEL 
 static void nfb_appendScrollDiag(NSMutableString *s, UIViewController *vc) {
     UIScrollView *sv = nfb_mainScrollViewOf(vc);
     if (!sv) { [s appendString:@"scroll=(nil)\n"]; return; }
+    UIViewController *segmented = nfb_parentControllerNamed(vc, @"Segmented");
+    NSString *selectedText = segmented ? nfb_selectedTextInView(segmented.view, 0) : nil;
+    NSInteger pagingIndex = nfb_indexOfChildInPagingController(vc);
+    id timeline = nfb_timelineOf(vc);
     [s appendFormat:@"scroll=%@ offset=(%.1f,%.1f) size=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) bounceV=%d\n",
         NSStringFromClass([sv class]), sv.contentOffset.x, sv.contentOffset.y,
         sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height,
         sv.adjustedContentInset.top, sv.adjustedContentInset.left, sv.adjustedContentInset.bottom, sv.adjustedContentInset.right,
         sv.alwaysBounceVertical ? 1 : 0];
+    [s appendFormat:@"homeVariant recommended=%d pagingIndex=%ld selectedText=%@ timeline=%@\n",
+        nfb_isRecommendedHomeTimeline(vc) ? 1 : 0,
+        (long)pagingIndex,
+        selectedText ?: @"(nil)",
+        timeline ? NSStringFromClass([timeline class]) : @"(nil)"];
 }
 
 static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
@@ -620,14 +709,67 @@ static void nfb_visibilityForScroll(UIScrollView *sv) {
                      completion:^(BOOL f){ gStreamButton.userInteractionEnabled = (target > 0.5); }];
 }
 
+static NSString *nfb_scribePageOfTabView(UIView *view) {
+    NSString *page = nil;
+    @try {
+        id value = [view valueForKey:@"scribePage"];
+        if ([value isKindOfClass:NSString.class]) page = value;
+    } @catch (NSException *e) {
+        page = nil;
+    }
+    return page;
+}
+
+static BOOL nfb_tabViewSelected(UIView *view, BOOL *known) {
+    if (known) *known = NO;
+    @try {
+        id value = [view valueForKey:@"selected"];
+        if ([value respondsToSelector:@selector(boolValue)]) {
+            if (known) *known = YES;
+            return [value boolValue];
+        }
+    } @catch (NSException *e) {
+    }
+    return NO;
+}
+
+static NSString *nfb_selectedTabPageInView(UIView *view, int depth) {
+    if (!view || view.hidden || view.alpha < 0.01 || depth > 12) return nil;
+    Class tabClass = NSClassFromString(@"T1TabView");
+    BOOL looksLikeTab = (tabClass && [view isKindOfClass:tabClass]) || [NSStringFromClass(view.class) isEqualToString:@"T1TabView"];
+    if (looksLikeTab) {
+        BOOL known = NO;
+        BOOL selected = nfb_tabViewSelected(view, &known);
+        NSString *page = nfb_scribePageOfTabView(view);
+        if (known && selected && page.length) return page;
+    }
+    for (UIView *subview in view.subviews.reverseObjectEnumerator) {
+        NSString *page = nfb_selectedTabPageInView(subview, depth + 1);
+        if (page.length) return page;
+    }
+    return nil;
+}
+
+static BOOL nfb_homeTabSelectedOrUnknown(void) {
+    for (UIWindow *window in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
+        if (window.hidden || window.alpha < 0.01) continue;
+        NSString *page = nfb_selectedTabPageInView(window, 0);
+        if (page.length) return [page isEqualToString:@"home"];
+    }
+    return YES;
+}
+
 #pragma mark - streaming timer
 
 static char kNFBStreamTimerKey;
 
 static BOOL nfb_streamShouldFire(UIViewController *vc) {
     if (![BHTManager autoStreamTimeline]) return NO;
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return NO;
     if (vc != gActiveItemsVC) return NO;                        // only the visible list
     if (![vc isViewLoaded] || vc.view.window == nil) return NO;
+    if (!nfb_homeTabSelectedOrUnknown()) return NO;
+    if (nfb_isRecommendedHomeTimeline(vc)) return NO;
     UIScrollView *sv = nfb_mainScrollViewOf(vc);
     if (sv) {
         if (sv.isDragging || sv.isDecelerating || sv.isTracking) return NO;
