@@ -29,6 +29,7 @@ static void nfb_styleButton(BOOL on);
 static void nfb_updateGauge(BOOL on, NSTimeInterval interval);
 static void nfb_updateStreamStateIconForVC(UIViewController *vc);
 static BOOL nfb_homeTabSelectedOrUnknown(void);
+static void nfb_showNewTweetsPill(UIViewController *vc);
 void NFBSetInlineColumnsEnabled(BOOL enabled);
 
 // Minimal bases so `self.view` resolves; everything else goes through objc_msgSend.
