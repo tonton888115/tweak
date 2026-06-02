@@ -500,20 +500,17 @@ static void nfb_streamTrigger(UIViewController *vc) {
         nfb_scrollToTop(vc, NO);
     }
 
-    BOOL did = nfb_doTimelineRefresh(vc);
-    if (nfb_doLoadTop(vc)) {
-        nfb_doSchedulePullUpdate(vc);
-        did = YES;
-    }
-    if (!did) {
-        if (nfb_doSchedulePullUpdate(vc))   did = YES;
-        else if (nfb_doDynamicPullToLoadTop(vc)) did = YES;
-        else if (nfb_doPullWithControl(vc))      did = YES;
-        else if (nfb_doPull(vc))                 did = YES;
-        else if (nfb_doLoadNewer(vc))            did = YES;
-        else if (nfb_doReloadTop(vc))            did = YES;
-        else if (nfb_doRefreshContent(vc))       did = YES;
-    }
+    // All of C/D/F are confirmed working on-device; fire ONLY ONE per trigger so the
+    // auto-timer (every few seconds) doesn't hit the timeline endpoint 3x -> rate limits.
+    BOOL did = nfb_doTimelineRefresh(vc)            // F: TFNTwitterHomeTimeline refreshWithSource:completion:
+            || nfb_doSchedulePullUpdate(vc)         // C: schedulePullToRefreshUpdate
+            || nfb_doDynamicPullToLoadTop(vc)       // D: native pull-to-load-top (real control as sender)
+            || nfb_doLoadTop(vc)                    // A: loadTop:
+            || nfb_doPullWithControl(vc)
+            || nfb_doPull(vc)
+            || nfb_doLoadNewer(vc)
+            || nfb_doReloadTop(vc)
+            || nfb_doRefreshContent(vc);
     if (did) nfb_afterRefresh(vc);
 }
 
