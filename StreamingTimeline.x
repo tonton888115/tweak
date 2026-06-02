@@ -5,7 +5,7 @@
 //  Native Home-timeline auto-refresh ("streaming" / 垂れ流し). A floating control sits
 //  top-right (beside the logo row); a countdown gauge ring depletes each interval and at
 //  0 the timeline reloads. TAP = refresh now. LONG-PRESS = options (on/off, interval, and
-//  an A/B/C/D refresh-method test, since Twitter's refresh entry point varies by build).
+//  refresh-method tests, since Twitter's refresh entry point varies by build).
 //  The control is owned by the Home *container* (stable across For-You/Following switches)
 //  and fades away while scrolling down, like the header.
 //
@@ -79,6 +79,25 @@ static BOOL nfb_doRefreshContent(id startVC) {
     if (t) { ((void(*)(id,SEL))objc_msgSend)(t, @selector(_refreshContent)); return YES; }
     return NO;
 }
+static BOOL nfb_doSchedulePullUpdate(id startVC) {
+    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(schedulePullToRefreshUpdate), 0);
+    if (t) { ((void(*)(id,SEL))objc_msgSend)(t, @selector(schedulePullToRefreshUpdate)); return YES; }
+    return NO;
+}
+static BOOL nfb_doLoadTop(id startVC) {
+    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(loadTop:), 0);
+    if (t) { ((void(*)(id,SEL,id))objc_msgSend)(t, @selector(loadTop:), nil); return YES; }
+    return NO;
+}
+static BOOL nfb_doTimelineRefresh(id startVC) {
+    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(refreshWithSource:completion:), 0);
+    if (t) {
+        void (^completion)(void) = ^{};
+        ((void(*)(id,SEL,NSInteger,id))objc_msgSend)(t, @selector(refreshWithSource:completion:), 0, completion);
+        return YES;
+    }
+    return NO;
+}
 
 // Find an instance variable of `obj` whose type encoding mentions `typeName`.
 static id nfb_ivarOfType(id obj, const char *typeName) {
@@ -95,8 +114,17 @@ static id nfb_ivarOfType(id obj, const char *typeName) {
     }
     return nil;
 }
+static id nfb_pullToLoadTopControlOf(id obj) {
+    if (nfb_resp(obj, @selector(pullToLoadTopControl))) {
+        return ((id(*)(id,SEL))objc_msgSend)(obj, @selector(pullToLoadTopControl));
+    }
+    return nil;
+}
 static id nfb_findPullControl(UIViewController *startVC) {
-    id ctrl = nfb_ivarOfType(gActiveItemsVC, "TFNPullToRefreshControl");
+    id ctrl = nfb_pullToLoadTopControlOf(gActiveItemsVC);
+    if (!ctrl) ctrl = nfb_pullToLoadTopControlOf(startVC);
+    if (!ctrl) ctrl = nfb_pullToLoadTopControlOf(nfb_findResponder(nfb_homeRoot(startVC), @selector(pullToLoadTopControl), 0));
+    if (!ctrl) ctrl = nfb_ivarOfType(gActiveItemsVC, "TFNPullToRefreshControl");
     if (!ctrl) ctrl = nfb_ivarOfType(nfb_findResponder(nfb_homeRoot(startVC), @selector(_t1_didPullToRefresh:), 0), "TFNPullToRefreshControl");
     if (!ctrl) {
         UIScrollView *sv = nfb_scrollOf(gActiveItemsVC);
@@ -113,12 +141,25 @@ static BOOL nfb_doPullWithControl(id startVC) {
     ((void(*)(id,SEL,id))objc_msgSend)(cont, @selector(_t1_didPullToRefresh:), ctrl);
     return YES;
 }
+// Current Twitter builds expose this on the visible items VC; it is the native
+// pull-to-load-top action, with the real pull control as sender.
+static BOOL nfb_doDynamicPullToLoadTop(id startVC) {
+    id t = nfb_findResponder(nfb_homeRoot(startVC), @selector(_tfn_dynamic_didPullToLoadTop:), 0);
+    id ctrl = nfb_findPullControl(startVC);
+    if (!t || !ctrl) return NO;
+    ((void(*)(id,SEL,id))objc_msgSend)(t, @selector(_tfn_dynamic_didPullToLoadTop:), ctrl);
+    return YES;
+}
 
 static void nfb_streamTrigger(UIViewController *vc) {
-    if (nfb_doPullWithControl(vc)) return;
-    if (nfb_doPull(vc))            return;
-    if (nfb_doLoadNewer(vc))       return;
-    if (nfb_doReloadTop(vc))       return;
+    if (nfb_doDynamicPullToLoadTop(vc)) return;
+    if (nfb_doLoadTop(vc))              return;
+    if (nfb_doTimelineRefresh(vc))      return;
+    if (nfb_doSchedulePullUpdate(vc))   return;
+    if (nfb_doPullWithControl(vc))      return;
+    if (nfb_doPull(vc))                 return;
+    if (nfb_doLoadNewer(vc))            return;
+    if (nfb_doReloadTop(vc))            return;
     nfb_doRefreshContent(vc);
 }
 
@@ -147,6 +188,10 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
     if (!vc || depth > 6) return;
     NSString *ind = (depth > 0) ? [@"" stringByPaddingToLength:depth * 2 withString:@". " startingAtIndex:0] : @"";
     NSMutableArray *r = [NSMutableArray array];
+    if ([vc respondsToSelector:@selector(_tfn_dynamic_didPullToLoadTop:)]) [r addObject:@"pullLoadTop"];
+    if ([vc respondsToSelector:@selector(pullToLoadTopControl)]) [r addObject:@"pullCtrl"];
+    if ([vc respondsToSelector:@selector(loadTop:)]) [r addObject:@"loadTop"];
+    if ([vc respondsToSelector:@selector(schedulePullToRefreshUpdate)]) [r addObject:@"schedulePull"];
     if ([vc respondsToSelector:@selector(loadNewer)]) [r addObject:@"loadNewer"];
     if ([vc respondsToSelector:@selector(_t1_didPullToRefresh:)]) [r addObject:@"pull"];
     if ([vc respondsToSelector:@selector(reloadTop:)]) [r addObject:@"reloadTop"];
@@ -159,7 +204,11 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
     if (meth.length) [s appendFormat:@"%@   m: %@\n", ind, meth];
     id tl = nfb_timelineOf(vc);
     if (tl) {
-        [s appendFormat:@"%@  ⮡timeline=%@\n", ind, NSStringFromClass([tl class])];
+        NSMutableArray *tr = [NSMutableArray array];
+        if ([tl respondsToSelector:@selector(refreshWithSource:completion:)]) [tr addObject:@"refreshSrc"];
+        if ([tl respondsToSelector:@selector(refreshWithSource:pushToHomeTweetId:completion:)]) [tr addObject:@"refreshSrcTweet"];
+        [s appendFormat:@"%@  ⮡timeline=%@%@\n", ind, NSStringFromClass([tl class]),
+            tr.count ? [NSString stringWithFormat:@"  <%@>", [tr componentsJoinedByString:@","]] : @""];
         NSString *tm = nfb_refreshMethodsOf([tl class]);
         if (tm.length) [s appendFormat:@"%@   tl.m: %@\n", ind, tm];
     }
@@ -260,11 +309,11 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
 - (void)showTest {
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"更新方式テスト"
         message:@"各ボタンでその方式の更新を1回試します。TLが更新された方式を教えてください。" preferredStyle:UIAlertControllerStyleActionSheet];
-    [ac addAction:[UIAlertAction actionWithTitle:@"A: pull" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doPull(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"B: loadNewer" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doLoadNewer(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"C: reloadTop" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doReloadTop(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"D: refreshContent" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doRefreshContent(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"E: pull + 本物のコントロール" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doPullWithControl(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"A: dynamic pullToLoadTop" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doDynamicPullToLoadTop(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"B: loadTop:nil" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doLoadTop(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"C: timeline refresh" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doTimelineRefresh(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"D: schedulePullUpdate" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doSchedulePullUpdate(vc); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"E: legacy container pull" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_doPullWithControl(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
