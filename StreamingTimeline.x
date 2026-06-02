@@ -194,6 +194,23 @@ static NSString *nfb_homeTimelineTabIdentifier(UIViewController *vc) {
 }
 
 static BOOL nfb_isRecommendedHomeTimeline(UIViewController *vc) {
+    if (!vc) return NO;
+    // Definitive: the Home container exposes the "For You" (home) and "Following"
+    // (latest) list controllers as distinct objects. Compare by identity — this is
+    // immune to the nil tab text/identifiers that broke the old heuristic, and it
+    // never mis-flags Following or pinned lists as recommended.
+    UIViewController *container = nfb_parentControllerNamed(vc, @"HomeTimelineContainer");
+    if (container && nfb_resp(container, @selector(homeTimelineViewController))) {
+        id homeVC = ((id(*)(id, SEL))objc_msgSend)(container, @selector(homeTimelineViewController));
+        if (homeVC) {
+            id latestVC = nfb_resp(container, @selector(latestTimelineViewController))
+                ? ((id(*)(id, SEL))objc_msgSend)(container, @selector(latestTimelineViewController)) : nil;
+            if (vc == latestVC) return NO;   // Following  -> auto-refresh allowed
+            if (vc == homeVC)   return YES;  // For You    -> auto-refresh blocked
+            return NO;                        // pinned list -> auto-refresh allowed
+        }
+    }
+    // Fallback (container not ready / older builds): old text + identifier heuristic.
     UIViewController *segmented = nfb_parentControllerNamed(vc, @"Segmented");
     NSString *selectedText = segmented ? nfb_selectedTextInView(segmented.view, 0) : nil;
     if (nfb_textLooksRecommendedTab(selectedText)) return YES;
@@ -202,7 +219,6 @@ static BOOL nfb_isRecommendedHomeTimeline(UIViewController *vc) {
     if (![timelineClass isEqualToString:@"TFNTwitterHomeTimeline"]) return NO;
     NSString *identifier = nfb_homeTimelineTabIdentifier(vc);
     if (nfb_homeTabIdentifierLooksRecommended(identifier)) return YES;
-    if (nfb_homeTabIdentifierLooksChronological(identifier)) return NO;
     return NO;
 }
 
@@ -567,6 +583,13 @@ static void nfb_appendScrollDiag(NSMutableString *s, UIViewController *vc) {
         selectedText ?: @"(nil)",
         tabIdentifier ?: @"(nil)",
         timeline ? NSStringFromClass([timeline class]) : @"(nil)"];
+    UIViewController *container = nfb_parentControllerNamed(vc, @"HomeTimelineContainer");
+    id homeVC = (container && nfb_resp(container, @selector(homeTimelineViewController)))
+        ? ((id(*)(id, SEL))objc_msgSend)(container, @selector(homeTimelineViewController)) : nil;
+    id latestVC = (container && nfb_resp(container, @selector(latestTimelineViewController)))
+        ? ((id(*)(id, SEL))objc_msgSend)(container, @selector(latestTimelineViewController)) : nil;
+    [s appendFormat:@"identity isForYou=%d isFollowing=%d (homeVC=%p latestVC=%p self=%p)\n",
+        (vc == homeVC) ? 1 : 0, (vc == latestVC) ? 1 : 0, homeVC, latestVC, vc];
 }
 
 static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
