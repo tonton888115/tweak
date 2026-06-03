@@ -634,7 +634,11 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
             if (selectedIndex >= 0 && selectedIndex < (NSInteger)tabViews.count) {
                 id tabView = tabViews[(NSUInteger)selectedIndex];
                 page = [tabView valueForKey:@"scribePage"];
-                if (!BHTIsColumnsPageID(page)) {
+                if (BHTIsColumnsPageID(page)) {
+                    BHTPresentColumnsMode();
+                    BHTUpdateColumnsTabSelection((UIViewController *)self, YES);
+                    return;
+                } else {
                     BHTDismissColumnsMode();
                 }
             }
@@ -4618,7 +4622,12 @@ void BHTPresentColumnsMode(void) {
         return;
     }
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - gBHTLastColumnsOpen < 0.25) return;
+    if (now - gBHTLastColumnsOpen < 0.20) {
+        NFBSetInlineColumnsEnabled(YES);
+        UIWindow *activeWindow = BHT_activeKeyWindow();
+        if (activeWindow.rootViewController) BHTUpdateColumnsTabSelection(activeWindow.rootViewController, YES);
+        return;
+    }
     gBHTLastColumnsOpen = now;
 
     UIWindow *window = BHT_activeKeyWindow();
@@ -4627,16 +4636,35 @@ void BHTPresentColumnsMode(void) {
     UIViewController *hostController = tabBarController ?: window.rootViewController;
     if (!hostController || !hostController.view) return;
 
+    if (gBHTColumnsNavigationController) {
+        [gBHTColumnsNavigationController willMoveToParentViewController:nil];
+        [gBHTColumnsNavigationController.view removeFromSuperview];
+        [gBHTColumnsNavigationController removeFromParentViewController];
+    }
+    [gBHTColumnsOverlayView removeFromSuperview];
+    [gBHTColumnsWindow resignKeyWindow];
+    gBHTColumnsWindow.hidden = YES;
+    gBHTColumnsWindow.rootViewController = nil;
+    gBHTColumnsNavigationController = nil;
+    gBHTColumnsOverlayView = nil;
+    gBHTColumnsWindow = nil;
+    gBHTColumnsPreviousKeyWindow = nil;
+    gBHTColumnsHostController = hostController;
+
     gBHTSelectingHomeForColumns = YES;
     if (tabBarController) BHTSelectTabPage(window.rootViewController, @"home");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        BHTShowColumnsOverlayOnTabBar(hostController);
-        gBHTSelectingHomeForColumns = NO;
+        NFBSetInlineColumnsEnabled(YES);
+        BHTUpdateColumnsTabSelection(hostController, YES);
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        BHTLayoutColumnsOverlay();
+        NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
         gBHTSelectingHomeForColumns = NO;
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.90 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NFBSetInlineColumnsEnabled(YES);
+        BHTUpdateColumnsTabSelection(hostController, YES);
     });
 }
 

@@ -63,6 +63,8 @@ static CGFloat gActiveTimelineTopY = 0.0;
 static NSTimeInterval gLastUserTimelineScrollInteraction = 0.0;
 static NSTimeInterval gRefreshStartedAt = 0.0;
 static BOOL gRefreshStartedAtTop = NO;
+static char kNFBRefreshStartedAtKey;
+static char kNFBRefreshStartedAtTopKey;
 
 #pragma mark - refresh callers (no signature assumptions)
 
@@ -474,7 +476,13 @@ static void nfb_noteActiveTimelineScroll(UIScrollView *sv) {
     }
 }
 static BOOL nfb_visibleTimelineAtTop(UIViewController *vc) {
-    if (gInlineColumnsEnabled && vc) return nfb_isTimelineAtTop(vc);
+    if (vc) {
+        UIScrollView *ownScroll = nfb_mainScrollViewOf(vc);
+        if (ownScroll && ownScroll.window && ownScroll.bounds.size.height > 100.0) {
+            CGFloat topY = -ownScroll.adjustedContentInset.top;
+            return ownScroll.contentOffset.y <= topY + 8.0;
+        }
+    }
     UIScrollView *activeScroll = gActiveTimelineScrollView;
     if (activeScroll && activeScroll.window && activeScroll.bounds.size.height > 100.0) {
         CGFloat topY = -activeScroll.adjustedContentInset.top;
@@ -482,11 +490,25 @@ static BOOL nfb_visibleTimelineAtTop(UIViewController *vc) {
     }
     return nfb_isTimelineAtTop(vc);
 }
-static BOOL nfb_canRevealRefreshStartedAtTop(UIViewController *vc) {
-    if (!gRefreshStartedAtTop) return NO;
+static void nfb_markRefreshStarted(UIViewController *vc, BOOL atTop) {
     NSTimeInterval now = CACurrentMediaTime();
-    if (now - gRefreshStartedAt > 12.0) return NO;
-    if (gLastUserTimelineScrollInteraction > gRefreshStartedAt + 0.05) return NO;
+    gRefreshStartedAt = now;
+    gRefreshStartedAtTop = atTop;
+    if (!vc) return;
+    objc_setAssociatedObject(vc, &kNFBRefreshStartedAtKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, &kNFBRefreshStartedAtTopKey, @(atTop), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static BOOL nfb_canRevealRefreshStartedAtTop(UIViewController *vc) {
+    if (![BHTManager autoStreamTimeline]) return NO;
+    if (!vc) return NO;
+    NSNumber *startedAtTop = objc_getAssociatedObject(vc, &kNFBRefreshStartedAtTopKey);
+    if (!startedAtTop.boolValue) return NO;
+    NSNumber *startedAtValue = objc_getAssociatedObject(vc, &kNFBRefreshStartedAtKey);
+    NSTimeInterval startedAt = startedAtValue ? startedAtValue.doubleValue : 0.0;
+    if (startedAt <= 0.0) return NO;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - startedAt > 12.0) return NO;
+    if (gLastUserTimelineScrollInteraction > startedAt + 0.05) return NO;
     if (!gInlineColumnsEnabled) {
         UIViewController *active = gActiveItemsVC;
         if (active && vc && vc != active) {
@@ -642,13 +664,12 @@ static BOOL nfb_streamTriggerTarget(UIViewController *target) {
     if (!target || nfb_isRecommendedHomeTimeline(target)) return NO;
 
     if (!nfb_visibleTimelineAtTop(target)) {
-        gRefreshStartedAtTop = NO;
+        nfb_markRefreshStarted(target, NO);
         nfb_showNewTweetsPill(target);
         nfb_updateStreamStateIconForVC(target);
         return NO;
     }
-    gRefreshStartedAt = CACurrentMediaTime();
-    gRefreshStartedAtTop = YES;
+    nfb_markRefreshStarted(target, YES);
     nfb_hideNewTweetsPill();
     nfb_scrollToTop(target, NO);
 
@@ -1456,8 +1477,25 @@ static void nfb_ensureColumnsOverlayForPaging(UIViewController *paging) {
 
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
+    if (!pages.count) {
+        static NSTimeInterval lastColumnsPageRetry = 0.0;
+        nfb_removeColumnsOverlay();
+        NSTimeInterval now = CACurrentMediaTime();
+        if (now - lastColumnsPageRetry > 0.75) {
+            lastColumnsPageRetry = now;
+            if ([paging respondsToSelector:@selector(reloadVisibleViewControllers)]) {
+                ((void(*)(id, SEL))objc_msgSend)(paging, @selector(reloadVisibleViewControllers));
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                nfb_layoutActiveHomePaging();
+            });
+        }
+        return;
+    }
     nfb_ensureColumnsOverlayForPaging(paging);
     if (!gColumnsOverlayView || !gColumnsOverlayScrollView) return;
+    nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
 
     UIView *host = nfb_columnsHostViewForPaging(paging);
     if (host) gColumnsOverlayView.frame = host.bounds;
@@ -1466,7 +1504,6 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     CGFloat columnWidth = nfb_columnsColumnWidth(bounds.size.width);
     CGFloat height = bounds.size.height;
 
-    NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
     gColumnsOverlayPages = [pages copy];
     gColumnsOverlayScrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, bounds.size.width + 1.0), height);
     gColumnsAllTopButton.frame = CGRectMake(MAX(12.0, bounds.size.width - 128.0), 10.0, 116.0, 34.0);
@@ -1593,6 +1630,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
 
 static void nfb_applyInlineColumns(UIViewController *paging) {
     if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
     nfb_layoutColumnsOverlayForPaging(paging);
 }
 
@@ -1783,12 +1821,6 @@ BOOL NFBInlineColumnsEnabled(void) {
 void NFBSetInlineColumnsEnabled(BOOL enabled) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ NFBSetInlineColumnsEnabled(enabled); });
-        return;
-    }
-    if (enabled) {
-        gInlineColumnsEnabled = NO;
-        nfb_removeColumnsOverlay();
-        BHTPresentColumnsMode();
         return;
     }
     gInlineColumnsEnabled = enabled;
