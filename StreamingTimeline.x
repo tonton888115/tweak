@@ -945,7 +945,12 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     UIViewController *vc = gPendingNewTweetsVC ?: gActiveItemsVC;
     gPendingNewTweetsVC = nil;
     nfb_hideNewTweetsPill();
-    if (vc) nfb_revealTopAfterRefresh(vc);
+    if (!vc) return;
+    // Explicit user tap = jump to the top NOW. The old path (nfb_revealTopAfterRefresh) bailed to
+    // re-showing the pill when not already at top, so tapping it did nothing.
+    UIViewController *target = nfb_selectedTimelineVC(vc) ?: vc;
+    nfb_scrollToTop(target, YES);
+    nfb_updateStreamStateIconForVC(vc);
 }
 - (void)revealAllColumnsTap {
     nfb_revealAllColumnTops();
@@ -1141,6 +1146,9 @@ static void nfb_visibilityForScroll(UIScrollView *sv) {
     CGFloat target = gStreamButton.alpha;
     if (atTop || dy < -2.0) target = 1.0;          // at top or scrolling up
     else if (dy > 2.0) target = 0.0;               // scrolling down
+    // In columns mode the button is the single global control for all columns; never fade/disable
+    // it on a per-column scroll, otherwise it becomes un-long-pressable (settings menu unreachable).
+    if (gInlineColumnsEnabled) target = 1.0;
     if (fabs(gStreamButton.alpha - target) < 0.01) return;
     [UIView animateWithDuration:0.2 animations:^{
         gStreamButton.alpha = target;
@@ -1331,6 +1339,7 @@ static UIView *gColumnsOverlayView = nil;
 static UIScrollView *gColumnsOverlayScrollView = nil;
 static UIButton *gColumnsAllTopButton = nil;
 static NSArray<UIViewController *> *gColumnsOverlayPages = nil;
+static char kNFBColumnLoadKickedKey;
 
 static BOOL nfb_isHomePagingController(UIViewController *vc) {
     return nfb_parentControllerNamed(vc, @"HomeTimelineContainer") != nil;
@@ -1445,9 +1454,41 @@ static void nfb_restoreColumnsChromeInView(UIView *view, int depth) {
     }
 }
 
+// nfb_textOfView reads only a view's OWN text; the home segment bar is a container whose tab
+// labels (おすすめ/フォロー中/list names) are CHILD UILabels, so it never matched and never hid.
+// Collect descendant text so the whole bar can be recognised by its labels.
+static void nfb_appendDescendantText(UIView *view, NSMutableString *out, int depth) {
+    if (!view || view.hidden || view.alpha < 0.01 || depth > 6) return;
+    NSString *t = nfb_textOfView(view);
+    if (t.length) { [out appendString:t]; [out appendString:@"\n"]; }
+    for (UIView *sub in view.subviews) nfb_appendDescendantText(sub, out, depth + 1);
+}
+
+// A top, full-width, short horizontal strip whose descendants include 2+ home tab labels = the
+// おすすめ/フォロー中/list segment bar, whatever its private class is. The height cap stops us from
+// matching a tall ancestor that merely contains the bar (so we never hide the timeline body).
+static BOOL nfb_viewLooksLikeHomeSegmentBar(UIView *view, UIView *root) {
+    if (!view || !root || view == root) return NO;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    if (CGRectGetMinY(frame) > 240.0) return NO;
+    if (frame.size.height < 20.0 || frame.size.height > 140.0) return NO;
+    if (frame.size.width < root.bounds.size.width * 0.5) return NO;
+    NSMutableString *txt = [NSMutableString string];
+    nfb_appendDescendantText(view, txt, 0);
+    NSString *lower = txt.lowercaseString;
+    NSInteger hits = 0;
+    if ([txt containsString:@"おすすめ"]) hits++;
+    if ([txt containsString:@"フォロー中"]) hits++;
+    if ([lower containsString:@"for you"]) hits++;
+    if ([lower containsString:@"following"]) hits++;
+    return hits >= 2;
+}
+
 static BOOL nfb_globalTopColumnsChromeCandidate(UIView *view, UIView *root) {
     if (!view || !root || view == root || view.hidden || view.alpha < 0.01 || nfb_columnsProtectedView(view)) return NO;
     if (nfb_columnsPagingSurface(view)) return NO;
+    // Match the bar by its labels first (covers the nav-bar-hosted bar with a generic class).
+    if (!nfb_viewContainsColumnsPagingSurface(view, 0) && nfb_viewLooksLikeHomeSegmentBar(view, root)) return YES;
     CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
     if (CGRectGetMinY(frame) > 240.0 || frame.size.width < 24.0 || frame.size.height < 4.0 || frame.size.height > 220.0) return NO;
     NSString *cls = NSStringFromClass(view.class);
@@ -1608,6 +1649,17 @@ static void nfb_ensureColumnsOverlayForPaging(UIViewController *paging) {
     [host bringSubviewToFront:gColumnsAllTopButton];
 }
 
+// A column that the pager placed but never made "current" can sit empty (no fetch) — seen on iPad
+// where pinned-list columns reported contentSize height 0. Kick a single load so it populates.
+static void nfb_kickEmptyColumnLoad(UIViewController *page) {
+    if (!page || ![page isViewLoaded]) return;
+    UIScrollView *sv = nfb_mainScrollViewOf(page);
+    if (sv && sv.contentSize.height > 60.0) return;            // already has content
+    if (objc_getAssociatedObject(page, &kNFBColumnLoadKickedKey)) return;
+    objc_setAssociatedObject(page, &kNFBColumnLoadKickedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    nfb_streamTriggerTarget(page);
+}
+
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
     NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
@@ -1686,6 +1738,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         pageView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
         [pageView setNeedsLayout];
         [pageView layoutIfNeeded];
+        nfb_kickEmptyColumnLoad(page);
         idx++;
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -2147,7 +2200,9 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
     %orig;
     if (!nfb_parentControllerNamed(self, @"HomeTimelineContainer")) return;
-    nfb_visibilityForScroll(scrollView);
+    // Icon refresh only — do NOT run the full visibility logic here (it fades/disables the button).
+    nfb_noteActiveTimelineScroll(scrollView);
+    nfb_updateStreamStateIconForVC(gActiveItemsVC);
 }
 %end
 

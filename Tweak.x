@@ -4556,7 +4556,8 @@ NSString *BHTColumnsModeDiagnostic(void) {
     CGRect contentFrame = host && host.view ? BHTColumnsContentFrameForHost(host) : CGRectZero;
     NSArray<UIView *> *tabs = host ? BHTAllTabViewsForController(host) : @[];
     return [NSString stringWithFormat:
-        @"separateColumns overlay=%d overlayWindow=%d dedicatedWindow=%d host=%@ nav=%@ frame=(%.1f,%.1f,%.1f,%.1f) contentFrame=(%.1f,%.1f,%.1f,%.1f) tabs=%lu\n",
+        @"separateColumns intent=%d overlay=%d overlayWindow=%d dedicatedWindow=%d host=%@ nav=%@ frame=(%.1f,%.1f,%.1f,%.1f) contentFrame=(%.1f,%.1f,%.1f,%.1f) tabs=%lu\n",
+        gBHTColumnsIntent ? 1 : 0,
         gBHTColumnsOverlayView ? 1 : 0,
         (gBHTColumnsOverlayView && gBHTColumnsOverlayView.window) || (gBHTColumnsWindow && !gBHTColumnsWindow.hidden) ? 1 : 0,
         (gBHTColumnsWindow && !gBHTColumnsWindow.hidden) ? 1 : 0,
