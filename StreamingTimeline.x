@@ -36,6 +36,7 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active);
 static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void);
 static UIViewController *nfb_firstColumnTimelineAwayFromTop(void);
 static UIViewController *nfb_firstColumnTimelineAwayFromTopExcept(UIViewController *allowedRevealing);
+static void nfb_layoutActiveHomePaging(void);
 void NFBSetInlineColumnsEnabled(BOOL enabled);
 
 // Minimal bases so `self.view` resolves; everything else goes through objc_msgSend.
@@ -845,6 +846,7 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
 + (instancetype)shared;
 - (void)tap;
 - (void)newTweetsTap;
+- (void)revealAllColumnsTap;
 - (void)longPress:(UILongPressGestureRecognizer *)g;
 @end
 
@@ -883,6 +885,9 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     gPendingNewTweetsVC = nil;
     nfb_hideNewTweetsPill();
     if (vc) nfb_revealTopAfterRefresh(vc);
+}
+- (void)revealAllColumnsTap {
+    nfb_revealAllColumnTops();
 }
 - (void)longPress:(UILongPressGestureRecognizer *)g { if (g.state == UIGestureRecognizerStateBegan) [self showMain]; }
 
@@ -968,7 +973,7 @@ static BOOL nfb_streamCanRunForTarget(UIViewController *target) {
     if (!nfb_homeTabSelectedOrUnknown()) return NO;
     if (gInlineColumnsEnabled) {
         for (UIViewController *page in nfb_currentColumnTimelinePages()) {
-            if (![page isViewLoaded] || page.view.window == nil || page.view.hidden) continue;
+            if (![page isViewLoaded] || page.view.window == nil) continue;
             UIScrollView *sv = nfb_mainScrollViewOf(page);
             if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) continue;
             if (nfb_isTimelineAtTop(page)) return YES;
@@ -1251,6 +1256,15 @@ static char kNFBInlineColumnsChromeSavedKey;
 static char kNFBInlineColumnsChromeHiddenKey;
 static char kNFBInlineColumnsChromeAlphaKey;
 static char kNFBInlineColumnsChromeInteractionKey;
+static char kNFBColumnsOriginalSuperviewKey;
+static char kNFBColumnsOriginalFrameKey;
+static char kNFBColumnsOriginalAutoresizingKey;
+static char kNFBColumnsOriginalHiddenKey;
+static char kNFBColumnsOriginalAlphaKey;
+static UIView *gColumnsOverlayView = nil;
+static UIScrollView *gColumnsOverlayScrollView = nil;
+static UIButton *gColumnsAllTopButton = nil;
+static NSArray<UIViewController *> *gColumnsOverlayPages = nil;
 
 static BOOL nfb_isHomePagingController(UIViewController *vc) {
     return nfb_parentControllerNamed(vc, @"HomeTimelineContainer") != nil;
@@ -1342,6 +1356,131 @@ static void nfb_setColumnsSegmentedHiddenForPaging(UIViewController *paging, BOO
     }
 }
 
+static UIView *nfb_columnsHostViewForPaging(UIViewController *paging) {
+    UIViewController *container = nfb_parentControllerNamed(paging, @"HomeTimelineContainer");
+    if (container && [container isViewLoaded]) return container.view;
+    return [paging isViewLoaded] ? paging.view : nil;
+}
+
+static CGFloat nfb_columnsColumnWidth(CGFloat viewportWidth) {
+    CGFloat columnWidth = viewportWidth >= 700.0 ? 340.0 : MIN(viewportWidth, 390.0);
+    return MAX(320.0, MIN(390.0, columnWidth));
+}
+
+static void nfb_rememberColumnOriginalViewState(UIView *view) {
+    if (!view || objc_getAssociatedObject(view, &kNFBColumnsOriginalSuperviewKey)) return;
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalSuperviewKey, view.superview, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalFrameKey, [NSValue valueWithCGRect:view.frame], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalAutoresizingKey, @(view.autoresizingMask), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalHiddenKey, @(view.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalAlphaKey, @(view.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void nfb_restoreColumnOriginalViewState(UIView *view) {
+    if (!view || !objc_getAssociatedObject(view, &kNFBColumnsOriginalSuperviewKey)) return;
+    UIView *superview = objc_getAssociatedObject(view, &kNFBColumnsOriginalSuperviewKey);
+    NSValue *frame = objc_getAssociatedObject(view, &kNFBColumnsOriginalFrameKey);
+    NSNumber *autoresizing = objc_getAssociatedObject(view, &kNFBColumnsOriginalAutoresizingKey);
+    NSNumber *hidden = objc_getAssociatedObject(view, &kNFBColumnsOriginalHiddenKey);
+    NSNumber *alpha = objc_getAssociatedObject(view, &kNFBColumnsOriginalAlphaKey);
+    if (superview && view.superview != superview) [superview addSubview:view];
+    if (frame) view.frame = frame.CGRectValue;
+    if (autoresizing) view.autoresizingMask = autoresizing.unsignedIntegerValue;
+    view.hidden = hidden ? hidden.boolValue : NO;
+    view.alpha = alpha ? alpha.doubleValue : 1.0;
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalSuperviewKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalFrameKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalAutoresizingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void nfb_removeColumnsOverlay(void) {
+    NSArray<UIViewController *> *pages = gColumnsOverlayPages ?: @[];
+    for (UIViewController *page in pages) {
+        if ([page isViewLoaded]) nfb_restoreColumnOriginalViewState(page.view);
+    }
+    for (UIViewController *page in nfb_currentColumnTimelinePages()) {
+        if ([page isViewLoaded]) nfb_restoreColumnOriginalViewState(page.view);
+    }
+    [gColumnsOverlayView removeFromSuperview];
+    gColumnsOverlayView = nil;
+    gColumnsOverlayScrollView = nil;
+    gColumnsAllTopButton = nil;
+    gColumnsOverlayPages = nil;
+    gPendingNewTweetsVC = nil;
+    nfb_hideNewTweetsPill();
+}
+
+static void nfb_ensureColumnsOverlayForPaging(UIViewController *paging) {
+    UIView *host = nfb_columnsHostViewForPaging(paging);
+    if (!host) return;
+    if (!gColumnsOverlayView) {
+        gColumnsOverlayView = [[UIView alloc] initWithFrame:host.bounds];
+        gColumnsOverlayView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        gColumnsOverlayView.backgroundColor = UIColor.systemBackgroundColor;
+
+        gColumnsOverlayScrollView = [[UIScrollView alloc] initWithFrame:gColumnsOverlayView.bounds];
+        gColumnsOverlayScrollView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        gColumnsOverlayScrollView.alwaysBounceHorizontal = YES;
+        gColumnsOverlayScrollView.showsHorizontalScrollIndicator = YES;
+        gColumnsOverlayScrollView.directionalLockEnabled = YES;
+        [gColumnsOverlayView addSubview:gColumnsOverlayScrollView];
+
+        gColumnsAllTopButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        gColumnsAllTopButton.frame = CGRectMake(0.0, 0.0, 116.0, 34.0);
+        gColumnsAllTopButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+        gColumnsAllTopButton.backgroundColor = UIColor.systemBlueColor;
+        gColumnsAllTopButton.layer.cornerRadius = 17.0;
+        gColumnsAllTopButton.layer.masksToBounds = YES;
+        gColumnsAllTopButton.titleLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightSemibold];
+        [gColumnsAllTopButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        [gColumnsAllTopButton setTitle:@"全カラム↑" forState:UIControlStateNormal];
+        [gColumnsAllTopButton addTarget:[NFBStreamHandler shared] action:@selector(revealAllColumnsTap) forControlEvents:UIControlEventTouchUpInside];
+        [gColumnsOverlayView addSubview:gColumnsAllTopButton];
+    }
+    if (gColumnsOverlayView.superview != host) {
+        [gColumnsOverlayView removeFromSuperview];
+        gColumnsOverlayView.frame = host.bounds;
+        [host addSubview:gColumnsOverlayView];
+    }
+    [host bringSubviewToFront:gColumnsOverlayView];
+}
+
+static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
+    if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    nfb_ensureColumnsOverlayForPaging(paging);
+    if (!gColumnsOverlayView || !gColumnsOverlayScrollView) return;
+
+    UIView *host = nfb_columnsHostViewForPaging(paging);
+    if (host) gColumnsOverlayView.frame = host.bounds;
+    CGRect bounds = gColumnsOverlayView.bounds;
+    gColumnsOverlayScrollView.frame = bounds;
+    CGFloat columnWidth = nfb_columnsColumnWidth(bounds.size.width);
+    CGFloat height = bounds.size.height;
+
+    NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
+    gColumnsOverlayPages = [pages copy];
+    gColumnsOverlayScrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, bounds.size.width + 1.0), height);
+    gColumnsAllTopButton.frame = CGRectMake(MAX(12.0, bounds.size.width - 128.0), 10.0, 116.0, 34.0);
+    [gColumnsOverlayView bringSubviewToFront:gColumnsAllTopButton];
+
+    NSUInteger idx = 0;
+    for (UIViewController *page in pages) {
+        [page loadViewIfNeeded];
+        UIView *pageView = page.view;
+        nfb_rememberColumnOriginalViewState(pageView);
+        if (pageView.superview != gColumnsOverlayScrollView) [gColumnsOverlayScrollView addSubview:pageView];
+        pageView.hidden = NO;
+        pageView.alpha = 1.0;
+        pageView.frame = CGRectMake(columnWidth * idx, 0.0, columnWidth, height);
+        pageView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
+        [pageView setNeedsLayout];
+        [pageView layoutIfNeeded];
+        idx++;
+    }
+}
+
 static CGFloat nfb_horizontalScrollScore(UIScrollView *sv) {
     if (!sv || sv.hidden || sv.alpha < 0.01 || sv.bounds.size.width < 100.0 || sv.bounds.size.height < 100.0) return 0;
     CGFloat score = sv.bounds.size.width * sv.bounds.size.height;
@@ -1408,6 +1547,7 @@ static void nfb_rememberInlineColumnsOriginals(UIScrollView *scrollView) {
 
 static void nfb_restoreInlineColumns(UIViewController *paging) {
     if (!nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    nfb_removeColumnsOverlay();
     nfb_setColumnsSegmentedHiddenForPaging(paging, NO);
     UIScrollView *scrollView = nfb_horizontalPagingScrollViewOf(paging);
     if (!scrollView || !objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey)) return;
@@ -1446,56 +1586,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
 
 static void nfb_applyInlineColumns(UIViewController *paging) {
     if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
-    nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
-    UIScrollView *scrollView = nfb_horizontalPagingScrollViewOf(paging);
-    if (!scrollView || scrollView.bounds.size.width < 100.0 || scrollView.bounds.size.height < 100.0) return;
-
-    NSMutableArray<UIViewController *> *pages = [NSMutableArray array];
-    for (UIViewController *child in paging.childViewControllers) {
-        NSString *cls = NSStringFromClass(child.class);
-        if ([cls containsString:@"HomeTimelineItemsViewController"] || [cls containsString:@"PinnedTimelineViewController"]) {
-            if (nfb_isRecommendedHomeTimeline(child)) {
-                if ([child isViewLoaded]) child.view.hidden = YES;
-                continue;
-            }
-            [pages addObject:child];
-        }
-    }
-    if (pages.count < 1) return;
-
-    BOOL firstApply = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) == nil;
-    nfb_rememberInlineColumnsOriginals(scrollView);
-
-    CGFloat viewportWidth = scrollView.bounds.size.width;
-    CGFloat columnWidth = viewportWidth >= 1000.0 ? 360.0 :
-                          (viewportWidth >= 700.0 ? 340.0 : MIN(viewportWidth, 390.0));
-    columnWidth = MAX(320.0, MIN(390.0, columnWidth));
-    CGFloat height = scrollView.bounds.size.height;
-
-    scrollView.pagingEnabled = NO;
-    scrollView.alwaysBounceHorizontal = YES;
-    scrollView.directionalLockEnabled = YES;
-    scrollView.showsHorizontalScrollIndicator = YES;
-    scrollView.clipsToBounds = YES;
-    scrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, viewportWidth + 1.0), height);
-
-    NSUInteger idx = 0;
-    for (UIViewController *page in pages) {
-        [page loadViewIfNeeded];
-        UIView *pageView = page.view;
-        if (!pageView.superview) [scrollView addSubview:pageView];
-        if (pageView.superview != scrollView) { idx++; continue; }
-        pageView.hidden = NO;
-        pageView.alpha = 1.0;
-        pageView.frame = CGRectMake(columnWidth * idx, 0.0, columnWidth, height);
-        pageView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
-        [pageView setNeedsLayout];
-        [pageView layoutIfNeeded];
-        idx++;
-    }
-    if (firstApply) {
-        [scrollView setContentOffset:CGPointMake(0.0, scrollView.contentOffset.y) animated:NO];
-    }
+    nfb_layoutColumnsOverlayForPaging(paging);
 }
 
 static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void) {
@@ -1513,7 +1604,7 @@ static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void) {
 
 static UIViewController *nfb_firstColumnTimelineAwayFromTopExcept(UIViewController *allowedRevealing) {
     for (UIViewController *page in nfb_currentColumnTimelinePages()) {
-        if (![page isViewLoaded] || page.view.window == nil || page.view.hidden) continue;
+        if (![page isViewLoaded] || page.view.window == nil) continue;
         if (allowedRevealing && page == allowedRevealing && nfb_canRevealRefreshStartedAtTop(page)) continue;
         UIScrollView *sv = nfb_mainScrollViewOf(page);
         if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) return page;
@@ -1527,8 +1618,11 @@ static UIViewController *nfb_firstColumnTimelineAwayFromTop(void) {
 }
 
 static void nfb_revealAllColumnTops(void) {
+    nfb_layoutActiveHomePaging();
     for (UIViewController *page in nfb_currentColumnTimelinePages()) {
-        if (![page isViewLoaded] || page.view.window == nil || page.view.hidden) continue;
+        if (![page isViewLoaded] || page.view.window == nil) continue;
+        page.view.hidden = NO;
+        page.view.alpha = 1.0;
         nfb_scrollToTop(page, NO);
     }
     gPendingNewTweetsVC = nil;
@@ -1537,13 +1631,16 @@ static void nfb_revealAllColumnTops(void) {
 }
 
 static BOOL nfb_streamTriggerColumns(void) {
+    nfb_layoutActiveHomePaging();
     NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
     if (!pages.count) return NO;
 
     BOOL did = NO;
     UIViewController *away = nil;
     for (UIViewController *page in pages) {
-        if (![page isViewLoaded] || page.view.window == nil || page.view.hidden) continue;
+        if (![page isViewLoaded] || page.view.window == nil) continue;
+        page.view.hidden = NO;
+        page.view.alpha = 1.0;
         UIScrollView *sv = nfb_mainScrollViewOf(page);
         if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) {
             if (!away) away = page;
@@ -1597,9 +1694,21 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
         paging ? NSStringFromClass(paging.class) : @"(nil)",
         applied ? 1 : 0,
         (unsigned long)pages.count];
+    [s appendFormat:@"columnsOverlay=%d overlayWindow=%d frame=(%.1f,%.1f,%.1f,%.1f) scrollContent=(%.1f,%.1f) scrollBounds=(%.1f,%.1f) button=%d\n",
+        gColumnsOverlayView ? 1 : 0,
+        (gColumnsOverlayView && gColumnsOverlayView.window) ? 1 : 0,
+        gColumnsOverlayView ? gColumnsOverlayView.frame.origin.x : 0.0,
+        gColumnsOverlayView ? gColumnsOverlayView.frame.origin.y : 0.0,
+        gColumnsOverlayView ? gColumnsOverlayView.frame.size.width : 0.0,
+        gColumnsOverlayView ? gColumnsOverlayView.frame.size.height : 0.0,
+        gColumnsOverlayScrollView ? gColumnsOverlayScrollView.contentSize.width : 0.0,
+        gColumnsOverlayScrollView ? gColumnsOverlayScrollView.contentSize.height : 0.0,
+        gColumnsOverlayScrollView ? gColumnsOverlayScrollView.bounds.size.width : 0.0,
+        gColumnsOverlayScrollView ? gColumnsOverlayScrollView.bounds.size.height : 0.0,
+        gColumnsAllTopButton ? 1 : 0];
     if (h) {
         CGFloat inferredWidth = pages.count ? (h.contentSize.width / MAX((CGFloat)pages.count, 1.0)) : 0.0;
-        [s appendFormat:@"columnsHScroll class=%@ offset=(%.1f,%.1f) content=(%.1f,%.1f) bounds=(%.1f,%.1f) paging=%d bounceH=%d inferredColumnWidth=%.1f\n",
+        [s appendFormat:@"nativeHScroll class=%@ offset=(%.1f,%.1f) content=(%.1f,%.1f) bounds=(%.1f,%.1f) paging=%d bounceH=%d inferredColumnWidth=%.1f\n",
             NSStringFromClass(h.class), h.contentOffset.x, h.contentOffset.y, h.contentSize.width, h.contentSize.height,
             h.bounds.size.width, h.bounds.size.height, h.pagingEnabled ? 1 : 0, h.alwaysBounceHorizontal ? 1 : 0, inferredWidth];
     }
@@ -1640,7 +1749,10 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
 
 static void nfb_layoutActiveHomePaging(void) {
     UIViewController *paging = nfb_findVisibleHomePagingController();
-    if (!paging || ![paging isViewLoaded]) return;
+    if (!paging || ![paging isViewLoaded]) {
+        if (!gInlineColumnsEnabled) nfb_removeColumnsOverlay();
+        return;
+    }
     [paging.view setNeedsLayout];
     [paging.view layoutIfNeeded];
     if (gInlineColumnsEnabled) nfb_applyInlineColumns(paging);
