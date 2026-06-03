@@ -34,6 +34,12 @@ static BOOL nfb_streamTriggerColumns(void);
 static void nfb_revealAllColumnTops(void);
 static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active);
 static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void);
+static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc);
+static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging);
+static void nfb_requestColumnsPagingPreload(UIViewController *paging);
+static id nfb_pagingDataSource(UIViewController *paging);
+static NSIndexPath *nfb_pagingSelectedIndexPath(UIViewController *paging);
+static UIViewController *nfb_pagingViewControllerAtIndexPath(UIViewController *paging, NSIndexPath *indexPath);
 static UIViewController *nfb_firstColumnTimelineAwayFromTop(void);
 static UIViewController *nfb_firstColumnTimelineAwayFromTopExcept(UIViewController *allowedRevealing);
 static void nfb_layoutActiveHomePaging(void);
@@ -49,6 +55,8 @@ extern NSString *BHTColumnsModeDiagnostic(void);
 @interface T1HomeTimelineItemsViewController : UIViewController
 @end
 @interface TFNPagingViewController : UIViewController
+@end
+@interface TFNScrollingSegmentedViewController : UIViewController
 @end
 @class NFBStreamHandler;
 
@@ -220,6 +228,13 @@ static NSString *nfb_homeTimelineTabIdentifier(UIViewController *vc) {
         if (value.length) return value;
     }
     return nil;
+}
+
+static BOOL nfb_isTimelinePageController(UIViewController *vc) {
+    if (!vc) return NO;
+    NSString *cls = NSStringFromClass(vc.class);
+    return [cls containsString:@"HomeTimelineItemsViewController"] ||
+           [cls containsString:@"PinnedTimelineViewController"];
 }
 
 static BOOL nfb_isRecommendedHomeTimeline(UIViewController *vc) {
@@ -639,11 +654,32 @@ static void nfb_afterRefresh(UIViewController *vc) {
 // Following items VC, or a pinned-list PinnedTimelineViewController. The old code only
 // knew about the two home items VCs, so pinned lists (ニコニコ/投資) never refreshed.
 static UIViewController *nfb_selectedTimelineVC(UIViewController *vc) {
-    // The PAGING controller's selected page is the on-screen timeline, including pinned
-    // lists. (The home container's selectedTimelineViewController only tracks For You /
-    // Following, so it was wrong for ニコニコ/投資.)
     UIViewController *paging = nfb_parentControllerNamed(vc, @"Paging");
     if (paging) {
+        UIScrollView *h = nfb_horizontalPagingScrollViewOf(paging);
+        UIView *viewport = h ?: ([paging isViewLoaded] ? paging.view : nil);
+        CGRect viewportBounds = viewport ? viewport.bounds : CGRectZero;
+        CGFloat bestArea = 0.0;
+        UIViewController *bestVisible = nil;
+        for (UIViewController *child in paging.childViewControllers) {
+            if (!nfb_isTimelinePageController(child) || ![child isViewLoaded] || !child.view.window ||
+                child.view.hidden || child.view.alpha < 0.01 || !child.view.superview || !viewport) continue;
+            CGRect frame = [child.view.superview convertRect:child.view.frame toView:viewport];
+            CGRect visible = CGRectIntersection(frame, viewportBounds);
+            CGFloat area = CGRectIsNull(visible) ? 0.0 : visible.size.width * visible.size.height;
+            if (area > bestArea) {
+                bestArea = area;
+                bestVisible = child;
+            }
+        }
+        if (bestVisible && bestArea > 4000.0) return bestVisible;
+        NSIndexPath *selectedIndexPath = nfb_pagingSelectedIndexPath(paging);
+        UIViewController *selectedByIndexPath = nfb_pagingViewControllerAtIndexPath(paging, selectedIndexPath);
+        if (selectedByIndexPath) return selectedByIndexPath;
+        if (nfb_isTimelinePageController(vc) && [vc isViewLoaded] && vc.view.window &&
+            !vc.view.hidden && vc.view.alpha > 0.01 && !nfb_isRecommendedHomeTimeline(vc)) {
+            return vc;
+        }
         for (NSString *name in @[@"selectedViewController", @"visibleViewController", @"primaryViewController"]) {
             SEL sel = NSSelectorFromString(name);
             if ([paging respondsToSelector:sel]) {
@@ -1350,9 +1386,13 @@ static BOOL nfb_columnsChromeCandidate(UIView *view, UIView *root) {
 
 static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView *root, int depth) {
     if (!view || !root || depth > 8) return NO;
-    if (view == pagingView) return NO;
+    if (gColumnsOverlayView && (view == gColumnsOverlayView || nfb_viewContainsDescendant(gColumnsOverlayView, view))) return NO;
     BOOL containsPaging = nfb_viewContainsDescendant(view, pagingView);
-    if (!containsPaging && nfb_columnsChromeCandidate(view, root)) {
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    BOOL fullScreenChromeLayer = view != root && view != pagingView && !containsPaging &&
+        CGRectGetMinY(frame) <= 280.0 && frame.size.width >= root.bounds.size.width * 0.6 &&
+        frame.size.height > 260.0 && frame.size.height <= root.bounds.size.height + 80.0 && depth <= 4;
+    if (view != pagingView && !containsPaging && (nfb_columnsChromeCandidate(view, root) || fullScreenChromeLayer)) {
         nfb_setColumnsChromeViewHidden(view, YES);
         return YES;
     }
@@ -1376,7 +1416,7 @@ static void nfb_setColumnsSegmentedHiddenForPaging(UIViewController *paging, BOO
     UIViewController *container = nfb_parentControllerNamed(paging, @"HomeTimelineContainer");
     if (![paging isViewLoaded]) return;
     if (hidden) {
-        if (segmented && [segmented isViewLoaded]) nfb_hideColumnsChromeInView(segmented.view, paging.view, segmented.view, 0);
+        if (segmented && [segmented isViewLoaded]) nfb_setColumnsChromeViewHidden(segmented.view, YES);
         if (container && [container isViewLoaded]) nfb_hideColumnsChromeInView(container.view, paging.view, container.view, 0);
     } else {
         if (segmented && [segmented isViewLoaded]) nfb_restoreColumnsChromeInView(segmented.view, 0);
@@ -1478,28 +1518,39 @@ static void nfb_ensureColumnsOverlayForPaging(UIViewController *paging) {
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
     NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
+    NSInteger estimatedPages = nfb_estimatedHomePagingPageCount(paging);
+    NSInteger expectedColumns = MAX(1, estimatedPages - 1);
     if (!pages.count) {
         static NSTimeInterval lastColumnsPageRetry = 0.0;
         nfb_removeColumnsOverlay();
         NSTimeInterval now = CACurrentMediaTime();
         if (now - lastColumnsPageRetry > 0.75) {
             lastColumnsPageRetry = now;
-            if ([paging respondsToSelector:@selector(reloadVisibleViewControllers)]) {
-                ((void(*)(id, SEL))objc_msgSend)(paging, @selector(reloadVisibleViewControllers));
-            }
+            nfb_requestColumnsPagingPreload(paging);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nfb_layoutActiveHomePaging();
             });
         }
         return;
     }
+    if ((NSInteger)pages.count < expectedColumns) {
+        static NSTimeInterval lastColumnsPreload = 0.0;
+        NSTimeInterval now = CACurrentMediaTime();
+        if (now - lastColumnsPreload > 0.75) {
+            lastColumnsPreload = now;
+            nfb_requestColumnsPagingPreload(paging);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                nfb_layoutActiveHomePaging();
+            });
+        }
+    }
     nfb_ensureColumnsOverlayForPaging(paging);
     if (!gColumnsOverlayView || !gColumnsOverlayScrollView) return;
-    nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
 
     UIView *host = nfb_columnsHostViewForPaging(paging);
     if (host) gColumnsOverlayView.frame = host.bounds;
     CGRect bounds = gColumnsOverlayView.bounds;
+    if (bounds.size.width < 120.0 || bounds.size.height < 240.0) return;
     gColumnsOverlayScrollView.frame = bounds;
     CGFloat columnWidth = nfb_columnsColumnWidth(bounds.size.width);
     CGFloat height = bounds.size.height;
@@ -1523,6 +1574,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         [pageView layoutIfNeeded];
         idx++;
     }
+    nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
 }
 
 static CGFloat nfb_horizontalScrollScore(UIScrollView *sv) {
@@ -1552,6 +1604,88 @@ static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc) {
     if (![vc isViewLoaded]) return nil;
     CGFloat bestScore = 0;
     return nfb_findHorizontalScrollViewInView(vc.view, &bestScore);
+}
+
+static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging) {
+    id dataSource = nfb_pagingDataSource(paging);
+    SEL sectionsSel = @selector(numberOfSectionsInPagingViewController:);
+    SEL pagesSel = @selector(pagingViewController:numberOfPagesInSection:);
+    if (dataSource && [dataSource respondsToSelector:sectionsSel] && [dataSource respondsToSelector:pagesSel]) {
+        NSInteger sections = ((NSInteger(*)(id, SEL, id))objc_msgSend)(dataSource, sectionsSel, paging);
+        NSInteger total = 0;
+        for (NSInteger section = 0; section < sections; section++) {
+            total += ((NSInteger(*)(id, SEL, id, NSInteger))objc_msgSend)(dataSource, pagesSel, paging, section);
+        }
+        if (total > 0) return total;
+    }
+    UIScrollView *h = nfb_horizontalPagingScrollViewOf(paging);
+    if (h && h.bounds.size.width > 100.0 && h.contentSize.width > h.bounds.size.width) {
+        return MAX(1, (NSInteger)llround(h.contentSize.width / h.bounds.size.width));
+    }
+    return MAX(1, (NSInteger)paging.childViewControllers.count);
+}
+
+static void nfb_requestColumnsPagingPreload(UIViewController *paging) {
+    if (!paging) return;
+    UIViewController *segmented = nfb_parentControllerNamed(paging, @"Segmented");
+    UIViewController *container = nfb_parentControllerNamed(paging, @"HomeTimelineContainer");
+    if (container && [container respondsToSelector:@selector(loadInitialPinnedTimelines)]) {
+        ((void(*)(id, SEL))objc_msgSend)(container, @selector(loadInitialPinnedTimelines));
+    }
+    if (segmented && [segmented respondsToSelector:@selector(setPreloadContent:)]) {
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(segmented, @selector(setPreloadContent:), YES);
+    }
+    if (segmented && [segmented respondsToSelector:@selector(reloadVisibleTabs)]) {
+        ((void(*)(id, SEL))objc_msgSend)(segmented, @selector(reloadVisibleTabs));
+    }
+    for (NSString *name in @[@"reloadInvisibleViewControllers", @"reloadVisibleViewControllers", @"reloadViewControllers"]) {
+        SEL sel = NSSelectorFromString(name);
+        if ([paging respondsToSelector:sel]) {
+            ((void(*)(id, SEL))objc_msgSend)(paging, sel);
+        }
+    }
+}
+
+static id nfb_pagingDataSource(UIViewController *paging) {
+    if (!paging) return nil;
+    SEL sel = @selector(dataSource);
+    if ([paging respondsToSelector:sel]) return ((id(*)(id, SEL))objc_msgSend)(paging, sel);
+    @try {
+        return [paging valueForKey:@"dataSource"];
+    } @catch (NSException *e) {
+        return nil;
+    }
+}
+
+static NSIndexPath *nfb_pagingSelectedIndexPath(UIViewController *paging) {
+    if (!paging) return nil;
+    SEL sel = @selector(selectedIndexPath);
+    if ([paging respondsToSelector:sel]) {
+        id value = ((id(*)(id, SEL))objc_msgSend)(paging, sel);
+        if ([value isKindOfClass:NSIndexPath.class]) return (NSIndexPath *)value;
+    }
+    @try {
+        id value = [paging valueForKey:@"selectedIndexPath"];
+        if ([value isKindOfClass:NSIndexPath.class]) return (NSIndexPath *)value;
+    } @catch (NSException *e) {
+    }
+    return nil;
+}
+
+static UIViewController *nfb_pagingViewControllerAtIndexPath(UIViewController *paging, NSIndexPath *indexPath) {
+    if (!paging || !indexPath) return nil;
+    SEL ownSel = @selector(viewControllerAtIndexPath:);
+    if ([paging respondsToSelector:ownSel]) {
+        id value = ((id(*)(id, SEL, id))objc_msgSend)(paging, ownSel, indexPath);
+        if ([value isKindOfClass:UIViewController.class]) return (UIViewController *)value;
+    }
+    id dataSource = nfb_pagingDataSource(paging);
+    SEL dsSel = @selector(pagingViewController:viewControllerAtIndexPath:);
+    if (dataSource && [dataSource respondsToSelector:dsSel]) {
+        id value = ((id(*)(id, SEL, id, id))objc_msgSend)(dataSource, dsSel, paging, indexPath);
+        if ([value isKindOfClass:UIViewController.class]) return (UIViewController *)value;
+    }
+    return nil;
 }
 
 static UIViewController *nfb_findHomePagingControllerInTree(UIViewController *root, int depth) {
@@ -1630,7 +1764,6 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
 
 static void nfb_applyInlineColumns(UIViewController *paging) {
     if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
-    nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
     nfb_layoutColumnsOverlayForPaging(paging);
 }
 
@@ -1638,11 +1771,24 @@ static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void) {
     UIViewController *paging = nfb_findVisibleHomePagingController();
     if (!paging || ![paging isViewLoaded]) return @[];
     NSMutableArray<UIViewController *> *pages = [NSMutableArray array];
+    id dataSource = nfb_pagingDataSource(paging);
+    SEL sectionsSel = @selector(numberOfSectionsInPagingViewController:);
+    SEL pagesSel = @selector(pagingViewController:numberOfPagesInSection:);
+    if (dataSource && [dataSource respondsToSelector:sectionsSel] && [dataSource respondsToSelector:pagesSel]) {
+        NSInteger sections = ((NSInteger(*)(id, SEL, id))objc_msgSend)(dataSource, sectionsSel, paging);
+        for (NSInteger section = 0; section < sections; section++) {
+            NSInteger count = ((NSInteger(*)(id, SEL, id, NSInteger))objc_msgSend)(dataSource, pagesSel, paging, section);
+            for (NSInteger item = 0; item < count; item++) {
+                NSIndexPath *indexPath = [NSIndexPath indexPathForItem:item inSection:section];
+                UIViewController *page = nfb_pagingViewControllerAtIndexPath(paging, indexPath);
+                if (!nfb_isTimelinePageController(page) || nfb_isRecommendedHomeTimeline(page) || [pages containsObject:page]) continue;
+                [pages addObject:page];
+            }
+        }
+    }
     for (UIViewController *child in paging.childViewControllers) {
-        NSString *cls = NSStringFromClass(child.class);
-        BOOL timeline = [cls containsString:@"HomeTimelineItemsViewController"] || [cls containsString:@"PinnedTimelineViewController"];
-        if (!timeline || nfb_isRecommendedHomeTimeline(child)) continue;
-        [pages addObject:child];
+        if (!nfb_isTimelinePageController(child) || nfb_isRecommendedHomeTimeline(child)) continue;
+        if (![pages containsObject:child]) [pages addObject:child];
     }
     return pages;
 }
@@ -1734,11 +1880,17 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
     UIScrollView *h = paging ? nfb_horizontalPagingScrollViewOf(paging) : nil;
     NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
     BOOL applied = h && objc_getAssociatedObject(h, &kNFBInlineColumnsAppliedKey) != nil;
-    [s appendFormat:@"columns enabled=%d paging=%@ applied=%d pages=%lu\n",
+    NSIndexPath *selectedIndexPath = paging ? nfb_pagingSelectedIndexPath(paging) : nil;
+    NSInteger estimatedPages = paging ? nfb_estimatedHomePagingPageCount(paging) : 0;
+    id dataSource = paging ? nfb_pagingDataSource(paging) : nil;
+    [s appendFormat:@"columns enabled=%d paging=%@ applied=%d pages=%lu estimatedPages=%ld selectedIndexPath=%@ dataSource=%@\n",
         gInlineColumnsEnabled ? 1 : 0,
         paging ? NSStringFromClass(paging.class) : @"(nil)",
         applied ? 1 : 0,
-        (unsigned long)pages.count];
+        (unsigned long)pages.count,
+        (long)estimatedPages,
+        selectedIndexPath ?: @"(nil)",
+        dataSource ? NSStringFromClass([dataSource class]) : @"(nil)"];
     [s appendFormat:@"columnsOverlay=%d overlayWindow=%d frame=(%.1f,%.1f,%.1f,%.1f) scrollContent=(%.1f,%.1f) scrollBounds=(%.1f,%.1f) button=%d\n",
         gColumnsOverlayView ? 1 : 0,
         (gColumnsOverlayView && gColumnsOverlayView.window) ? 1 : 0,
@@ -1812,6 +1964,12 @@ static void nfb_scheduleLayoutActiveHomePaging(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         nfb_layoutActiveHomePaging();
     });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.00 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        nfb_layoutActiveHomePaging();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.80 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        nfb_layoutActiveHomePaging();
+    });
 }
 
 BOOL NFBInlineColumnsEnabled(void) {
@@ -1833,6 +1991,18 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 %hook THFHomeTimelineContainerViewController
 - (void)viewDidAppear:(BOOL)animated { %orig; nfb_syncHomeTimelineTabIdentifierFromController(self); nfb_installButton(self.view.window); }
 - (void)viewDidDisappear:(BOOL)animated { %orig; nfb_removeButton(); }
+- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    %orig(size, coordinator);
+    if (!gInlineColumnsEnabled) return;
+    nfb_scheduleLayoutActiveHomePaging();
+    [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
+        nfb_scheduleLayoutActiveHomePaging();
+    }];
+}
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    %orig(previousTraitCollection);
+    if (gInlineColumnsEnabled) nfb_scheduleLayoutActiveHomePaging();
+}
 - (void)selectTimelineVariant:(id)variant shouldRefresh:(BOOL)shouldRefresh {
     nfb_persistHomeTimelineTabIdentifier(nfb_identifierForTimelineVariantArgument(variant));
     %orig(variant, shouldRefresh);
@@ -1865,5 +2035,32 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     %orig;
     if (gInlineColumnsEnabled) nfb_applyInlineColumns(self);
     else nfb_restoreInlineColumns(self);
+}
+- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    %orig(size, coordinator);
+    if (!gInlineColumnsEnabled) return;
+    nfb_scheduleLayoutActiveHomePaging();
+    [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
+        nfb_scheduleLayoutActiveHomePaging();
+    }];
+}
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    %orig(previousTraitCollection);
+    if (gInlineColumnsEnabled) nfb_scheduleLayoutActiveHomePaging();
+}
+%end
+
+%hook TFNScrollingSegmentedViewController
+- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    %orig(size, coordinator);
+    if (!gInlineColumnsEnabled) return;
+    nfb_scheduleLayoutActiveHomePaging();
+    [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
+        nfb_scheduleLayoutActiveHomePaging();
+    }];
+}
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    %orig(previousTraitCollection);
+    if (gInlineColumnsEnabled) nfb_scheduleLayoutActiveHomePaging();
 }
 %end
