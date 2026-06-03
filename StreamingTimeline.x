@@ -38,6 +38,7 @@ static UIViewController *nfb_firstColumnTimelineAwayFromTop(void);
 static UIViewController *nfb_firstColumnTimelineAwayFromTopExcept(UIViewController *allowedRevealing);
 static void nfb_layoutActiveHomePaging(void);
 void NFBSetInlineColumnsEnabled(BOOL enabled);
+extern void BHTPresentColumnsMode(void);
 
 // Minimal bases so `self.view` resolves; everything else goes through objc_msgSend.
 @interface THFHomeTimelineContainerViewController : UIViewController
@@ -902,7 +903,10 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
         [ac addAction:[UIAlertAction actionWithTitle:@"⬆︎ 全カラムを上へ移動" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_revealAllColumnTops(); }]];
     }
     [ac addAction:[UIAlertAction actionWithTitle:(on ? @"自動更新を OFF にする" : @"自動更新を ON にする") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_setStreamEnabled(!on); UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamStart(vc); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:(gInlineColumnsEnabled ? @"カラムモードを OFF にする" : @"カラムモードを ON にする") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ NFBSetInlineColumnsEnabled(!gInlineColumnsEnabled); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:(gInlineColumnsEnabled ? @"カラムモードを OFF にする" : @"カラムモードを ON にする") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        if (gInlineColumnsEnabled) NFBSetInlineColumnsEnabled(NO);
+        else BHTPresentColumnsMode();
+    }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"⏱ 更新間隔を変更…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showInterval]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🔧 更新方式テスト…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showTest]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🔍 診断情報（コピーして送って）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showDiag]; }]];
@@ -1776,6 +1780,12 @@ BOOL NFBInlineColumnsEnabled(void) {
 void NFBSetInlineColumnsEnabled(BOOL enabled) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ NFBSetInlineColumnsEnabled(enabled); });
+        return;
+    }
+    if (enabled) {
+        gInlineColumnsEnabled = NO;
+        nfb_removeColumnsOverlay();
+        BHTPresentColumnsMode();
         return;
     }
     gInlineColumnsEnabled = enabled;

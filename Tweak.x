@@ -28,6 +28,8 @@
 #import "ModernSettingsViewController.h"
 
 extern void NFBSetInlineColumnsEnabled(BOOL enabled);
+void BHTPresentColumnsMode(void);
+void BHTDismissColumnsMode(void);
 static BOOL gBHTSelectingHomeForColumns = NO;
 static BOOL gBHTApplyingColumnsTabSelection = NO;
 static BOOL BHTIsColumnsPageID(NSString *page);
@@ -632,7 +634,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
                 id tabView = tabViews[(NSUInteger)selectedIndex];
                 page = [tabView valueForKey:@"scribePage"];
                 if (!BHTIsColumnsPageID(page)) {
-                    NFBSetInlineColumnsEnabled(NO);
+                    BHTDismissColumnsMode();
                 }
             }
         } @catch (NSException *e) {
@@ -640,6 +642,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     }
     %orig(selectedIndex);
     if (!gBHTSelectingHomeForColumns && !BHTIsColumnsPageID(page)) {
+        BHTDismissColumnsMode();
         BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
     }
 }
@@ -4152,6 +4155,9 @@ static char kManualRefreshInProgressKey;
 // MARK: - Classic Tab Bar Icon Theming
 static char kBHTColumnsTapGestureKey;
 static NSTimeInterval gBHTLastColumnsOpen = 0;
+static UIView *gBHTColumnsOverlayView = nil;
+static UIViewController *gBHTColumnsNavigationController = nil;
+static __weak UIViewController *gBHTColumnsHostController = nil;
 
 static NSString *BHTColumnsTabTitle(void) {
     NSString *title = [[BHTBundle sharedBundle] localizedStringForKey:@"CUSTOM_TAB_BAR_COLUMNS"];
@@ -4289,26 +4295,147 @@ static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSel
     }
 }
 
-static void BHTPresentColumnsViewController(void) {
+static void BHTBringTabChromeToFront(UIViewController *tabBarController) {
+    NSArray *tabViews = nil;
+    @try {
+        tabViews = [tabBarController valueForKey:@"tabViews"];
+    } @catch (NSException *e) {
+        tabViews = nil;
+    }
+    NSMutableSet<UIView *> *containers = [NSMutableSet set];
+    for (id tabView in tabViews) {
+        UIView *view = [tabView isKindOfClass:UIView.class] ? (UIView *)tabView : nil;
+        if (!view || !view.superview) continue;
+        UIView *container = view.superview;
+        if (container == tabBarController.view) {
+            [containers addObject:view];
+            continue;
+        }
+        for (int i = 0; container.superview && container.superview != tabBarController.view && i < 3; i++) {
+            container = container.superview;
+        }
+        if (container && container != tabBarController.view) [containers addObject:container];
+    }
+    for (UIView *container in containers) {
+        [tabBarController.view bringSubviewToFront:container];
+    }
+}
+
+static UIViewController *BHTFindHomeContainerController(UIViewController *root, NSInteger depth) {
+    if (!root || depth > 14) return nil;
+    if ([NSStringFromClass(root.class) containsString:@"HomeTimelineContainer"]) return root;
+    UIViewController *presented = BHTFindHomeContainerController(root.presentedViewController, depth + 1);
+    if (presented) return presented;
+    for (UIViewController *child in root.childViewControllers) {
+        UIViewController *found = BHTFindHomeContainerController(child, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void BHTLayoutColumnsOverlay(void) {
+    UIViewController *host = gBHTColumnsHostController;
+    if (!host || !gBHTColumnsOverlayView || !gBHTColumnsNavigationController) return;
+    gBHTColumnsOverlayView.frame = host.view.bounds;
+    gBHTColumnsNavigationController.view.frame = gBHTColumnsOverlayView.bounds;
+    [host.view bringSubviewToFront:gBHTColumnsOverlayView];
+    BHTBringTabChromeToFront(host);
+}
+
+void BHTDismissColumnsMode(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ BHTDismissColumnsMode(); });
+        return;
+    }
+    NFBSetInlineColumnsEnabled(NO);
+    UIViewController *host = gBHTColumnsHostController;
+    if (gBHTColumnsNavigationController) {
+        [gBHTColumnsNavigationController willMoveToParentViewController:nil];
+        [gBHTColumnsNavigationController.view removeFromSuperview];
+        [gBHTColumnsNavigationController removeFromParentViewController];
+    }
+    [gBHTColumnsOverlayView removeFromSuperview];
+    gBHTColumnsNavigationController = nil;
+    gBHTColumnsOverlayView = nil;
+    gBHTColumnsHostController = nil;
+    if (host) BHTUpdateColumnsTabSelection(host, NO);
+}
+
+static void BHTShowColumnsOverlayOnTabBar(UIViewController *tabBarController) {
+    if (!tabBarController || !tabBarController.view.window) return;
+    if (gBHTColumnsNavigationController && gBHTColumnsHostController == tabBarController) {
+        BHTLayoutColumnsOverlay();
+        BHTUpdateColumnsTabSelection(tabBarController, YES);
+        return;
+    }
+    BHTDismissColumnsMode();
+
+    Class columnsClass = NSClassFromString(@"NFBColumnsViewController");
+    if (!columnsClass) return;
+    UIViewController *columns = [[columnsClass alloc] init];
+    UIViewController *homeContainer = BHTFindHomeContainerController(tabBarController, 0);
+    if (homeContainer) {
+        @try {
+            [columns setValue:homeContainer forKey:@"sourceHomeContainer"];
+        } @catch (NSException *e) {
+        }
+    }
+    @try {
+        [columns setValue:tabBarController forKey:@"sourceTabBarController"];
+    } @catch (NSException *e) {
+    }
+
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:columns];
+    nav.view.backgroundColor = UIColor.systemBackgroundColor;
+    nav.navigationBar.translucent = NO;
+
+    UIView *overlay = [[UIView alloc] initWithFrame:tabBarController.view.bounds];
+    overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    overlay.backgroundColor = UIColor.systemBackgroundColor;
+    overlay.userInteractionEnabled = YES;
+
+    [tabBarController addChildViewController:nav];
+    [overlay addSubview:nav.view];
+    [tabBarController.view addSubview:overlay];
+    [nav didMoveToParentViewController:tabBarController];
+
+    gBHTColumnsOverlayView = overlay;
+    gBHTColumnsNavigationController = nav;
+    gBHTColumnsHostController = tabBarController;
+    NFBSetInlineColumnsEnabled(NO);
+    BHTLayoutColumnsOverlay();
+    BHTUpdateColumnsTabSelection(tabBarController, YES);
+}
+
+void BHTPresentColumnsMode(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ BHTPresentColumnsMode(); });
+        return;
+    }
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - gBHTLastColumnsOpen < 0.35) return;
+    if (now - gBHTLastColumnsOpen < 0.25) return;
     gBHTLastColumnsOpen = now;
 
     UIWindow *window = BHT_activeKeyWindow();
     if (!window.rootViewController) return;
-    NFBSetInlineColumnsEnabled(YES);
+    UIViewController *tabBarController = BHTFindControllerOfClass(window.rootViewController, NSClassFromString(@"T1TabBarViewController"), 0);
+    if (!tabBarController) return;
+
     gBHTSelectingHomeForColumns = YES;
     BHTSelectTabPage(window.rootViewController, @"home");
-    BHTUpdateColumnsTabSelection(window.rootViewController, YES);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NFBSetInlineColumnsEnabled(YES);
-        BHTUpdateColumnsTabSelection(window.rootViewController, YES);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        BHTShowColumnsOverlayOnTabBar(tabBarController);
         gBHTSelectingHomeForColumns = NO;
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        BHTUpdateColumnsTabSelection(window.rootViewController, YES);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        BHTLayoutColumnsOverlay();
+        BHTUpdateColumnsTabSelection(tabBarController, YES);
         gBHTSelectingHomeForColumns = NO;
     });
+}
+
+static void BHTPresentColumnsViewController(void) {
+    BHTPresentColumnsMode();
 }
 
 %hook T1TabView
@@ -4430,17 +4557,17 @@ static void BHTPresentColumnsViewController(void) {
         return;
     }
     if (isHome) {
-        NFBSetInlineColumnsEnabled(NO);
+        BHTDismissColumnsMode();
         UIWindow *window = BHT_activeKeyWindow();
         BHTUpdateColumnsTabSelection(window.rootViewController, NO);
     }
     %orig(touches, event);
     if (isHome) {
-        NFBSetInlineColumnsEnabled(NO);
+        BHTDismissColumnsMode();
         UIWindow *window = BHT_activeKeyWindow();
         BHTUpdateColumnsTabSelection(window.rootViewController, NO);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            NFBSetInlineColumnsEnabled(NO);
+            BHTDismissColumnsMode();
             BHTUpdateColumnsTabSelection(window.rootViewController, NO);
         });
     }
@@ -4469,6 +4596,13 @@ static void BHTPresentColumnsViewController(void) {
                 [tabView performSelector:@selector(bh_applyCurrentThemeToIcon)];
             }
         }
+    }
+}
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    if (gBHTColumnsHostController == (UIViewController *)self) {
+        BHTLayoutColumnsOverlay();
     }
 }
 
