@@ -909,24 +909,44 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
 static BOOL gNFBLogRecording = NO;
 static NSMutableArray<NSString *> *gNFBLog = nil;
 static NSTimeInterval gNFBLogStart = 0.0;
+static NSFileHandle *gNFBLogFile = nil;
+static NSString *nfb_logFilePath(void) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
+    return [dir stringByAppendingPathComponent:@"nfb_oplog.txt"];
+}
 void NFBLogEvent(NSString *msg) {
     if (!gNFBLogRecording) return;
     if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ NFBLogEvent(msg); }); return; }
     if (!gNFBLog) gNFBLog = [NSMutableArray array];
-    [gNFBLog addObject:[NSString stringWithFormat:@"+%7.2f %@", CACurrentMediaTime() - gNFBLogStart, msg ?: @""]];
+    NSString *line = [NSString stringWithFormat:@"+%7.2f %@", CACurrentMediaTime() - gNFBLogStart, msg ?: @""];
+    [gNFBLog addObject:line];
     if (gNFBLog.count > 6000) [gNFBLog removeObjectAtIndex:0];
+    // Mirror each line to a file so the log survives an app kill or a stuck screen where the menu /
+    // stop button isn't reachable — it can be copied next launch via "保存済みログをコピー".
+    @try { [gNFBLogFile writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]]; } @catch (NSException *e) {}
 }
 BOOL NFBLogIsRecording(void) { return gNFBLogRecording; }
 void NFBLogStartRecording(void) {
     gNFBLog = [NSMutableArray array];
     gNFBLogStart = CACurrentMediaTime();
+    @try {
+        NSString *path = nfb_logFilePath();
+        [[NSData data] writeToFile:path atomically:NO];            // truncate previous file
+        gNFBLogFile = [NSFileHandle fileHandleForWritingAtPath:path];
+    } @catch (NSException *e) { gNFBLogFile = nil; }
     gNFBLogRecording = YES;
     NFBLogEvent(@"=== REC START ===");
 }
 NSString *NFBLogStopRecording(void) {
     if (gNFBLogRecording) NFBLogEvent(@"=== REC STOP ===");
     gNFBLogRecording = NO;
+    @try { [gNFBLogFile closeFile]; } @catch (NSException *e) {}
+    gNFBLogFile = nil;
     return gNFBLog.count ? [gNFBLog componentsJoinedByString:@"\n"] : @"(ログなし)";
+}
+NSString *NFBLogSavedFileContents(void) {
+    NSString *s = [NSString stringWithContentsOfFile:nfb_logFilePath() encoding:NSUTF8StringEncoding error:nil];
+    return s.length ? s : @"(保存ログなし)";
 }
 
 #pragma mark - tap / long-press handler (reliable action sheets)
@@ -994,8 +1014,9 @@ NSString *NFBLogStopRecording(void) {
     if (NFBLogIsRecording()) {
         [ac addAction:[UIAlertAction actionWithTitle:@"⏹ ログ録画を停止してコピー" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){ [self stopLogAndShow]; }]];
     } else {
-        [ac addAction:[UIAlertAction actionWithTitle:@"⏺ ログ録画を開始（既存ログ消去）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ NFBLogStartRecording(); [self toast:@"録画開始。再現操作をしてから、もう一度長押し→「停止してコピー」"]; }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"⏺ ログ録画を開始（既存ログ消去）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ NFBLogStartRecording(); [self toast:@"録画開始。再現操作をしてから、もう一度長押し→「停止してコピー」。詰まって停止できない時は、起動し直して「保存済みログをコピー」。"]; }]];
     }
+    [ac addAction:[UIAlertAction actionWithTitle:@"📄 保存済みログをコピー（停止不要・kill後も可）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self copySavedLog]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🔄 今すぐ更新" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamTrigger(vc); }]];
     if (gInlineColumnsEnabled) {
         [ac addAction:[UIAlertAction actionWithTitle:@"⬆︎ 全カラムを上へ移動" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_revealAllColumnTops(); }]];
@@ -1020,6 +1041,14 @@ NSString *NFBLogStopRecording(void) {
     NSString *log = NFBLogStopRecording();
     UIPasteboard.generalPasteboard.string = log;
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"録画ログ（コピー済み）" message:log preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"再コピー" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIPasteboard.generalPasteboard.string = log; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:ac];
+}
+- (void)copySavedLog {
+    NSString *log = NFBLogSavedFileContents();
+    UIPasteboard.generalPasteboard.string = log;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"保存ログ（コピー済み）" message:log preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"再コピー" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIPasteboard.generalPasteboard.string = log; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
@@ -1772,10 +1801,12 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nativeScrollView.showsHorizontalScrollIndicator = NO;
     nativeScrollView.clipsToBounds = YES;
     nativeScrollView.directionalLockEnabled = YES;
+    // Always pin OUR column contentSize. The recorded log proved Twitter's %orig sets it to
+    // pages*fullWidth (=1808) mid-drag, which let the scroll run into empty space past the 1020-wide
+    // columns and then snap back — that is the "catch and bounce". Shrinking contentSize never
+    // interrupts an in-flight scroll; only the hard offset clamp does, so that stays behind !dragging.
+    nativeScrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, bounds.size.width + 1.0), height);
     if (!columnsScrollDragging) {
-        // contentSize / offset changes interrupt an in-progress horizontal scroll — only touch them
-        // when the user isn't actively dragging. The page frames below are re-applied every pass.
-        nativeScrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, bounds.size.width + 1.0), height);
         CGFloat maxOffsetX = MAX(0.0, nativeScrollView.contentSize.width - bounds.size.width);
         if (nativeScrollView.contentOffset.x > maxOffsetX) {
             [nativeScrollView setContentOffset:CGPointMake(maxOffsetX, nativeScrollView.contentOffset.y) animated:NO];
