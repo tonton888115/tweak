@@ -42,6 +42,7 @@ static NSIndexPath *nfb_pagingSelectedIndexPath(UIViewController *paging);
 static UIViewController *nfb_pagingViewControllerAtIndexPath(UIViewController *paging, NSIndexPath *indexPath);
 static UIViewController *nfb_firstColumnTimelineAwayFromTop(void);
 static UIViewController *nfb_firstColumnTimelineAwayFromTopExcept(UIViewController *allowedRevealing);
+static void nfb_rememberInlineColumnsOriginals(UIScrollView *scrollView);
 static void nfb_layoutActiveHomePaging(void);
 void NFBSetInlineColumnsEnabled(BOOL enabled);
 extern void BHTPresentColumnsMode(void);
