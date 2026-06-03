@@ -647,6 +647,7 @@ static void nfb_afterRefresh(UIViewController *vc) {
         gPendingNewTweetsVC = nil;
     }
     nfb_revealTopAfterRefresh(vc);
+    if (gInlineColumnsEnabled) nfb_layoutActiveHomePaging();
     nfb_updateStreamStateIconForVC(vc);
 }
 
@@ -1384,15 +1385,47 @@ static BOOL nfb_columnsChromeCandidate(UIView *view, UIView *root) {
     return CGRectGetMaxY(frame) <= 220.0 && view.subviews.count > 0;
 }
 
+static BOOL nfb_columnsProtectedView(UIView *view) {
+    if (!view) return NO;
+    for (id candidate in @[gStreamButton ?: (id)[NSNull null],
+                           gStreamStateIcon ?: (id)[NSNull null],
+                           gNewTweetsPill ?: (id)[NSNull null],
+                           gColumnsAllTopButton ?: (id)[NSNull null]]) {
+        if (![candidate isKindOfClass:UIView.class]) continue;
+        UIView *protectedView = (UIView *)candidate;
+        if (view == protectedView || nfb_viewContainsDescendant(protectedView, view)) return YES;
+    }
+    return NO;
+}
+
+static BOOL nfb_columnsPagingSurface(UIView *view) {
+    if (!view) return NO;
+    NSString *cls = NSStringFromClass(view.class);
+    return [cls containsString:@"Paging"] || ([view isKindOfClass:UIScrollView.class] && view.bounds.size.height > 240.0);
+}
+
+static BOOL nfb_viewContainsColumnsPagingSurface(UIView *view, int depth) {
+    if (!view || depth > 8) return NO;
+    if (nfb_columnsPagingSurface(view)) return YES;
+    for (UIView *subview in view.subviews) {
+        if (nfb_viewContainsColumnsPagingSurface(subview, depth + 1)) return YES;
+    }
+    return NO;
+}
+
 static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView *root, int depth) {
     if (!view || !root || depth > 8) return NO;
-    if (gColumnsOverlayView && (view == gColumnsOverlayView || nfb_viewContainsDescendant(gColumnsOverlayView, view))) return NO;
+    if (nfb_columnsProtectedView(view)) return NO;
     BOOL containsPaging = nfb_viewContainsDescendant(view, pagingView);
+    BOOL pagingSurface = nfb_columnsPagingSurface(view);
+    BOOL containsPagingSurface = nfb_viewContainsColumnsPagingSurface(view, 0);
+    if (pagingSurface) return NO;
     CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
     BOOL fullScreenChromeLayer = view != root && view != pagingView && !containsPaging &&
+        !pagingSurface && !containsPagingSurface &&
         CGRectGetMinY(frame) <= 280.0 && frame.size.width >= root.bounds.size.width * 0.6 &&
         frame.size.height > 260.0 && frame.size.height <= root.bounds.size.height + 80.0 && depth <= 4;
-    if (view != pagingView && !containsPaging && (nfb_columnsChromeCandidate(view, root) || fullScreenChromeLayer)) {
+    if (view != pagingView && !containsPaging && !pagingSurface && !containsPagingSurface && (nfb_columnsChromeCandidate(view, root) || fullScreenChromeLayer)) {
         nfb_setColumnsChromeViewHidden(view, YES);
         return YES;
     }
@@ -1411,14 +1444,57 @@ static void nfb_restoreColumnsChromeInView(UIView *view, int depth) {
     }
 }
 
+static BOOL nfb_globalTopColumnsChromeCandidate(UIView *view, UIView *root) {
+    if (!view || !root || view == root || view.hidden || view.alpha < 0.01 || nfb_columnsProtectedView(view)) return NO;
+    if (nfb_columnsPagingSurface(view)) return NO;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    if (CGRectGetMinY(frame) > 240.0 || frame.size.width < 24.0 || frame.size.height < 4.0 || frame.size.height > 220.0) return NO;
+    NSString *cls = NSStringFromClass(view.class);
+    NSString *text = nfb_textOfView(view);
+    NSString *lower = text.lowercaseString;
+    if ([text containsString:@"おすすめ"] || [text containsString:@"フォロー中"] ||
+        [lower containsString:@"for you"] || [lower containsString:@"following"]) return YES;
+    if ([cls containsString:@"HomeSegment"] || [cls containsString:@"Segmented"] ||
+        [cls containsString:@"LabelBar"] || [cls containsString:@"HorizontalLabel"] ||
+        [cls containsString:@"SegmentedLabel"]) return YES;
+    return NO;
+}
+
+static NSInteger nfb_setColumnsGlobalTopChromeHiddenInView(UIView *view, UIView *root, BOOL hidden, int depth) {
+    if (!view || !root || depth > 12) return 0;
+    if (hidden && nfb_columnsPagingSurface(view)) return 0;
+    NSInteger count = 0;
+    if (hidden && nfb_globalTopColumnsChromeCandidate(view, root)) {
+        nfb_setColumnsChromeViewHidden(view, YES);
+        return 1;
+    }
+    if (!hidden && objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey)) {
+        nfb_setColumnsChromeViewHidden(view, NO);
+        count++;
+    }
+    for (UIView *subview in view.subviews) {
+        count += nfb_setColumnsGlobalTopChromeHiddenInView(subview, root, hidden, depth + 1);
+    }
+    return count;
+}
+
+static void nfb_setColumnsGlobalTopChromeHidden(BOOL hidden) {
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window.hidden || window.alpha < 0.01) continue;
+        nfb_setColumnsGlobalTopChromeHiddenInView(window, window, hidden, 0);
+    }
+}
+
 static void nfb_setColumnsSegmentedHiddenForPaging(UIViewController *paging, BOOL hidden) {
     UIViewController *segmented = nfb_parentControllerNamed(paging, @"Segmented");
     UIViewController *container = nfb_parentControllerNamed(paging, @"HomeTimelineContainer");
     if (![paging isViewLoaded]) return;
     if (hidden) {
-        if (segmented && [segmented isViewLoaded]) nfb_setColumnsChromeViewHidden(segmented.view, YES);
+        if (segmented && [segmented isViewLoaded]) nfb_hideColumnsChromeInView(segmented.view, paging.view, segmented.view, 0);
         if (container && [container isViewLoaded]) nfb_hideColumnsChromeInView(container.view, paging.view, container.view, 0);
+        nfb_setColumnsGlobalTopChromeHidden(YES);
     } else {
+        nfb_setColumnsGlobalTopChromeHidden(NO);
         if (segmented && [segmented isViewLoaded]) nfb_restoreColumnsChromeInView(segmented.view, 0);
         if (container && [container isViewLoaded]) nfb_restoreColumnsChromeInView(container.view, 0);
     }
@@ -1472,29 +1548,25 @@ static void nfb_removeColumnsOverlay(void) {
         if ([page isViewLoaded]) nfb_restoreColumnOriginalViewState(page.view);
     }
     [gColumnsOverlayView removeFromSuperview];
+    [gColumnsAllTopButton removeFromSuperview];
     gColumnsOverlayView = nil;
     gColumnsOverlayScrollView = nil;
     gColumnsAllTopButton = nil;
     gColumnsOverlayPages = nil;
     gPendingNewTweetsVC = nil;
+    nfb_setColumnsGlobalTopChromeHidden(NO);
     nfb_hideNewTweetsPill();
 }
 
 static void nfb_ensureColumnsOverlayForPaging(UIViewController *paging) {
     UIView *host = nfb_columnsHostViewForPaging(paging);
     if (!host) return;
-    if (!gColumnsOverlayView) {
-        gColumnsOverlayView = [[UIView alloc] initWithFrame:host.bounds];
-        gColumnsOverlayView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        gColumnsOverlayView.backgroundColor = UIColor.systemBackgroundColor;
-
-        gColumnsOverlayScrollView = [[UIScrollView alloc] initWithFrame:gColumnsOverlayView.bounds];
-        gColumnsOverlayScrollView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        gColumnsOverlayScrollView.alwaysBounceHorizontal = YES;
-        gColumnsOverlayScrollView.showsHorizontalScrollIndicator = YES;
-        gColumnsOverlayScrollView.directionalLockEnabled = YES;
-        [gColumnsOverlayView addSubview:gColumnsOverlayScrollView];
-
+    if (gColumnsOverlayView || gColumnsOverlayScrollView) {
+        [gColumnsOverlayView removeFromSuperview];
+        gColumnsOverlayView = nil;
+        gColumnsOverlayScrollView = nil;
+    }
+    if (!gColumnsAllTopButton) {
         gColumnsAllTopButton = [UIButton buttonWithType:UIButtonTypeSystem];
         gColumnsAllTopButton.frame = CGRectMake(0.0, 0.0, 116.0, 34.0);
         gColumnsAllTopButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
@@ -1505,14 +1577,12 @@ static void nfb_ensureColumnsOverlayForPaging(UIViewController *paging) {
         [gColumnsAllTopButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
         [gColumnsAllTopButton setTitle:@"全カラム↑" forState:UIControlStateNormal];
         [gColumnsAllTopButton addTarget:[NFBStreamHandler shared] action:@selector(revealAllColumnsTap) forControlEvents:UIControlEventTouchUpInside];
-        [gColumnsOverlayView addSubview:gColumnsAllTopButton];
     }
-    if (gColumnsOverlayView.superview != host) {
-        [gColumnsOverlayView removeFromSuperview];
-        gColumnsOverlayView.frame = host.bounds;
-        [host addSubview:gColumnsOverlayView];
+    if (gColumnsAllTopButton.superview != host) {
+        [gColumnsAllTopButton removeFromSuperview];
+        [host addSubview:gColumnsAllTopButton];
     }
-    [host bringSubviewToFront:gColumnsOverlayView];
+    [host bringSubviewToFront:gColumnsAllTopButton];
 }
 
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
@@ -1545,27 +1615,48 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         }
     }
     nfb_ensureColumnsOverlayForPaging(paging);
-    if (!gColumnsOverlayView || !gColumnsOverlayScrollView) return;
+    UIScrollView *nativeScrollView = nfb_horizontalPagingScrollViewOf(paging);
+    if (!nativeScrollView) return;
 
     UIView *host = nfb_columnsHostViewForPaging(paging);
-    if (host) gColumnsOverlayView.frame = host.bounds;
-    CGRect bounds = gColumnsOverlayView.bounds;
+    CGRect bounds = nativeScrollView.bounds;
     if (bounds.size.width < 120.0 || bounds.size.height < 240.0) return;
-    gColumnsOverlayScrollView.frame = bounds;
     CGFloat columnWidth = nfb_columnsColumnWidth(bounds.size.width);
     CGFloat height = bounds.size.height;
 
     gColumnsOverlayPages = [pages copy];
-    gColumnsOverlayScrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, bounds.size.width + 1.0), height);
-    gColumnsAllTopButton.frame = CGRectMake(MAX(12.0, bounds.size.width - 128.0), 10.0, 116.0, 34.0);
-    [gColumnsOverlayView bringSubviewToFront:gColumnsAllTopButton];
+    nfb_rememberInlineColumnsOriginals(nativeScrollView);
+    nativeScrollView.pagingEnabled = NO;
+    nativeScrollView.alwaysBounceHorizontal = YES;
+    nativeScrollView.showsHorizontalScrollIndicator = YES;
+    nativeScrollView.clipsToBounds = YES;
+    nativeScrollView.directionalLockEnabled = YES;
+    nativeScrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, bounds.size.width + 1.0), height);
+    CGFloat maxOffsetX = MAX(0.0, nativeScrollView.contentSize.width - bounds.size.width);
+    if (nativeScrollView.contentOffset.x > maxOffsetX) {
+        [nativeScrollView setContentOffset:CGPointMake(maxOffsetX, nativeScrollView.contentOffset.y) animated:NO];
+    }
+    if (host && gColumnsAllTopButton) {
+        CGRect hostBounds = host.bounds;
+        gColumnsAllTopButton.frame = CGRectMake(MAX(12.0, hostBounds.size.width - 128.0), 10.0, 116.0, 34.0);
+        [host bringSubviewToFront:gColumnsAllTopButton];
+    }
+
+    NSSet<UIViewController *> *pageSet = [NSSet setWithArray:pages];
+    for (UIViewController *child in paging.childViewControllers) {
+        if (![child isViewLoaded] || !nfb_isTimelinePageController(child)) continue;
+        if (![pageSet containsObject:child]) {
+            child.view.hidden = YES;
+            child.view.alpha = 0.0;
+        }
+    }
 
     NSUInteger idx = 0;
     for (UIViewController *page in pages) {
         [page loadViewIfNeeded];
         UIView *pageView = page.view;
         nfb_rememberColumnOriginalViewState(pageView);
-        if (pageView.superview != gColumnsOverlayScrollView) [gColumnsOverlayScrollView addSubview:pageView];
+        if (pageView.superview != nativeScrollView) [nativeScrollView addSubview:pageView];
         pageView.hidden = NO;
         pageView.alpha = 1.0;
         pageView.frame = CGRectMake(columnWidth * idx, 0.0, columnWidth, height);
