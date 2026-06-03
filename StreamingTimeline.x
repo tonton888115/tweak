@@ -901,6 +901,34 @@ static UIImageView *gStreamStateIcon = nil;
 static void nfb_setStreamEnabled(BOOL on)    { [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"auto_stream_timeline"]; [[NSUserDefaults standardUserDefaults] synchronize]; }
 static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDefaults] setInteger:s forKey:@"auto_stream_interval"]; [[NSUserDefaults standardUserDefaults] synchronize]; }
 
+#pragma mark - operation log recorder (start/stop from the long-press menu)
+// Records timestamped events (button taps, tab switches, columns present/dismiss, mode changes,
+// screen appearances) continuously while recording — so dynamic / stuck states the snapshot can't
+// reach are captured and pasted as text. NFBLogEvent returns immediately unless recording, so it's
+// cheap to sprinkle everywhere. Shared with Tweak.x via the extern declarations there.
+static BOOL gNFBLogRecording = NO;
+static NSMutableArray<NSString *> *gNFBLog = nil;
+static NSTimeInterval gNFBLogStart = 0.0;
+void NFBLogEvent(NSString *msg) {
+    if (!gNFBLogRecording) return;
+    if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ NFBLogEvent(msg); }); return; }
+    if (!gNFBLog) gNFBLog = [NSMutableArray array];
+    [gNFBLog addObject:[NSString stringWithFormat:@"+%7.2f %@", CACurrentMediaTime() - gNFBLogStart, msg ?: @""]];
+    if (gNFBLog.count > 6000) [gNFBLog removeObjectAtIndex:0];
+}
+BOOL NFBLogIsRecording(void) { return gNFBLogRecording; }
+void NFBLogStartRecording(void) {
+    gNFBLog = [NSMutableArray array];
+    gNFBLogStart = CACurrentMediaTime();
+    gNFBLogRecording = YES;
+    NFBLogEvent(@"=== REC START ===");
+}
+NSString *NFBLogStopRecording(void) {
+    if (gNFBLogRecording) NFBLogEvent(@"=== REC STOP ===");
+    gNFBLogRecording = NO;
+    return gNFBLog.count ? [gNFBLog componentsJoinedByString:@"\n"] : @"(ログなし)";
+}
+
 #pragma mark - tap / long-press handler (reliable action sheets)
 
 @interface NFBStreamHandler : NSObject
@@ -963,6 +991,11 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"TL自動更新（垂れ流し）"
         message:[NSString stringWithFormat:@"状態: %@ ／ 間隔: %ld秒", on ? @"ON" : @"OFF", (long)iv]
         preferredStyle:UIAlertControllerStyleActionSheet];
+    if (NFBLogIsRecording()) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"⏹ ログ録画を停止してコピー" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){ [self stopLogAndShow]; }]];
+    } else {
+        [ac addAction:[UIAlertAction actionWithTitle:@"⏺ ログ録画を開始（既存ログ消去）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ NFBLogStartRecording(); [self toast:@"録画開始。再現操作をしてから、もう一度長押し→「停止してコピー」"]; }]];
+    }
     [ac addAction:[UIAlertAction actionWithTitle:@"🔄 今すぐ更新" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamTrigger(vc); }]];
     if (gInlineColumnsEnabled) {
         [ac addAction:[UIAlertAction actionWithTitle:@"⬆︎ 全カラムを上へ移動" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_revealAllColumnTops(); }]];
@@ -976,6 +1009,19 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     [ac addAction:[UIAlertAction actionWithTitle:@"🔧 更新方式テスト…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showTest]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🔍 診断情報（コピーして送って）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showDiag]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:ac];
+}
+- (void)toast:(NSString *)msg {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:nil message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self present:ac];
+}
+- (void)stopLogAndShow {
+    NSString *log = NFBLogStopRecording();
+    UIPasteboard.generalPasteboard.string = log;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"録画ログ（コピー済み）" message:log preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"再コピー" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIPasteboard.generalPasteboard.string = log; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
 - (void)showDiag {
@@ -2175,6 +2221,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
         dispatch_async(dispatch_get_main_queue(), ^{ NFBSetInlineColumnsEnabled(enabled); });
         return;
     }
+    if (gInlineColumnsEnabled != enabled) NFBLogEvent([NSString stringWithFormat:@"NFBSetInlineColumns -> %d", enabled]);
     gInlineColumnsEnabled = enabled;
     nfb_scheduleLayoutActiveHomePaging();
 }
@@ -2183,8 +2230,8 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 
 // Button lifecycle on the stable Home container.
 %hook THFHomeTimelineContainerViewController
-- (void)viewDidAppear:(BOOL)animated { %orig; nfb_syncHomeTimelineTabIdentifierFromController(self); nfb_installButton(self.view.window); }
-- (void)viewDidDisappear:(BOOL)animated { %orig; nfb_removeButton(); }
+- (void)viewDidAppear:(BOOL)animated { %orig; NFBLogEvent([NSString stringWithFormat:@"homeContainer viewDidAppear cols=%d", gInlineColumnsEnabled]); nfb_syncHomeTimelineTabIdentifierFromController(self); nfb_installButton(self.view.window); }
+- (void)viewDidDisappear:(BOOL)animated { %orig; NFBLogEvent(@"homeContainer viewDidDisappear"); nfb_removeButton(); }
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
     %orig(size, coordinator);
     if (!gInlineColumnsEnabled) return;
@@ -2204,7 +2251,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 %end
 
 %hook THFHomeTimelineItemsViewController
-- (void)viewDidAppear:(BOOL)animated { %orig; nfb_syncHomeTimelineTabIdentifierFromController(nfb_parentControllerNamed(self, @"HomeTimelineContainer")); gActiveItemsVC = self; nfb_installButton(self.view.window); nfb_streamStart(self); }
+- (void)viewDidAppear:(BOOL)animated { %orig; NFBLogEvent([NSString stringWithFormat:@"homeItems viewDidAppear recommended=%d", nfb_isRecommendedHomeTimeline(self) ? 1 : 0]); nfb_syncHomeTimelineTabIdentifierFromController(nfb_parentControllerNamed(self, @"HomeTimelineContainer")); gActiveItemsVC = self; nfb_installButton(self.view.window); nfb_streamStart(self); }
 // NOTE: do NOT stop the timer on disappear. Switching to a pinned list (ニコニコ/投資)
 // disappears this home VC; the timer must keep running so it can refresh the list via
 // the paging controller's selectedViewController. It self-cleans on dealloc / when off.

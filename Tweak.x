@@ -28,6 +28,7 @@
 #import "ModernSettingsViewController.h"
 
 extern void NFBSetInlineColumnsEnabled(BOOL enabled);
+extern void NFBLogEvent(NSString *msg);   // operation-log recorder (no-op unless recording)
 void BHTPresentColumnsMode(void);
 void BHTDismissColumnsMode(void);
 NSString *BHTColumnsModeDiagnostic(void);
@@ -638,6 +639,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
             if (selectedIndex >= 0 && selectedIndex < (NSInteger)tabViews.count) {
                 id tabView = tabViews[(NSUInteger)selectedIndex];
                 page = [tabView valueForKey:@"scribePage"];
+                NFBLogEvent([NSString stringWithFormat:@"tabBar.setSelectedIndex=%ld page=%@ selHome=%d intent=%d", (long)selectedIndex, page, gBHTSelectingHomeForColumns, gBHTColumnsIntent]);
                 if (BHTIsColumnsPageID(page)) {
                     BHTPresentColumnsMode();
                     BHTUpdateColumnsTabSelection((UIViewController *)self, YES);
@@ -4552,6 +4554,7 @@ void BHTDismissColumnsMode(void) {
     }
     gBHTColumnsIntent = NO;
     gBHTSelectingHomeForColumns = NO;
+    NFBLogEvent(@"BHTDismissColumnsMode()");
     NFBSetInlineColumnsEnabled(NO);
     UIViewController *host = gBHTColumnsHostController;
     if (gBHTColumnsNavigationController) {
@@ -4652,6 +4655,7 @@ void BHTPresentColumnsMode(void) {
         return;
     }
     gBHTColumnsIntent = YES;
+    NFBLogEvent(@"BHTPresentColumnsMode()");
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (now - gBHTLastColumnsOpen < 0.20) {
         NFBSetInlineColumnsEnabled(YES);
@@ -4751,6 +4755,7 @@ static void BHTPresentColumnsViewController(void) {
 %new
 - (void)bh_openColumns:(UITapGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateEnded) return;
+    NFBLogEvent(@"bh_openColumns (communities tap gesture)");
     BHTPresentColumnsViewController();
 }
 
@@ -4795,6 +4800,7 @@ static void BHTPresentColumnsViewController(void) {
 %new
 - (void)bh_homeTapped:(UITapGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateEnded) return;
+    NFBLogEvent([NSString stringWithFormat:@"bh_homeTapped (home gesture) intent=%d", gBHTColumnsIntent]);
     if (!gBHTColumnsIntent) return;   // only act when columns mode is on; otherwise leave Home alone
     BHTDismissColumnsMode();
     UIWindow *window = BHT_activeKeyWindow();
@@ -4848,6 +4854,7 @@ static void BHTPresentColumnsViewController(void) {
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     BOOL isColumns = BHTIsColumnsTabView((T1TabView *)self);
     BOOL isHome = BHTIsHomeTabView((T1TabView *)self);
+    NFBLogEvent([NSString stringWithFormat:@"tabView.touchesEnded page=%@ isHome=%d isCol=%d intent=%d", BHTPageOfTabView((T1TabView *)self), isHome, isColumns, gBHTColumnsIntent]);
     if (isColumns) {
         BHTPresentColumnsViewController();
         return;
