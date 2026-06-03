@@ -24,14 +24,15 @@ extern void BHTDismissColumnsMode(void);
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Columns";
+    self.title = @"カラム";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.widthConstraints = [NSMutableArray array];
     self.columnControllers = [NSMutableArray array];
 
-    UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
-                                                                          target:self
-                                                                          action:@selector(closeColumns)];
+    UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithTitle:@"ホーム"
+                                                             style:UIBarButtonItemStylePlain
+                                                            target:self
+                                                            action:@selector(closeColumns)];
     UIBarButtonItem *refresh = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
                                                                              target:self
                                                                              action:@selector(reloadColumns)];

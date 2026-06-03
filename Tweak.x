@@ -4159,6 +4159,12 @@ static NSTimeInterval gBHTLastColumnsOpen = 0;
 static UIView *gBHTColumnsOverlayView = nil;
 static UIViewController *gBHTColumnsNavigationController = nil;
 static __weak UIViewController *gBHTColumnsHostController = nil;
+static UIWindow *gBHTColumnsWindow = nil;
+static __weak UIWindow *gBHTColumnsPreviousKeyWindow = nil;
+static char kBHTColumnsHiddenFloatingSavedKey;
+static char kBHTColumnsHiddenFloatingHiddenKey;
+static char kBHTColumnsHiddenFloatingAlphaKey;
+static char kBHTColumnsHiddenFloatingInteractionKey;
 
 static NSString *BHTColumnsTabTitle(void) {
     NSString *title = [[BHTBundle sharedBundle] localizedStringForKey:@"CUSTOM_TAB_BAR_COLUMNS"];
@@ -4342,6 +4348,118 @@ static CGRect BHTColumnsContentFrameForHost(UIViewController *host) {
     return frame;
 }
 
+static void BHTSetColumnsFloatingViewHidden(UIView *view, BOOL hidden) {
+    if (!view) return;
+    if (hidden) {
+        if (!objc_getAssociatedObject(view, &kBHTColumnsHiddenFloatingSavedKey)) {
+            objc_setAssociatedObject(view, &kBHTColumnsHiddenFloatingSavedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(view, &kBHTColumnsHiddenFloatingHiddenKey, @(view.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(view, &kBHTColumnsHiddenFloatingAlphaKey, @(view.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(view, &kBHTColumnsHiddenFloatingInteractionKey, @(view.userInteractionEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        view.hidden = YES;
+        view.alpha = 0.0;
+        view.userInteractionEnabled = NO;
+        return;
+    }
+    if (!objc_getAssociatedObject(view, &kBHTColumnsHiddenFloatingSavedKey)) return;
+    NSNumber *wasHidden = objc_getAssociatedObject(view, &kBHTColumnsHiddenFloatingHiddenKey);
+    NSNumber *alpha = objc_getAssociatedObject(view, &kBHTColumnsHiddenFloatingAlphaKey);
+    NSNumber *interactive = objc_getAssociatedObject(view, &kBHTColumnsHiddenFloatingInteractionKey);
+    view.hidden = wasHidden ? wasHidden.boolValue : NO;
+    view.alpha = alpha ? alpha.doubleValue : 1.0;
+    view.userInteractionEnabled = interactive ? interactive.boolValue : YES;
+    objc_setAssociatedObject(view, &kBHTColumnsHiddenFloatingSavedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTColumnsHiddenFloatingHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTColumnsHiddenFloatingAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTColumnsHiddenFloatingInteractionKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static BOOL BHTViewIsColumnsOverlayDescendant(UIView *view) {
+    UIView *current = view;
+    for (int i = 0; current && i < 12; i++, current = current.superview) {
+        if (current == gBHTColumnsOverlayView) return YES;
+    }
+    return NO;
+}
+
+static NSString *BHTTextForFloatingCandidate(UIView *view) {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if (view.accessibilityLabel.length) [parts addObject:view.accessibilityLabel];
+    if (view.accessibilityIdentifier.length) [parts addObject:view.accessibilityIdentifier];
+    if ([view isKindOfClass:UIButton.class]) {
+        NSString *title = [((UIButton *)view) titleForState:UIControlStateNormal];
+        if (title.length) [parts addObject:title];
+    }
+    @try {
+        id titleLabel = [view valueForKey:@"titleLabel"];
+        if ([titleLabel respondsToSelector:@selector(text)]) {
+            NSString *text = [titleLabel text];
+            if (text.length) [parts addObject:text];
+        }
+    } @catch (NSException *e) {
+    }
+    [parts addObject:NSStringFromClass(view.class)];
+    return [[parts componentsJoinedByString:@" "] lowercaseString];
+}
+
+static BOOL BHTLooksLikeFloatingComposeButton(UIView *view, UIView *root) {
+    if (!view || !root || view.hidden || view.alpha < 0.01 || BHTViewIsColumnsOverlayDescendant(view)) return NO;
+    Class tabClass = NSClassFromString(@"T1TabView");
+    if (tabClass && [view isKindOfClass:tabClass]) return NO;
+    if (![view isKindOfClass:UIControl.class] && ![view isKindOfClass:UIButton.class]) return NO;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    CGFloat rootW = CGRectGetWidth(root.bounds);
+    CGFloat rootH = CGRectGetHeight(root.bounds);
+    if (frame.size.width < 36.0 || frame.size.height < 36.0 || frame.size.width > 120.0 || frame.size.height > 120.0) return NO;
+    if (CGRectGetMidX(frame) < rootW * 0.55 || CGRectGetMidY(frame) < rootH * 0.45) return NO;
+
+    NSString *text = BHTTextForFloatingCandidate(view);
+    BOOL namedCompose =
+        [text containsString:@"compose"] ||
+        [text containsString:@"tweet"] ||
+        [text containsString:@"post"] ||
+        [text containsString:@"ツイート"] ||
+        [text containsString:@"ポスト"] ||
+        [text containsString:@"投稿"];
+    BOOL circular = view.layer.cornerRadius >= MIN(frame.size.width, frame.size.height) * 0.35;
+    BOOL bottomRight = CGRectGetMinX(frame) > rootW * 0.60 && CGRectGetMinY(frame) > rootH * 0.55;
+    return namedCompose || (circular && bottomRight);
+}
+
+static NSInteger BHTSetFloatingComposeButtonsHiddenInView(UIView *view, UIView *root, BOOL hidden, NSInteger depth) {
+    if (!view || !root || depth > 14) return 0;
+    NSInteger count = 0;
+    if (hidden) {
+        if (BHTLooksLikeFloatingComposeButton(view, root)) {
+            BHTSetColumnsFloatingViewHidden(view, YES);
+            count++;
+            return count;
+        }
+    } else {
+        if (objc_getAssociatedObject(view, &kBHTColumnsHiddenFloatingSavedKey)) {
+            BHTSetColumnsFloatingViewHidden(view, NO);
+            count++;
+        }
+    }
+    for (UIView *subview in view.subviews) {
+        count += BHTSetFloatingComposeButtonsHiddenInView(subview, root, hidden, depth + 1);
+    }
+    return count;
+}
+
+static NSInteger BHTSetFloatingComposeButtonsHiddenForColumns(BOOL hidden) {
+    NSInteger count = 0;
+    UIViewController *host = gBHTColumnsHostController;
+    if (host.view) count += BHTSetFloatingComposeButtonsHiddenInView(host.view, host.view, hidden, 0);
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (!window.hidden && window.alpha > 0.01) {
+            count += BHTSetFloatingComposeButtonsHiddenInView(window, window, hidden, 0);
+        }
+    }
+    return count;
+}
+
 static void BHTBringTabChromeToFront(UIViewController *tabBarController) {
     NSArray *tabViews = nil;
     @try {
@@ -4384,6 +4502,11 @@ static UIViewController *BHTFindHomeContainerController(UIViewController *root, 
 
 static void BHTLayoutColumnsOverlay(void) {
     UIViewController *host = gBHTColumnsHostController;
+    if (gBHTColumnsWindow && gBHTColumnsNavigationController) {
+        gBHTColumnsWindow.frame = gBHTColumnsPreviousKeyWindow ? gBHTColumnsPreviousKeyWindow.bounds : UIScreen.mainScreen.bounds;
+        gBHTColumnsNavigationController.view.frame = gBHTColumnsWindow.bounds;
+        return;
+    }
     if (!host || !gBHTColumnsOverlayView || !gBHTColumnsNavigationController) return;
     gBHTColumnsOverlayView.frame = BHTColumnsContentFrameForHost(host);
     gBHTColumnsNavigationController.view.frame = gBHTColumnsOverlayView.bounds;
@@ -4404,9 +4527,16 @@ void BHTDismissColumnsMode(void) {
         [gBHTColumnsNavigationController removeFromParentViewController];
     }
     [gBHTColumnsOverlayView removeFromSuperview];
+    [gBHTColumnsWindow resignKeyWindow];
+    gBHTColumnsWindow.hidden = YES;
+    gBHTColumnsWindow.rootViewController = nil;
+    UIWindow *previousWindow = gBHTColumnsPreviousKeyWindow;
     gBHTColumnsNavigationController = nil;
     gBHTColumnsOverlayView = nil;
     gBHTColumnsHostController = nil;
+    gBHTColumnsWindow = nil;
+    gBHTColumnsPreviousKeyWindow = nil;
+    if (previousWindow && !previousWindow.hidden) [previousWindow makeKeyWindow];
     if (host) BHTUpdateColumnsTabSelection(host, NO);
 }
 
@@ -4416,19 +4546,23 @@ NSString *BHTColumnsModeDiagnostic(void) {
     CGRect contentFrame = host && host.view ? BHTColumnsContentFrameForHost(host) : CGRectZero;
     NSArray<UIView *> *tabs = host ? BHTAllTabViewsForController(host) : @[];
     return [NSString stringWithFormat:
-        @"separateColumns overlay=%d overlayWindow=%d host=%@ nav=%@ frame=(%.1f,%.1f,%.1f,%.1f) contentFrame=(%.1f,%.1f,%.1f,%.1f) tabs=%lu\n",
+        @"separateColumns overlay=%d overlayWindow=%d dedicatedWindow=%d host=%@ nav=%@ frame=(%.1f,%.1f,%.1f,%.1f) contentFrame=(%.1f,%.1f,%.1f,%.1f) tabs=%lu\n",
         gBHTColumnsOverlayView ? 1 : 0,
-        (gBHTColumnsOverlayView && gBHTColumnsOverlayView.window) ? 1 : 0,
+        (gBHTColumnsOverlayView && gBHTColumnsOverlayView.window) || (gBHTColumnsWindow && !gBHTColumnsWindow.hidden) ? 1 : 0,
+        (gBHTColumnsWindow && !gBHTColumnsWindow.hidden) ? 1 : 0,
         host ? NSStringFromClass(host.class) : @"(nil)",
         gBHTColumnsNavigationController ? NSStringFromClass(gBHTColumnsNavigationController.class) : @"(nil)",
-        overlayFrame.origin.x, overlayFrame.origin.y, overlayFrame.size.width, overlayFrame.size.height,
+        gBHTColumnsWindow ? gBHTColumnsWindow.frame.origin.x : overlayFrame.origin.x,
+        gBHTColumnsWindow ? gBHTColumnsWindow.frame.origin.y : overlayFrame.origin.y,
+        gBHTColumnsWindow ? gBHTColumnsWindow.frame.size.width : overlayFrame.size.width,
+        gBHTColumnsWindow ? gBHTColumnsWindow.frame.size.height : overlayFrame.size.height,
         contentFrame.origin.x, contentFrame.origin.y, contentFrame.size.width, contentFrame.size.height,
         (unsigned long)tabs.count];
 }
 
 static void BHTShowColumnsOverlayOnTabBar(UIViewController *tabBarController) {
     if (!tabBarController || !tabBarController.view.window) return;
-    if (gBHTColumnsNavigationController && gBHTColumnsHostController == tabBarController) {
+    if (gBHTColumnsWindow && gBHTColumnsNavigationController) {
         BHTLayoutColumnsOverlay();
         BHTUpdateColumnsTabSelection(tabBarController, YES);
         return;
@@ -4454,20 +4588,26 @@ static void BHTShowColumnsOverlayOnTabBar(UIViewController *tabBarController) {
     nav.view.backgroundColor = UIColor.systemBackgroundColor;
     nav.navigationBar.translucent = NO;
 
-    UIView *overlay = [[UIView alloc] initWithFrame:tabBarController.view.bounds];
-    overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    overlay.backgroundColor = UIColor.systemBackgroundColor;
-    overlay.userInteractionEnabled = YES;
+    UIWindow *baseWindow = tabBarController.view.window ?: BHT_activeKeyWindow();
+    UIWindow *columnsWindow = nil;
+    if (@available(iOS 13.0, *)) {
+        if (baseWindow.windowScene) columnsWindow = [[UIWindow alloc] initWithWindowScene:baseWindow.windowScene];
+    }
+    CGRect windowFrame = baseWindow ? baseWindow.bounds : UIScreen.mainScreen.bounds;
+    if (!columnsWindow) columnsWindow = [[UIWindow alloc] initWithFrame:windowFrame];
+    columnsWindow.frame = windowFrame;
+    columnsWindow.windowLevel = MAX(baseWindow.windowLevel + 10.0, UIWindowLevelAlert + 2.0);
+    columnsWindow.backgroundColor = UIColor.systemBackgroundColor;
+    columnsWindow.rootViewController = nav;
+    columnsWindow.hidden = NO;
 
-    [tabBarController addChildViewController:nav];
-    [overlay addSubview:nav.view];
-    [tabBarController.view addSubview:overlay];
-    [nav didMoveToParentViewController:tabBarController];
-
-    gBHTColumnsOverlayView = overlay;
+    gBHTColumnsPreviousKeyWindow = baseWindow;
+    gBHTColumnsWindow = columnsWindow;
     gBHTColumnsNavigationController = nav;
     gBHTColumnsHostController = tabBarController;
+    gBHTColumnsOverlayView = nil;
     NFBSetInlineColumnsEnabled(NO);
+    [columnsWindow makeKeyAndVisible];
     BHTLayoutColumnsOverlay();
     BHTUpdateColumnsTabSelection(tabBarController, YES);
 }
