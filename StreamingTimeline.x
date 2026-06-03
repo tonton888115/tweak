@@ -1501,6 +1501,25 @@ static void nfb_setColumnsSegmentedHiddenForPaging(UIViewController *paging, BOO
     }
 }
 
+// Hide the Home segment bar (おすすめ / フォロー中 / pinned-list tabs) while columns mode is on by
+// targeting TFNScrollingSegmentedViewController's own scrolling control directly, instead of the
+// frame/text heuristics that were latching onto the wrong full-screen view. Runs from the
+// segmented controller's layout pass, so it stays hidden even when the columns layout can't
+// finish yet. Gated to the Home instance and reuses the save/restore used by the rest of chrome.
+static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC) {
+    if (!segmentedVC || ![segmentedVC isViewLoaded]) return;
+    if (!nfb_parentControllerNamed(segmentedVC, @"HomeTimelineContainer")) return; // Home only
+    UIView *bar = nil;
+    for (NSString *key in @[@"_segmentedControl", @"segmentedControl", @"_headerView", @"headerView"]) {
+        @try {
+            id value = [segmentedVC valueForKey:key];
+            if ([value isKindOfClass:UIView.class]) { bar = (UIView *)value; break; }
+        } @catch (NSException *e) {}
+    }
+    if (!bar || nfb_columnsProtectedView(bar) || nfb_viewContainsColumnsPagingSurface(bar, 0)) return;
+    nfb_setColumnsChromeViewHidden(bar, gInlineColumnsEnabled);
+}
+
 static UIView *nfb_columnsHostViewForPaging(UIViewController *paging) {
     UIViewController *container = nfb_parentControllerNamed(paging, @"HomeTimelineContainer");
     if (container && [container isViewLoaded]) return container.view;
@@ -1555,7 +1574,10 @@ static void nfb_removeColumnsOverlay(void) {
     gColumnsAllTopButton = nil;
     gColumnsOverlayPages = nil;
     gPendingNewTweetsVC = nil;
-    nfb_setColumnsGlobalTopChromeHidden(NO);
+    // Only un-hide the top chrome when columns mode is actually being turned off. The layout
+    // routine calls this on its retry/early-out path even while columns mode is still enabled
+    // (e.g. pages not ready yet); restoring the segment bar there made it flash back on screen.
+    if (!gInlineColumnsEnabled) nfb_setColumnsGlobalTopChromeHidden(NO);
     nfb_hideNewTweetsPill();
 }
 
@@ -2117,6 +2139,18 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_noteActiveTimelineScroll(scrollView); nfb_visibilityForScroll(scrollView); }
 %end
 
+// Pinned-list timelines (ニコニコ / 投資) are hosted by T1URTViewController inside the Home paging
+// surface and never reach the home items VC scroll hook, so the stream state icon kept reading
+// "paused" even when the list sat at the very top. Refresh straight from the list's own scroll,
+// but only when it belongs to the Home surface so unrelated URT screens are unaffected.
+%hook T1URTViewController
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView {
+    %orig;
+    if (!nfb_parentControllerNamed(self, @"HomeTimelineContainer")) return;
+    nfb_visibilityForScroll(scrollView);
+}
+%end
+
 %hook TFNPagingViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
@@ -2143,6 +2177,14 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 %end
 
 %hook TFNScrollingSegmentedViewController
+- (void)viewWillAppear:(BOOL)animated {
+    %orig(animated);
+    nfb_applyColumnsSegmentedControlHidden(self);
+}
+- (void)viewDidLayoutSubviews {
+    %orig;
+    nfb_applyColumnsSegmentedControlHidden(self);
+}
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
     %orig(size, coordinator);
     if (!gInlineColumnsEnabled) return;

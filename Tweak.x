@@ -33,6 +33,10 @@ void BHTDismissColumnsMode(void);
 NSString *BHTColumnsModeDiagnostic(void);
 static BOOL gBHTSelectingHomeForColumns = NO;
 static BOOL gBHTApplyingColumnsTabSelection = NO;
+// Single source of truth for whether columns mode should currently be on. Present sets it YES,
+// dismiss sets it NO. All deferred re-enable work must check this so a quick Home tap right after
+// Communities can't be overridden by a stale "enable columns" block firing 0.4-0.9s later.
+static BOOL gBHTColumnsIntent = NO;
 static BOOL BHTIsColumnsPageID(NSString *page);
 static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSelected);
 
@@ -4523,6 +4527,8 @@ void BHTDismissColumnsMode(void) {
         dispatch_async(dispatch_get_main_queue(), ^{ BHTDismissColumnsMode(); });
         return;
     }
+    gBHTColumnsIntent = NO;
+    gBHTSelectingHomeForColumns = NO;
     NFBSetInlineColumnsEnabled(NO);
     UIViewController *host = gBHTColumnsHostController;
     if (gBHTColumnsNavigationController) {
@@ -4621,6 +4627,7 @@ void BHTPresentColumnsMode(void) {
         dispatch_async(dispatch_get_main_queue(), ^{ BHTPresentColumnsMode(); });
         return;
     }
+    gBHTColumnsIntent = YES;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (now - gBHTLastColumnsOpen < 0.20) {
         NFBSetInlineColumnsEnabled(YES);
@@ -4654,15 +4661,18 @@ void BHTPresentColumnsMode(void) {
     gBHTSelectingHomeForColumns = YES;
     if (tabBarController) BHTSelectTabPage(window.rootViewController, @"home");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!gBHTColumnsIntent) return;
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gBHTSelectingHomeForColumns = NO;
+        if (!gBHTColumnsIntent) return;
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
-        gBHTSelectingHomeForColumns = NO;
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.90 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!gBHTColumnsIntent) return;
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
     });
