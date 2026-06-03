@@ -1508,9 +1508,12 @@ static NSInteger nfb_setColumnsGlobalTopChromeHiddenInView(UIView *view, UIView 
     if (hidden && nfb_columnsPagingSurface(view)) return 0;
     NSInteger count = 0;
     if (hidden && nfb_globalTopColumnsChromeCandidate(view, root)) {
-        if (nfb_viewLooksLikeHomeSegmentBar(view, root)) {
+        // Capture the bar height ONCE and lock it. Re-capturing each pass made it flip 44<->0
+        // (44 when detected, 0 when not), so the column shift flickered and the content/gap jumped
+        // mid-swipe. A stable value keeps every column pinned at the same offset.
+        if (gColumnsHiddenBarHeight < 1.0 && nfb_viewLooksLikeHomeSegmentBar(view, root)) {
             CGRect bf = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
-            if (bf.size.height > 1.0) gColumnsHiddenBarHeight = bf.size.height;   // remember for gap-closing
+            if (bf.size.height > 1.0) gColumnsHiddenBarHeight = bf.size.height;
         }
         nfb_setColumnsChromeViewHidden(view, YES);
         return 1;
@@ -1573,8 +1576,10 @@ static UIView *nfb_columnsHostViewForPaging(UIViewController *paging) {
 }
 
 static CGFloat nfb_columnsColumnWidth(CGFloat viewportWidth) {
-    CGFloat columnWidth = viewportWidth >= 700.0 ? 340.0 : MIN(viewportWidth, 390.0);
-    return MAX(320.0, MIN(390.0, columnWidth));
+    // Fixed 340pt columns; how many are visible varies with the content-area width (iPhone ~1,
+    // iPad central column ~2-3) and the rest are reached by horizontal scroll. Never exceed the
+    // viewport so a single column always fits on very narrow widths.
+    return MIN(340.0, MAX(200.0, viewportWidth));
 }
 
 static void nfb_rememberColumnOriginalViewState(UIView *view) {
@@ -1675,8 +1680,10 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     NSInteger estimatedPages = nfb_estimatedHomePagingPageCount(paging);
     NSInteger expectedColumns = MAX(1, estimatedPages - 1);
     if (!pages.count) {
+        // Transient empties happen during iPad split-view resizes (the content VC is rebuilt for a
+        // moment). Tearing the columns down here made them vanish on every resize. Keep whatever is
+        // laid out and just retry the preload; restore only happens when columns mode is turned off.
         static NSTimeInterval lastColumnsPageRetry = 0.0;
-        nfb_removeColumnsOverlay();
         NSTimeInterval now = CACurrentMediaTime();
         if (now - lastColumnsPageRetry > 0.75) {
             lastColumnsPageRetry = now;
