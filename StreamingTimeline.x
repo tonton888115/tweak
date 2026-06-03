@@ -1814,6 +1814,24 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         nfb_kickEmptyColumnLoad(page);
         idx++;
     }
+    // Record the columns layout state (only when it CHANGES) so UI breakage / scroll catching is
+    // visible in the recorded log: column frames flipping or contentSize flapping mid-drag = Twitter's
+    // paging layout fighting ours. The live offset is logged for context but excluded from the
+    // change-key, so plain scrolling doesn't flood the log.
+    if (gNFBLogRecording) {
+        BOOL drag = nativeScrollView.isDragging || nativeScrollView.isTracking || nativeScrollView.isDecelerating;
+        NSMutableString *key = [NSMutableString stringWithFormat:@"pages=%lu w=%.0f drag=%d content=%.0f", (unsigned long)pages.count, columnWidth, drag ? 1 : 0, nativeScrollView.contentSize.width];
+        NSUInteger ci = 0;
+        for (UIViewController *p in pages) {
+            if ([p isViewLoaded]) { CGRect f = p.view.frame; [key appendFormat:@" c%lu=(%.0f,%.0f,%.0f,%.0f)", (unsigned long)ci, f.origin.x, f.origin.y, f.size.width, f.size.height]; }
+            ci++;
+        }
+        static NSString *lastLayoutKey = nil;
+        if (![key isEqualToString:lastLayoutKey]) {
+            lastLayoutKey = [key copy];
+            NFBLogEvent([NSString stringWithFormat:@"layout %@ off=%.0f", key, nativeScrollView.contentOffset.x]);
+        }
+    }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
 }
 
