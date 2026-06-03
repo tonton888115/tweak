@@ -666,6 +666,9 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
         if ([tabView respondsToSelector:@selector(bh_setupColumnsTabIfNeeded)]) {
             [tabView performSelector:@selector(bh_setupColumnsTabIfNeeded)];
         }
+        if ([tabView respondsToSelector:@selector(bh_setupHomeTabIfNeeded)]) {
+            [tabView performSelector:@selector(bh_setupHomeTabIfNeeded)];
+        }
     }
 }
 %end
@@ -4163,6 +4166,7 @@ static char kManualRefreshInProgressKey;
 
 // MARK: - Classic Tab Bar Icon Theming
 static char kBHTColumnsTapGestureKey;
+static char kBHTHomeTapGestureKey;
 static NSTimeInterval gBHTLastColumnsOpen = 0;
 static UIView *gBHTColumnsOverlayView = nil;
 static UIViewController *gBHTColumnsNavigationController = nil;
@@ -4753,6 +4757,31 @@ static void BHTPresentColumnsViewController(void) {
     }
 }
 
+// Columns mode reuses the Home paging surface, so the *real* selected tab is already Home — tapping
+// Home is a re-tap that never fires setSelectedIndex:, and touchesEnded didn't catch it reliably.
+// Use the same UITapGestureRecognizer mechanism that already works for the columns tab.
+%new
+- (void)bh_setupHomeTabIfNeeded {
+    if (!BHTIsHomeTabView((T1TabView *)self)) return;
+    if (!objc_getAssociatedObject(self, &kBHTHomeTapGestureKey)) {
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bh_homeTapped:)];
+        tap.cancelsTouchesInView = NO;
+        tap.delaysTouchesBegan = NO;
+        tap.delaysTouchesEnded = NO;
+        [self addGestureRecognizer:tap];
+        objc_setAssociatedObject(self, &kBHTHomeTapGestureKey, tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+%new
+- (void)bh_homeTapped:(UITapGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateEnded) return;
+    if (!gBHTColumnsIntent) return;   // only act when columns mode is on; otherwise leave Home alone
+    BHTDismissColumnsMode();
+    UIWindow *window = BHT_activeKeyWindow();
+    if (window.rootViewController) BHTUpdateColumnsTabSelection(window.rootViewController, NO);
+}
+
 - (BOOL)_t1_showsTitle {
     if ([BHTManager restoreTabLabels]) {
         return true;
@@ -4821,6 +4850,7 @@ static void BHTPresentColumnsViewController(void) {
 - (void)didMoveToWindow {
     %orig;
     [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
+    [self performSelector:@selector(bh_setupHomeTabIfNeeded)];
 }
 
 %end

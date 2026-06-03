@@ -1340,6 +1340,7 @@ static UIScrollView *gColumnsOverlayScrollView = nil;
 static UIButton *gColumnsAllTopButton = nil;
 static NSArray<UIViewController *> *gColumnsOverlayPages = nil;
 static char kNFBColumnLoadKickedKey;
+static CGFloat gColumnsHiddenBarHeight = 0.0;   // height of the hidden home segment bar, for gap-closing
 
 static BOOL nfb_isHomePagingController(UIViewController *vc) {
     return nfb_parentControllerNamed(vc, @"HomeTimelineContainer") != nil;
@@ -1507,6 +1508,10 @@ static NSInteger nfb_setColumnsGlobalTopChromeHiddenInView(UIView *view, UIView 
     if (hidden && nfb_columnsPagingSurface(view)) return 0;
     NSInteger count = 0;
     if (hidden && nfb_globalTopColumnsChromeCandidate(view, root)) {
+        if (nfb_viewLooksLikeHomeSegmentBar(view, root)) {
+            CGRect bf = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+            if (bf.size.height > 1.0) gColumnsHiddenBarHeight = bf.size.height;   // remember for gap-closing
+        }
         nfb_setColumnsChromeViewHidden(view, YES);
         return 1;
     }
@@ -1662,6 +1667,10 @@ static void nfb_kickEmptyColumnLoad(UIViewController *page) {
 
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    // Re-laying-out mid-swipe resets contentSize/frames and makes the horizontal slide stop dead.
+    // While the user is actively dragging the columns, leave it alone; it re-applies once settled.
+    UIScrollView *activeColumnsScroll = nfb_horizontalPagingScrollViewOf(paging);
+    if (activeColumnsScroll && (activeColumnsScroll.isDragging || activeColumnsScroll.isTracking || activeColumnsScroll.isDecelerating)) return;
     NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
     NSInteger estimatedPages = nfb_estimatedHomePagingPageCount(paging);
     NSInteger expectedColumns = MAX(1, estimatedPages - 1);
@@ -1703,7 +1712,9 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nfb_rememberInlineColumnsOriginals(nativeScrollView);
     nativeScrollView.pagingEnabled = NO;
     nativeScrollView.alwaysBounceHorizontal = YES;
-    nativeScrollView.showsHorizontalScrollIndicator = YES;
+    // The horizontal indicator floated mid-screen (big bottom inset) and looked like a stray bar; the
+    // side-by-side columns already make horizontal scrollability obvious, so hide it.
+    nativeScrollView.showsHorizontalScrollIndicator = NO;
     nativeScrollView.clipsToBounds = YES;
     nativeScrollView.directionalLockEnabled = YES;
     nativeScrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, bounds.size.width + 1.0), height);
@@ -1734,7 +1745,10 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         if (pageView.superview != nativeScrollView) [nativeScrollView addSubview:pageView];
         pageView.hidden = NO;
         pageView.alpha = 1.0;
-        pageView.frame = CGRectMake(columnWidth * idx, 0.0, columnWidth, height);
+        // Shift the column up by the hidden segment bar's height so the table content fills the gap
+        // the bar left behind. We keep the table's own contentInset, so the at-top math is unchanged.
+        CGFloat topShift = MIN(MAX(gColumnsHiddenBarHeight, 0.0), 80.0);
+        pageView.frame = CGRectMake(columnWidth * idx, -topShift, columnWidth, height + topShift);
         pageView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
         [pageView setNeedsLayout];
         [pageView layoutIfNeeded];
