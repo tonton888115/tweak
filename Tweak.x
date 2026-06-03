@@ -4187,6 +4187,20 @@ static BOOL BHTIsColumnsTabView(T1TabView *tabView) {
     return [title isEqualToString:BHTColumnsTabTitle()] || [title containsString:@"カラム"] || [lower containsString:@"columns"];
 }
 
+static BOOL BHTIsHomeTabView(T1TabView *tabView) {
+    NSString *page = BHTPageOfTabView(tabView);
+    if ([page isEqualToString:@"home"]) return YES;
+    NSString *title = nil;
+    @try {
+        UILabel *titleLabel = [tabView valueForKey:@"titleLabel"];
+        title = titleLabel.text ?: tabView.accessibilityLabel;
+    } @catch (NSException *e) {
+        title = tabView.accessibilityLabel;
+    }
+    NSString *lower = title.lowercaseString;
+    return [title containsString:@"ホーム"] || [lower isEqualToString:@"home"];
+}
+
 static UIViewController *BHTFindControllerOfClass(UIViewController *root, Class targetClass, NSInteger depth) {
     if (!root || !targetClass || depth > 12) return nil;
     if ([root isKindOfClass:targetClass]) return root;
@@ -4410,16 +4424,25 @@ static void BHTPresentColumnsViewController(void) {
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     BOOL isColumns = BHTIsColumnsTabView((T1TabView *)self);
-    BOOL isHome = [BHTPageOfTabView((T1TabView *)self) isEqualToString:@"home"];
-    %orig(touches, event);
+    BOOL isHome = BHTIsHomeTabView((T1TabView *)self);
     if (isColumns) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            BHTPresentColumnsViewController();
-        });
-    } else if (isHome) {
+        BHTPresentColumnsViewController();
+        return;
+    }
+    if (isHome) {
         NFBSetInlineColumnsEnabled(NO);
         UIWindow *window = BHT_activeKeyWindow();
         BHTUpdateColumnsTabSelection(window.rootViewController, NO);
+    }
+    %orig(touches, event);
+    if (isHome) {
+        NFBSetInlineColumnsEnabled(NO);
+        UIWindow *window = BHT_activeKeyWindow();
+        BHTUpdateColumnsTabSelection(window.rootViewController, NO);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            NFBSetInlineColumnsEnabled(NO);
+            BHTUpdateColumnsTabSelection(window.rootViewController, NO);
+        });
     }
 }
 
