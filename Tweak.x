@@ -4303,15 +4303,34 @@ static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSel
 
     gBHTApplyingColumnsTabSelection = YES;
     @try {
+        // On revert, highlight whatever tab the bar ACTUALLY has selected, so the faked
+        // "communities=YES / home=NO" state can't desync the bar and strand navigation after the
+        // user leaves to another tab and comes back.
+        NSInteger realSelected = -1;
+        if (!columnsSelected) {
+            @try {
+                NSNumber *si = [tabBarController valueForKey:@"selectedIndex"];
+                if ([si respondsToSelector:@selector(integerValue)]) realSelected = si.integerValue;
+            } @catch (NSException *e) {}
+        }
+        NSInteger idx = 0;
         for (id tabView in tabViews) {
             NSString *page = BHTPageOfTabView((T1TabView *)tabView);
             BOOL isColumns = BHTIsColumnsTabView((T1TabView *)tabView);
-            BOOL shouldSelect = isColumns ? columnsSelected : NO;
-            if (columnsSelected && [page isEqualToString:@"home"]) shouldSelect = NO;
-            if (!columnsSelected && !isColumns) continue;
+            BOOL shouldSelect;
+            if (columnsSelected) {
+                shouldSelect = isColumns ? YES : NO;
+                if ([page isEqualToString:@"home"]) shouldSelect = NO;
+            } else if (realSelected >= 0) {
+                shouldSelect = (idx == realSelected);
+            } else {
+                if (!isColumns) { idx++; continue; }
+                shouldSelect = NO;
+            }
             if ([tabView respondsToSelector:@selector(setSelected:)]) {
                 ((void (*)(id, SEL, BOOL))objc_msgSend)(tabView, @selector(setSelected:), shouldSelect);
             }
+            idx++;
         }
     } @finally {
         gBHTApplyingColumnsTabSelection = NO;
@@ -4779,7 +4798,10 @@ static void BHTPresentColumnsViewController(void) {
     if (!gBHTColumnsIntent) return;   // only act when columns mode is on; otherwise leave Home alone
     BHTDismissColumnsMode();
     UIWindow *window = BHT_activeKeyWindow();
-    if (window.rootViewController) BHTUpdateColumnsTabSelection(window.rootViewController, NO);
+    if (window.rootViewController) {
+        BHTUpdateColumnsTabSelection(window.rootViewController, NO);
+        BHTSelectTabPage(window.rootViewController, @"home");   // force back to real Home (recover from a stuck state)
+    }
 }
 
 - (BOOL)_t1_showsTitle {

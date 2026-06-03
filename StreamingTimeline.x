@@ -1672,10 +1672,12 @@ static void nfb_kickEmptyColumnLoad(UIViewController *page) {
 
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
-    // Re-laying-out mid-swipe resets contentSize/frames and makes the horizontal slide stop dead.
-    // While the user is actively dragging the columns, leave it alone; it re-applies once settled.
+    // Twitter's own paging layout runs in %orig (before us) on every pass and snaps the pages back
+    // to full-width paging positions. We must ALWAYS re-apply the column frames so that snap can't
+    // win mid-drag (that was the "catch and bounce back"). Only the contentSize/contentOffset
+    // mutations are skipped while dragging, since those genuinely interrupt the in-flight scroll.
     UIScrollView *activeColumnsScroll = nfb_horizontalPagingScrollViewOf(paging);
-    if (activeColumnsScroll && (activeColumnsScroll.isDragging || activeColumnsScroll.isTracking || activeColumnsScroll.isDecelerating)) return;
+    BOOL columnsScrollDragging = activeColumnsScroll && (activeColumnsScroll.isDragging || activeColumnsScroll.isTracking || activeColumnsScroll.isDecelerating);
     NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
     NSInteger estimatedPages = nfb_estimatedHomePagingPageCount(paging);
     NSInteger expectedColumns = MAX(1, estimatedPages - 1);
@@ -1724,10 +1726,14 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nativeScrollView.showsHorizontalScrollIndicator = NO;
     nativeScrollView.clipsToBounds = YES;
     nativeScrollView.directionalLockEnabled = YES;
-    nativeScrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, bounds.size.width + 1.0), height);
-    CGFloat maxOffsetX = MAX(0.0, nativeScrollView.contentSize.width - bounds.size.width);
-    if (nativeScrollView.contentOffset.x > maxOffsetX) {
-        [nativeScrollView setContentOffset:CGPointMake(maxOffsetX, nativeScrollView.contentOffset.y) animated:NO];
+    if (!columnsScrollDragging) {
+        // contentSize / offset changes interrupt an in-progress horizontal scroll — only touch them
+        // when the user isn't actively dragging. The page frames below are re-applied every pass.
+        nativeScrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, bounds.size.width + 1.0), height);
+        CGFloat maxOffsetX = MAX(0.0, nativeScrollView.contentSize.width - bounds.size.width);
+        if (nativeScrollView.contentOffset.x > maxOffsetX) {
+            [nativeScrollView setContentOffset:CGPointMake(maxOffsetX, nativeScrollView.contentOffset.y) animated:NO];
+        }
     }
     if (host && gColumnsAllTopButton) {
         CGRect hostBounds = host.bounds;
