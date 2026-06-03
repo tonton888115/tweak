@@ -30,6 +30,7 @@
 extern void NFBSetInlineColumnsEnabled(BOOL enabled);
 void BHTPresentColumnsMode(void);
 void BHTDismissColumnsMode(void);
+NSString *BHTColumnsModeDiagnostic(void);
 static BOOL gBHTSelectingHomeForColumns = NO;
 static BOOL gBHTApplyingColumnsTabSelection = NO;
 static BOOL BHTIsColumnsPageID(NSString *page);
@@ -4266,16 +4267,20 @@ static void BHTSelectTabPage(UIViewController *root, NSString *pageID) {
     }
 }
 
+static NSArray<UIView *> *BHTAllTabViewsForController(UIViewController *controller);
+
 static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSelected) {
     Class tabBarClass = NSClassFromString(@"T1TabBarViewController");
     if (!root || !tabBarClass) return;
     UIViewController *tabBarController = [root isKindOfClass:tabBarClass] ? root : BHTFindControllerOfClass(root, tabBarClass, 0);
+    if (!tabBarController) tabBarController = root;
     NSArray *tabViews = nil;
     @try {
         tabViews = [tabBarController valueForKey:@"tabViews"];
     } @catch (NSException *e) {
         tabViews = nil;
     }
+    if (!tabViews.count) tabViews = BHTAllTabViewsForController(tabBarController);
     if (!tabViews.count) return;
 
     gBHTApplyingColumnsTabSelection = YES;
@@ -4295,6 +4300,48 @@ static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSel
     }
 }
 
+static void BHTCollectTabViewsInView(UIView *view, NSMutableArray<UIView *> *tabViews, NSInteger depth) {
+    if (!view || depth > 14) return;
+    Class tabClass = NSClassFromString(@"T1TabView");
+    BOOL isTab = (tabClass && [view isKindOfClass:tabClass]) || [NSStringFromClass(view.class) isEqualToString:@"T1TabView"];
+    if (isTab) [tabViews addObject:view];
+    for (UIView *subview in view.subviews) {
+        BHTCollectTabViewsInView(subview, tabViews, depth + 1);
+    }
+}
+
+static NSArray<UIView *> *BHTAllTabViewsForController(UIViewController *controller) {
+    NSMutableArray<UIView *> *result = [NSMutableArray array];
+    NSArray *tabViews = nil;
+    @try {
+        tabViews = [controller valueForKey:@"tabViews"];
+    } @catch (NSException *e) {
+        tabViews = nil;
+    }
+    for (id tabView in tabViews) {
+        if ([tabView isKindOfClass:UIView.class]) [result addObject:tabView];
+    }
+    if (controller.view) BHTCollectTabViewsInView(controller.view, result, 0);
+    return result;
+}
+
+static CGRect BHTColumnsContentFrameForHost(UIViewController *host) {
+    CGRect frame = host.view.bounds;
+    NSArray<UIView *> *tabViews = BHTAllTabViewsForController(host);
+    CGFloat minTabY = CGFLOAT_MAX;
+    for (UIView *tabView in tabViews) {
+        if (!tabView.window || tabView.hidden || tabView.alpha < 0.01) continue;
+        CGRect converted = [tabView.superview convertRect:tabView.frame toView:host.view];
+        if (CGRectGetMinY(converted) > CGRectGetHeight(host.view.bounds) * 0.45) {
+            minTabY = MIN(minTabY, CGRectGetMinY(converted));
+        }
+    }
+    if (minTabY != CGFLOAT_MAX && minTabY > 120.0) {
+        frame.size.height = MAX(0.0, minTabY);
+    }
+    return frame;
+}
+
 static void BHTBringTabChromeToFront(UIViewController *tabBarController) {
     NSArray *tabViews = nil;
     @try {
@@ -4303,8 +4350,10 @@ static void BHTBringTabChromeToFront(UIViewController *tabBarController) {
         tabViews = nil;
     }
     NSMutableSet<UIView *> *containers = [NSMutableSet set];
-    for (id tabView in tabViews) {
-        UIView *view = [tabView isKindOfClass:UIView.class] ? (UIView *)tabView : nil;
+    NSMutableArray<UIView *> *allTabs = [NSMutableArray array];
+    for (id tabView in tabViews) if ([tabView isKindOfClass:UIView.class]) [allTabs addObject:tabView];
+    if (tabBarController.view) BHTCollectTabViewsInView(tabBarController.view, allTabs, 0);
+    for (UIView *view in allTabs) {
         if (!view || !view.superview) continue;
         UIView *container = view.superview;
         if (container == tabBarController.view) {
@@ -4336,7 +4385,7 @@ static UIViewController *BHTFindHomeContainerController(UIViewController *root, 
 static void BHTLayoutColumnsOverlay(void) {
     UIViewController *host = gBHTColumnsHostController;
     if (!host || !gBHTColumnsOverlayView || !gBHTColumnsNavigationController) return;
-    gBHTColumnsOverlayView.frame = host.view.bounds;
+    gBHTColumnsOverlayView.frame = BHTColumnsContentFrameForHost(host);
     gBHTColumnsNavigationController.view.frame = gBHTColumnsOverlayView.bounds;
     [host.view bringSubviewToFront:gBHTColumnsOverlayView];
     BHTBringTabChromeToFront(host);
@@ -4359,6 +4408,22 @@ void BHTDismissColumnsMode(void) {
     gBHTColumnsOverlayView = nil;
     gBHTColumnsHostController = nil;
     if (host) BHTUpdateColumnsTabSelection(host, NO);
+}
+
+NSString *BHTColumnsModeDiagnostic(void) {
+    UIViewController *host = gBHTColumnsHostController;
+    CGRect overlayFrame = gBHTColumnsOverlayView ? gBHTColumnsOverlayView.frame : CGRectZero;
+    CGRect contentFrame = host && host.view ? BHTColumnsContentFrameForHost(host) : CGRectZero;
+    NSArray<UIView *> *tabs = host ? BHTAllTabViewsForController(host) : @[];
+    return [NSString stringWithFormat:
+        @"separateColumns overlay=%d overlayWindow=%d host=%@ nav=%@ frame=(%.1f,%.1f,%.1f,%.1f) contentFrame=(%.1f,%.1f,%.1f,%.1f) tabs=%lu\n",
+        gBHTColumnsOverlayView ? 1 : 0,
+        (gBHTColumnsOverlayView && gBHTColumnsOverlayView.window) ? 1 : 0,
+        host ? NSStringFromClass(host.class) : @"(nil)",
+        gBHTColumnsNavigationController ? NSStringFromClass(gBHTColumnsNavigationController.class) : @"(nil)",
+        overlayFrame.origin.x, overlayFrame.origin.y, overlayFrame.size.width, overlayFrame.size.height,
+        contentFrame.origin.x, contentFrame.origin.y, contentFrame.size.width, contentFrame.size.height,
+        (unsigned long)tabs.count];
 }
 
 static void BHTShowColumnsOverlayOnTabBar(UIViewController *tabBarController) {
@@ -4419,17 +4484,18 @@ void BHTPresentColumnsMode(void) {
     UIWindow *window = BHT_activeKeyWindow();
     if (!window.rootViewController) return;
     UIViewController *tabBarController = BHTFindControllerOfClass(window.rootViewController, NSClassFromString(@"T1TabBarViewController"), 0);
-    if (!tabBarController) return;
+    UIViewController *hostController = tabBarController ?: window.rootViewController;
+    if (!hostController || !hostController.view) return;
 
     gBHTSelectingHomeForColumns = YES;
-    BHTSelectTabPage(window.rootViewController, @"home");
+    if (tabBarController) BHTSelectTabPage(window.rootViewController, @"home");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        BHTShowColumnsOverlayOnTabBar(tabBarController);
+        BHTShowColumnsOverlayOnTabBar(hostController);
         gBHTSelectingHomeForColumns = NO;
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         BHTLayoutColumnsOverlay();
-        BHTUpdateColumnsTabSelection(tabBarController, YES);
+        BHTUpdateColumnsTabSelection(hostController, YES);
         gBHTSelectingHomeForColumns = NO;
     });
 }
@@ -4598,6 +4664,17 @@ static void BHTPresentColumnsViewController(void) {
         }
     }
 }
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    if (gBHTColumnsHostController == (UIViewController *)self) {
+        BHTLayoutColumnsOverlay();
+    }
+}
+
+%end
+
+%hook TFNTabbedViewController
 
 - (void)viewDidLayoutSubviews {
     %orig;

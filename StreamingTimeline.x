@@ -39,6 +39,7 @@ static UIViewController *nfb_firstColumnTimelineAwayFromTopExcept(UIViewControll
 static void nfb_layoutActiveHomePaging(void);
 void NFBSetInlineColumnsEnabled(BOOL enabled);
 extern void BHTPresentColumnsMode(void);
+extern NSString *BHTColumnsModeDiagnostic(void);
 
 // Minimal bases so `self.view` resolves; everything else goes through objc_msgSend.
 @interface THFHomeTimelineContainerViewController : UIViewController
@@ -918,6 +919,8 @@ static void nfb_setStreamInterval(NSInteger s){ [[NSUserDefaults standardUserDef
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"active=%@\n", active ? NSStringFromClass([active class]) : @"(nil)"];
     if (active) nfb_appendScrollDiag(s, active);
+    NSString *columnsMode = BHTColumnsModeDiagnostic();
+    if (columnsMode.length) [s appendString:columnsMode];
     nfb_appendColumnsDiag(s, active);
     nfb_dumpTree(nfb_homeRoot(active), 0, s);
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"診断情報" message:s preferredStyle:UIAlertControllerStyleAlert];
