@@ -28,7 +28,9 @@ static void nfb_streamTrigger(UIViewController *vc);
 static void nfb_styleButton(BOOL on);
 static void nfb_updateGauge(BOOL on, NSTimeInterval interval);
 static void nfb_updateStreamStateIconForVC(UIViewController *vc);
+static NSString *nfb_currentSelectedTabPage(void);
 static BOOL nfb_homeTabSelectedOrUnknown(void);
+void NFBUpdateStreamButtonVisibility(void);
 static void nfb_showNewTweetsPill(UIViewController *vc);
 static BOOL nfb_streamTriggerColumns(void);
 static void nfb_revealAllColumnTops(void);
@@ -664,6 +666,7 @@ static void nfb_revealTopAfterRefresh(UIViewController *vc) {
 }
 static void nfb_showNewTweetsPill(UIViewController *vc) {
     if (!vc || !vc.view.window) return;
+    if (!nfb_homeTabSelectedOrUnknown()) return;
     gPendingNewTweetsVC = vc;
     UIWindow *win = vc.view.window;
     if (!gNewTweetsPill) {
@@ -1196,6 +1199,10 @@ static BOOL nfb_streamCanRunForTarget(UIViewController *target) {
 
 static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
     if (!gStreamStateIcon) return;
+    if (gStreamButton && gStreamButton.hidden) {
+        gStreamStateIcon.hidden = YES;
+        return;
+    }
     UIViewController *target = vc ? (nfb_selectedTimelineVC(vc) ?: vc) : nil;
     BOOL globalOn = [BHTManager autoStreamTimeline];
     BOOL active = nfb_streamCanRunForTarget(target);
@@ -1212,9 +1219,12 @@ static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
 static void nfb_installButton(UIWindow *win) {
     if (!win) return;
     if (!gStreamButton) {
-        gStreamButton = [NFBStreamButton buttonWithType:UIButtonTypeSystem];
+        gStreamButton = [[NFBStreamButton alloc] initWithFrame:CGRectZero];
         gStreamButton.translatesAutoresizingMaskIntoConstraints = NO;
         gStreamButton.accessibilityLabel = @"TL自動更新";
+        gStreamButton.backgroundColor = UIColor.clearColor;
+        gStreamButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+        gStreamButton.contentVerticalAlignment = UIControlContentVerticalAlignmentCenter;
         [gStreamButton addTarget:[NFBStreamHandler shared] action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
         UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:[NFBStreamHandler shared] action:@selector(longPress:)];
         lp.minimumPressDuration = 0.4;
@@ -1256,6 +1266,7 @@ static void nfb_installButton(UIWindow *win) {
     BOOL on = [BHTManager autoStreamTimeline];
     nfb_styleButton(on);
     nfb_updateGauge(on, (NSTimeInterval)[BHTManager autoStreamInterval]);
+    NFBUpdateStreamButtonVisibility();
     nfb_updateStreamStateIconForVC(gActiveItemsVC);
 }
 static void nfb_removeButton(void) {
@@ -1265,9 +1276,43 @@ static void nfb_removeButton(void) {
     gPendingNewTweetsVC = nil;
 }
 
+void NFBUpdateStreamButtonVisibility(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ NFBUpdateStreamButtonVisibility(); });
+        return;
+    }
+    NSString *page = nfb_currentSelectedTabPage();
+    BOOL visible = nfb_homeTabSelectedOrUnknown();
+    static NSNumber *lastVisible = nil;
+    static NSString *lastPage = nil;
+    if (gNFBLogRecording && (!lastVisible || lastVisible.boolValue != visible || ![(lastPage ?: @"") isEqualToString:(page ?: @"")])) {
+        NFBLogEvent([NSString stringWithFormat:@"streamButton visible=%d page=%@ inline=%d activeWin=%d",
+            visible ? 1 : 0, page ?: @"(nil)", gInlineColumnsEnabled ? 1 : 0,
+            (gActiveItemsVC && [gActiveItemsVC isViewLoaded] && gActiveItemsVC.view.window) ? 1 : 0]);
+    }
+    lastVisible = @(visible);
+    lastPage = [page copy];
+    if (!visible) {
+        if (gStreamButton) {
+            gStreamButton.hidden = YES;
+            gStreamButton.userInteractionEnabled = NO;
+        }
+        if (gStreamStateIcon) gStreamStateIcon.hidden = YES;
+        nfb_hideNewTweetsPill();
+        return;
+    }
+    if (gStreamButton) {
+        gStreamButton.hidden = NO;
+        gStreamButton.userInteractionEnabled = YES;
+    }
+    if (gStreamStateIcon) gStreamStateIcon.hidden = NO;
+}
+
 // Fade with the header: hide while scrolling down, show at top / scrolling up.
 static void nfb_visibilityForScroll(UIScrollView *sv) {
     if (!gStreamButton || gStreamButton.window == nil) return;
+    NFBUpdateStreamButtonVisibility();
+    if (gStreamButton.hidden) return;
     nfb_noteActiveTimelineScroll(sv);
     nfb_updateStreamStateIconForVC(gActiveItemsVC);
     static CGFloat last = 0;
@@ -1333,17 +1378,24 @@ static NSString *nfb_selectedTabPageInView(UIView *view, int depth) {
     return nil;
 }
 
-static BOOL nfb_homeTabSelectedOrUnknown(void) {
+static NSString *nfb_currentSelectedTabPage(void) {
     for (UIWindow *window in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
         if (window.hidden || window.alpha < 0.01) continue;
         NSString *page = nfb_selectedTabPageInView(window, 0);
-        if (page.length) {
-            if ([page isEqualToString:@"home"]) return YES;
-            if (gInlineColumnsEnabled && [page isEqualToString:@"communities"]) return YES;
-            return NO;
-        }
+        if (page.length) return page;
     }
-    return YES;
+    return nil;
+}
+
+static BOOL nfb_homeTabSelectedOrUnknown(void) {
+    NSString *page = nfb_currentSelectedTabPage();
+    if (page.length) {
+        if ([page isEqualToString:@"home"]) return YES;
+        if (gInlineColumnsEnabled && [page isEqualToString:@"communities"]) return YES;
+        return NO;
+    }
+    if (gActiveItemsVC && [gActiveItemsVC isViewLoaded] && gActiveItemsVC.view.window) return YES;
+    return NO;
 }
 
 #pragma mark - streaming timer
@@ -1747,9 +1799,10 @@ static BOOL nfb_columnsChromeCandidate(UIView *view, UIView *root) {
     if ([text containsString:@"おすすめ"] || [text containsString:@"フォロー中"] ||
         [text.lowercaseString containsString:@"for you"] || [text.lowercaseString containsString:@"following"]) return YES;
     if (nfb_stringLooksSpacesTimeline(text) || nfb_stringLooksSpacesTimeline(cls)) return YES;
-    if ([cls containsString:@"Segment"] || [cls containsString:@"Tab"] || [cls containsString:@"LabelBar"]) return YES;
-    if ([cls containsString:@"Bar"] && frame.size.height <= 180.0) return YES;
-    return CGRectGetMaxY(frame) <= 220.0 && view.subviews.count > 0;
+    if ([cls containsString:@"HomeSegment"] || [cls containsString:@"Segmented"] ||
+        [cls containsString:@"LabelBar"] || [cls containsString:@"HorizontalLabel"] ||
+        [cls containsString:@"SegmentedLabel"] || [cls containsString:@"FleetLine"]) return YES;
+    return NO;
 }
 
 static BOOL nfb_columnsProtectedView(UIView *view) {
@@ -1830,9 +1883,10 @@ static BOOL nfb_columnsChromeAncestorRowCandidate(UIView *view, UIView *child, U
     if (frame.size.width < MIN(root.bounds.size.width * 0.45, 180.0)) return NO;
     if (frame.size.height < 1.0 || frame.size.height > 90.0) return NO;
     if (fabs(CGRectGetMinY(frame) - CGRectGetMinY(childFrame)) > 10.0) return NO;
-    BOOL genericRow = [cls isEqualToString:@"UIView"] || [cls containsString:@"StackView"] ||
-        [cls containsString:@"CustomHitTest"] || [cls containsString:@"Header"] ||
-        [cls containsString:@"Bar"];
+    BOOL genericRow = [cls containsString:@"StackView"] ||
+        [cls containsString:@"LabelBar"] ||
+        [cls containsString:@"HorizontalLabel"] ||
+        [cls containsString:@"Segment"];
     return genericRow;
 }
 
@@ -1947,15 +2001,6 @@ static BOOL nfb_globalTopColumnsChromeCandidate(UIView *view, UIView *root) {
     if ([cls containsString:@"HomeSegment"] || [cls containsString:@"Segmented"] ||
         [cls containsString:@"LabelBar"] || [cls containsString:@"HorizontalLabel"] ||
         [cls containsString:@"SegmentedLabel"]) return YES;
-    // Docked overlay bar below the nav bar (e.g. the Spaces "他N人" bar at y~150): a short, wide strip
-    // with text, sitting on top of the columns. The window walk stops at the paging surface, so this
-    // never sees a tweet cell inside a column — only sibling overlays.
-    if (CGRectGetMinY(frame) >= 110.0 && frame.size.height >= 20.0 && frame.size.height <= 120.0 &&
-        frame.size.width >= root.bounds.size.width * 0.7 && !nfb_viewContainsColumnsPagingSurface(view, 0)) {
-        NSMutableString *dockTxt = [NSMutableString string];
-        nfb_appendDescendantText(view, dockTxt, 0);
-        if (dockTxt.length) return YES;
-    }
     return NO;
 }
 
@@ -2026,8 +2071,8 @@ static void nfb_addSegmentedChromeCandidate(NSMutableArray<UIView *> *views, NSH
     NSString *cls = NSStringFromClass(view.class);
     BOOL shortTop = CGRectGetMinY(frame) <= 280.0 && frame.size.width >= 40.0 && frame.size.height >= 4.0 && frame.size.height <= 260.0;
     BOOL classMatch = [cls containsString:@"Segment"] || [cls containsString:@"LabelBar"] ||
-        [cls containsString:@"HorizontalLabel"] || [cls containsString:@"Tab"] ||
-        [cls containsString:@"Header"] || [cls containsString:@"Bar"];
+        [cls containsString:@"HorizontalLabel"] || [cls containsString:@"SegmentedLabel"] ||
+        [cls containsString:@"FleetLine"];
     if (nfb_viewLooksLikeHomeSegmentBar(view, root) || nfb_viewLooksLikeSpacesChrome(view, root) ||
         (shortTop && classMatch)) {
         [views addObject:view];
@@ -2064,7 +2109,6 @@ static void nfb_collectSegmentedChromeViewsInViewTree(UIView *view, NSMutableArr
 static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC) {
     if (!segmentedVC || ![segmentedVC isViewLoaded]) return;
     if (!nfb_parentControllerNamed(segmentedVC, @"HomeTimelineContainer")) {
-        nfb_restoreColumnsChromeInView(segmentedVC.view, 0);
         return; // Home only; search/explore segmented/search bars must never stay hidden here.
     }
     if (!gInlineColumnsEnabled) {
@@ -2084,7 +2128,6 @@ static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC
             nfb_collectSegmentedChromeViewsFromObject(value, bars, seen, root, 0);
         } @catch (NSException *e) {}
     }
-    nfb_collectSegmentedChromeViewsFromObject(segmentedVC, bars, seen, root, 0);
     nfb_collectSegmentedChromeViewsInViewTree(root, bars, seen, root, 0);
     for (UIView *bar in bars) {
         nfb_setColumnsChromeViewHidden(bar, YES);
@@ -3294,7 +3337,12 @@ void NFBLogSnapshot(NSString *reason) {
     if (gInlineColumnsEnabled || [reason containsString:@"present"]) {
         [s appendFormat:@"pageList=%@ ", nfb_columnsPageSummary(paging)];
     }
-    [s appendFormat:@"allTopBtn=%d/sup%d ", gColumnsAllTopButton ? 1 : 0, (gColumnsAllTopButton && gColumnsAllTopButton.superview) ? 1 : 0];
+    CGRect streamFrame = gStreamButton && gStreamButton.superview ? [gStreamButton.superview convertRect:gStreamButton.frame toView:nil] : CGRectZero;
+    [s appendFormat:@"allTopBtn=%d/sup%d streamBtn=%d/sup%d/h%d f=(%.0f,%.0f,%.0f,%.0f) page=%@ ",
+        gColumnsAllTopButton ? 1 : 0, (gColumnsAllTopButton && gColumnsAllTopButton.superview) ? 1 : 0,
+        gStreamButton ? 1 : 0, (gStreamButton && gStreamButton.superview) ? 1 : 0, (gStreamButton && gStreamButton.hidden) ? 1 : 0,
+        streamFrame.origin.x, streamFrame.origin.y, streamFrame.size.width, streamFrame.size.height,
+        nfb_currentSelectedTabPage() ?: @"(nil)"];
     [s appendFormat:@"edgeGestures=%ld/en%ld ", (long)nfb_countColumnsEdgeMenuGestures(), (long)nfb_countEnabledColumnsEdgeMenuGestures()];
     UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
     UIViewController *container = paging ? nfb_parentControllerNamed(paging, @"HomeTimelineContainer") : nil;
@@ -3482,6 +3530,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
         }
     }
     nfb_scheduleLayoutActiveHomePaging();
+    NFBUpdateStreamButtonVisibility();
 }
 
 #pragma mark - Hooks

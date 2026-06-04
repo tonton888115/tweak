@@ -31,6 +31,7 @@ extern void NFBSetInlineColumnsEnabled(BOOL enabled);
 extern BOOL NFBInlineColumnsEnabled(void);
 extern void NFBLogEvent(NSString *msg);       // operation-log recorder (no-op unless recording)
 extern void NFBLogSnapshot(NSString *reason); // compact state snapshot (no-op unless recording)
+extern void NFBUpdateStreamButtonVisibility(void);
 NSString *BHTColumnsLogFlags(void);           // columns flags + tab selectedIndex, used by the snapshot
 void BHTPresentColumnsMode(void);
 void BHTDismissColumnsMode(void);
@@ -866,6 +867,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     gBHTLastTabBarController = (UIViewController *)self;
     if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, nil, @"setSelectedIndex")) return;
     %orig(selectedIndex);
+    NFBUpdateStreamButtonVisibility();
     NFBLogSnapshot(@"setSelectedIndex.afterOrig");
     if (!gBHTSelectingHomeForColumns) {
         BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
@@ -876,6 +878,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     gBHTLastTabBarController = (UIViewController *)self;
     if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, nil, @"setSelectedTabIndex")) return;
     %orig(selectedIndex);
+    NFBUpdateStreamButtonVisibility();
     NFBLogSnapshot(@"setSelectedTabIndex.afterOrig");
     if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
 }
@@ -884,6 +887,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     gBHTLastTabBarController = (UIViewController *)self;
     if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, nil, @"selectTabAtIndex")) return;
     %orig(selectedIndex);
+    NFBUpdateStreamButtonVisibility();
     NFBLogSnapshot(@"selectTabAtIndex.afterOrig");
     if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
 }
@@ -892,6 +896,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     gBHTLastTabBarController = (UIViewController *)self;
     if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, tabView, @"customTabBar")) return;
     %orig(tabBar, selectedIndex, tabView);
+    NFBUpdateStreamButtonVisibility();
     NFBLogSnapshot(@"customTabBar.afterOrig");
     if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
 }
@@ -900,6 +905,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     gBHTLastTabBarController = (UIViewController *)self;
     if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, tabView, @"tabBarViewController")) return;
     %orig(tabBarController, selectedIndex, tabView);
+    NFBUpdateStreamButtonVisibility();
     NFBLogSnapshot(@"tabBarViewController.afterOrig");
     if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
 }
@@ -4744,11 +4750,13 @@ static BOOL BHTHandleTabSelectionRequest(UIViewController *tabBarController, NSI
     if (BHTIsColumnsPageID(page)) {
         BHTPresentColumnsMode();
         BHTUpdateColumnsTabSelection(tabBarController, YES);
+        NFBUpdateStreamButtonVisibility();
         return YES;
     }
     if (gBHTColumnsIntent) {
         BHTDismissColumnsMode();
         BHTUpdateColumnsTabSelection(tabBarController, NO);
+        NFBUpdateStreamButtonVisibility();
     }
     return NO;
 }
