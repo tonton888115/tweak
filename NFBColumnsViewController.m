@@ -74,7 +74,7 @@ extern void BHTDismissColumnsMode(void);
         [self.stackView.heightAnchor constraintEqualToAnchor:self.scrollView.frameLayoutGuide.heightAnchor]
     ]];
 
-    self.tweetsNoticeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.tweetsNoticeButton = [UIButton buttonWithType:UIButtonTypeCustom];
     self.tweetsNoticeButton.translatesAutoresizingMaskIntoConstraints = NO;
     self.tweetsNoticeButton.backgroundColor = UIColor.systemBlueColor;
     self.tweetsNoticeButton.layer.cornerRadius = 17.0;

@@ -670,7 +670,7 @@ static void nfb_showNewTweetsPill(UIViewController *vc) {
     gPendingNewTweetsVC = vc;
     UIWindow *win = vc.view.window;
     if (!gNewTweetsPill) {
-        gNewTweetsPill = [UIButton buttonWithType:UIButtonTypeSystem];
+        gNewTweetsPill = [UIButton buttonWithType:UIButtonTypeCustom];
         gNewTweetsPill.translatesAutoresizingMaskIntoConstraints = NO;
         gNewTweetsPill.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
         gNewTweetsPill.contentEdgeInsets = UIEdgeInsetsMake(8, 16, 8, 16);
