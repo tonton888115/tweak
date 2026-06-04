@@ -86,6 +86,15 @@ static char kBHTSpacesChromeBoundsKey;
 static char kBHTSpacesChromeClipsKey;
 static char kBHTSpacesChromeConstraintsKey;
 static char kBHTSpacesChromeGesturesKey;
+static NSHashTable<UIView *> *gBHTSavedSpacesChromeViews = nil;
+
+static void BHTTrackSavedSpacesChromeView(UIView *view) {
+    if (!view) return;
+    if (!gBHTSavedSpacesChromeViews) {
+        gBHTSavedSpacesChromeViews = [NSHashTable weakObjectsHashTable];
+    }
+    [gBHTSavedSpacesChromeViews addObject:view];
+}
 
 static BOOL BHTConstraintLooksLikeSpacesHeight(NSLayoutConstraint *constraint, UIView *view) {
     if (!constraint || !view) return NO;
@@ -111,6 +120,7 @@ static NSArray<NSLayoutConstraint *> *BHTSpacesChromeHeightConstraintsForView(UI
 static void BHTSaveSpacesChromeViewIfNeeded(UIView *view) {
     if (!view || objc_getAssociatedObject(view, &kBHTSpacesChromeSavedKey)) return;
     objc_setAssociatedObject(view, &kBHTSpacesChromeSavedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    BHTTrackSavedSpacesChromeView(view);
     objc_setAssociatedObject(view, &kBHTSpacesChromeHiddenKey, @(view.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kBHTSpacesChromeAlphaKey, @(view.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kBHTSpacesChromeInteractionKey, @(view.userInteractionEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -206,7 +216,7 @@ static void BHTRestoreSpacesChromeView(UIView *view) {
 }
 
 static void BHTRestoreSpacesChromeTree(UIView *view, NSInteger depth) {
-    if (!view || depth > 8) return;
+    if (!view || depth > 24) return;
     BHTRestoreSpacesChromeView(view);
     for (UIView *subview in view.subviews) {
         BHTRestoreSpacesChromeTree(subview, depth + 1);
@@ -224,6 +234,11 @@ static void BHTRestoreSpacesChromeViewAndNearbyContainers(UIView *view) {
 
 static void BHTRestoreAllSavedSpacesChrome(void) {
     if ([BHTManager hideSpacesBar]) return;
+    NSArray<UIView *> *savedViews = [gBHTSavedSpacesChromeViews allObjects];
+    for (UIView *view in savedViews) {
+        BHTRestoreSpacesChromeView(view);
+    }
+    [gBHTSavedSpacesChromeViews removeAllObjects];
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
         if (!window) continue;
         BHTRestoreSpacesChromeTree(window, 0);
@@ -245,7 +260,7 @@ static BOOL BHTLooksLikeSpacesChromeClass(UIView *view) {
 }
 
 static void BHTCollapseSpacesChromeDescendants(UIView *view, NSInteger depth) {
-    if (!view || !BHTShouldHideSpacesBarNow() || depth > 6) return;
+    if (!view || !BHTShouldHideSpacesBarNow() || depth > 24) return;
     for (UIView *subview in view.subviews) {
         NSString *cls = NSStringFromClass(subview.class);
         CGRect frame = subview.frame;

@@ -49,6 +49,7 @@ static id nfb_pagingDataSource(UIViewController *paging);
 static NSIndexPath *nfb_pagingSelectedIndexPath(UIViewController *paging);
 static UIViewController *nfb_pagingViewControllerAtIndexPath(UIViewController *paging, NSIndexPath *indexPath);
 static UIViewController *nfb_findAnyHomePagingController(void);
+static UIViewController *nfb_findVisibleHomePagingController(void);
 static UIViewController *nfb_firstColumnTimelineAwayFromTop(void);
 static UIViewController *nfb_firstColumnTimelineAwayFromTopExcept(UIViewController *allowedRevealing);
 static void nfb_rememberInlineColumnsOriginals(UIScrollView *scrollView);
@@ -1495,6 +1496,15 @@ static char kNFBColumnScrollInsetKey;
 static char kNFBColumnScrollIndicatorInsetKey;
 static char kNFBColumnScrollAdjustmentBehaviorKey;
 static CGFloat gColumnsHiddenBarHeight = 0.0;   // height of the hidden home segment bar, for gap-closing
+static NSHashTable<UIView *> *gNFBInlineColumnsSavedChromeViews = nil;
+
+static void nfb_trackSavedColumnsChromeView(UIView *view) {
+    if (!view) return;
+    if (!gNFBInlineColumnsSavedChromeViews) {
+        gNFBInlineColumnsSavedChromeViews = [NSHashTable weakObjectsHashTable];
+    }
+    [gNFBInlineColumnsSavedChromeViews addObject:view];
+}
 
 static BOOL nfb_columnsShouldTreatGestureAsEdgeMenu(UIGestureRecognizer *gesture) {
     if (!gesture) return NO;
@@ -1673,6 +1683,7 @@ static void nfb_setColumnsChromeViewHidden(UIView *view, BOOL hidden) {
     if (hidden) {
         if (!objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey)) {
             objc_setAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            nfb_trackSavedColumnsChromeView(view);
             objc_setAssociatedObject(view, &kNFBInlineColumnsChromeHiddenKey, @(view.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(view, &kNFBInlineColumnsChromeAlphaKey, @(view.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(view, &kNFBInlineColumnsChromeInteractionKey, @(view.userInteractionEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1749,7 +1760,7 @@ static BOOL nfb_columnsPagingSurface(UIView *view) {
 }
 
 static void nfb_setColumnsChromeDescendantsHidden(UIView *view, BOOL hidden, int depth) {
-    if (!view || depth > 8) return;
+    if (!view || depth > 24) return;
     for (UIView *subview in view.subviews) {
         if (nfb_columnsProtectedView(subview) || nfb_columnsPagingSurface(subview)) continue;
         nfb_setColumnsChromeViewHidden(subview, hidden);
@@ -1758,10 +1769,37 @@ static void nfb_setColumnsChromeDescendantsHidden(UIView *view, BOOL hidden, int
 }
 
 static BOOL nfb_viewContainsColumnsPagingSurface(UIView *view, int depth) {
-    if (!view || depth > 8) return NO;
+    if (!view || depth > 24) return NO;
     if (nfb_columnsPagingSurface(view)) return YES;
     for (UIView *subview in view.subviews) {
         if (nfb_viewContainsColumnsPagingSurface(subview, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static BOOL nfb_viewContainsNavigationChrome(UIView *view, int depth) {
+    if (!view || depth > 24) return NO;
+    NSString *cls = NSStringFromClass(view.class);
+    if ([cls containsString:@"NavigationBar"] || [cls containsString:@"UINavigationBar"] ||
+        [cls containsString:@"_UIBarBackground"]) return YES;
+    for (UIView *subview in view.subviews) {
+        if (nfb_viewContainsNavigationChrome(subview, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static BOOL nfb_viewContainsHomeTopChrome(UIView *view, int depth) {
+    if (!view || depth > 24) return NO;
+    NSString *cls = NSStringFromClass(view.class);
+    NSString *text = nfb_textOfView(view);
+    NSString *lower = text.lowercaseString;
+    if ([text containsString:@"おすすめ"] || [text containsString:@"フォロー中"] ||
+        [lower containsString:@"for you"] || [lower containsString:@"following"] ||
+        nfb_stringLooksSpacesTimeline(text) || nfb_stringLooksSpacesTimeline(cls) ||
+        [cls containsString:@"Segment"] || [cls containsString:@"LabelBar"] ||
+        [cls containsString:@"HorizontalLabel"] || [cls containsString:@"FleetLine"]) return YES;
+    for (UIView *subview in view.subviews) {
+        if (nfb_viewContainsHomeTopChrome(subview, depth + 1)) return YES;
     }
     return NO;
 }
@@ -1801,7 +1839,7 @@ static void nfb_collapseColumnsChromeAncestorsForView(UIView *view, UIView *root
 }
 
 static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView *root, int depth) {
-    if (!view || !root || depth > 8) return NO;
+    if (!view || !root || depth > 24) return NO;
     if (nfb_columnsProtectedView(view)) return NO;
     BOOL containsPaging = nfb_viewContainsDescendant(view, pagingView);
     BOOL pagingSurface = nfb_columnsPagingSurface(view);
@@ -1821,7 +1859,7 @@ static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView
 }
 
 static void nfb_restoreColumnsChromeInView(UIView *view, int depth) {
-    if (!view || depth > 10) return;
+    if (!view || depth > 24) return;
     nfb_setColumnsChromeViewHidden(view, NO);
     for (UIView *subview in view.subviews) {
         nfb_restoreColumnsChromeInView(subview, depth + 1);
@@ -1829,6 +1867,11 @@ static void nfb_restoreColumnsChromeInView(UIView *view, int depth) {
 }
 
 static void nfb_restoreAllSavedColumnsChrome(void) {
+    NSArray<UIView *> *savedViews = [gNFBInlineColumnsSavedChromeViews allObjects];
+    for (UIView *view in savedViews) {
+        nfb_setColumnsChromeViewHidden(view, NO);
+    }
+    [gNFBInlineColumnsSavedChromeViews removeAllObjects];
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
         if (!window) continue;
         nfb_restoreColumnsChromeInView(window, 0);
@@ -1883,8 +1926,16 @@ static BOOL nfb_globalTopColumnsChromeCandidate(UIView *view, UIView *root) {
     // Match the bar by its labels first (covers the nav-bar-hosted bar with a generic class).
     if (!nfb_viewContainsColumnsPagingSurface(view, 0) && nfb_viewLooksLikeHomeSegmentBar(view, root)) return YES;
     CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
-    if (CGRectGetMinY(frame) > 240.0 || frame.size.width < 24.0 || frame.size.height < 4.0 || frame.size.height > 220.0) return NO;
     NSString *cls = NSStringFromClass(view.class);
+    BOOL topBackdrop = CGRectGetMinY(frame) <= 80.0 && frame.size.height >= 80.0 && frame.size.height <= 320.0 &&
+        frame.size.width >= root.bounds.size.width * 0.7 &&
+        !nfb_viewContainsColumnsPagingSurface(view, 0) &&
+        !nfb_viewContainsNavigationChrome(view, 0) &&
+        nfb_viewContainsHomeTopChrome(view, 0) &&
+        ([cls isEqualToString:@"UIView"] || [cls containsString:@"VisualEffect"] ||
+         [cls containsString:@"StackView"] || [cls containsString:@"CustomHitTest"]);
+    if (topBackdrop) return YES;
+    if (CGRectGetMinY(frame) > 240.0 || frame.size.width < 24.0 || frame.size.height < 4.0 || frame.size.height > 220.0) return NO;
     NSString *text = nfb_textOfView(view);
     NSString *lower = text.lowercaseString;
     if ([text containsString:@"おすすめ"] || [text containsString:@"フォロー中"] ||
@@ -1905,7 +1956,7 @@ static BOOL nfb_globalTopColumnsChromeCandidate(UIView *view, UIView *root) {
 }
 
 static NSInteger nfb_setColumnsGlobalTopChromeHiddenInView(UIView *view, UIView *root, BOOL hidden, int depth) {
-    if (!view || !root || depth > 12) return 0;
+    if (!view || !root || depth > 24) return 0;
     if (hidden && nfb_columnsPagingSurface(view)) return 0;
     NSInteger count = 0;
     if (hidden && nfb_globalTopColumnsChromeCandidate(view, root)) {
@@ -1932,11 +1983,20 @@ static NSInteger nfb_setColumnsGlobalTopChromeHiddenInView(UIView *view, UIView 
 }
 
 static void nfb_setColumnsGlobalTopChromeHidden(BOOL hidden) {
-    for (UIWindow *window in UIApplication.sharedApplication.windows) {
-        if (window.hidden || window.alpha < 0.01) continue;
-        nfb_setColumnsGlobalTopChromeHiddenInView(window, window, hidden, 0);
+    if (!hidden) {
+        nfb_restoreAllSavedColumnsChrome();
+        return;
     }
-    if (!hidden) nfb_restoreAllSavedColumnsChrome();
+    UIViewController *paging = nfb_findVisibleHomePagingController();
+    if (!paging) paging = nfb_findAnyHomePagingController();
+    UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
+    UIViewController *container = paging ? nfb_parentControllerNamed(paging, @"HomeTimelineContainer") : nil;
+    if (segmented && [segmented isViewLoaded]) {
+        nfb_setColumnsGlobalTopChromeHiddenInView(segmented.view, segmented.view, YES, 0);
+    }
+    if (container && [container isViewLoaded] && container != segmented) {
+        nfb_setColumnsGlobalTopChromeHiddenInView(container.view, container.view, YES, 0);
+    }
 }
 
 static void nfb_setColumnsSegmentedHiddenForPaging(UIViewController *paging, BOOL hidden) {
@@ -1984,7 +2044,7 @@ static void nfb_collectSegmentedChromeViewsFromObject(id object, NSMutableArray<
 }
 
 static void nfb_collectSegmentedChromeViewsInViewTree(UIView *view, NSMutableArray<UIView *> *views, NSHashTable<UIView *> *seen, UIView *root, int depth) {
-    if (!view || !root || depth > 10) return;
+    if (!view || !root || depth > 24) return;
     nfb_addSegmentedChromeCandidate(views, seen, view, root);
     if (nfb_columnsPagingSurface(view)) return;
     for (UIView *subview in view.subviews) {
@@ -2104,6 +2164,37 @@ static void nfb_restoreColumnScrollAdjustmentForPage(UIViewController *page) {
     objc_setAssociatedObject(sv, &kNFBColumnScrollAdjustmentBehaviorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static CGFloat nfb_visibleNavigationBottomInView(UIView *view, UIWindow *window, int depth) {
+    if (!view || !window || depth > 18 || view.hidden || view.alpha < 0.01) return 0.0;
+    CGFloat bottom = 0.0;
+    NSString *cls = NSStringFromClass(view.class);
+    if (([cls containsString:@"NavigationBar"] || [cls containsString:@"UINavigationBar"] || [cls containsString:@"_UIBarBackground"]) &&
+        ![cls containsString:@"Overlay"]) {
+        CGRect frame = [view.superview convertRect:view.frame toView:window];
+        if (CGRectGetMinY(frame) <= 140.0 && frame.size.height >= 20.0 && frame.size.height <= 140.0 &&
+            frame.size.width >= window.bounds.size.width * 0.45) {
+            bottom = MAX(bottom, CGRectGetMaxY(frame));
+        }
+    }
+    for (UIView *subview in view.subviews) {
+        bottom = MAX(bottom, nfb_visibleNavigationBottomInView(subview, window, depth + 1));
+    }
+    return bottom;
+}
+
+static CGFloat nfb_columnsTopContentInsetForPageView(UIView *pageView) {
+    UIWindow *window = pageView.window;
+    if (!pageView || !window) return 0.0;
+    CGRect pageFrame = [pageView.superview convertRect:pageView.frame toView:window];
+    CGFloat navBottom = nfb_visibleNavigationBottomInView(window, window, 0);
+    if (navBottom < 1.0) {
+        navBottom = window.safeAreaInsets.top + 54.0;
+    }
+    CGFloat inset = navBottom - CGRectGetMinY(pageFrame);
+    if (!isfinite(inset)) return 0.0;
+    return MIN(MAX(inset, 0.0), 180.0);
+}
+
 static void nfb_adjustColumnScrollForPage(UIViewController *page, UIView *pageView) {
     if (!page || !pageView || ![page isViewLoaded]) return;
     UIScrollView *sv = nfb_mainScrollViewOf(page);
@@ -2135,14 +2226,15 @@ static void nfb_adjustColumnScrollForPage(UIViewController *page, UIView *pageVi
     if (@available(iOS 11.0, *)) {
         sv.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     }
+    CGFloat targetTopInset = nfb_columnsTopContentInsetForPageView(pageView);
     UIEdgeInsets inset = sv.contentInset;
-    if (fabs(inset.top) > 0.5) {
-        inset.top = 0.0;
+    if (fabs(inset.top - targetTopInset) > 0.5) {
+        inset.top = targetTopInset;
         sv.contentInset = inset;
     }
     UIEdgeInsets indicatorInset = sv.scrollIndicatorInsets;
-    if (fabs(indicatorInset.top) > 0.5) {
-        indicatorInset.top = 0.0;
+    if (fabs(indicatorInset.top - targetTopInset) > 0.5) {
+        indicatorInset.top = targetTopInset;
         sv.scrollIndicatorInsets = indicatorInset;
     }
     if (!sv.isDragging && !sv.isTracking && !sv.isDecelerating) {
@@ -3240,9 +3332,11 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
             frame.origin.x, frame.origin.y, frame.size.width, frame.size.height];
         if (sv) {
             CGFloat topY = -sv.adjustedContentInset.top;
+            CGFloat targetTopInset = ([page isViewLoaded] && page.view.window) ? nfb_columnsTopContentInsetForPageView(page.view) : 0.0;
             CGRect svFrame = sv.superview ? [sv.superview convertRect:sv.frame toView:page.view] : sv.frame;
-            [s appendFormat:@" scroll=%@ sframe=(%.1f,%.1f,%.1f,%.1f) offset=(%.1f,%.1f) topY=%.1f content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f)",
+            [s appendFormat:@" scroll=%@ sframe=(%.1f,%.1f,%.1f,%.1f) targetTopInset=%.1f offset=(%.1f,%.1f) topY=%.1f content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f)",
                 NSStringFromClass(sv.class), svFrame.origin.x, svFrame.origin.y, svFrame.size.width, svFrame.size.height,
+                targetTopInset,
                 sv.contentOffset.x, sv.contentOffset.y, topY,
                 sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height,
                 sv.contentInset.top, sv.contentInset.left, sv.contentInset.bottom, sv.contentInset.right,
