@@ -28,7 +28,9 @@
 #import "ModernSettingsViewController.h"
 
 extern void NFBSetInlineColumnsEnabled(BOOL enabled);
-extern void NFBLogEvent(NSString *msg);   // operation-log recorder (no-op unless recording)
+extern void NFBLogEvent(NSString *msg);       // operation-log recorder (no-op unless recording)
+extern void NFBLogSnapshot(NSString *reason); // compact state snapshot (no-op unless recording)
+NSString *BHTColumnsLogFlags(void);           // columns flags + tab selectedIndex, used by the snapshot
 void BHTPresentColumnsMode(void);
 void BHTDismissColumnsMode(void);
 NSString *BHTColumnsModeDiagnostic(void);
@@ -652,6 +654,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
         }
     }
     %orig(selectedIndex);
+    NFBLogSnapshot(@"setSelectedIndex.afterOrig");
     if (!gBHTSelectingHomeForColumns && !BHTIsColumnsPageID(page)) {
         BHTDismissColumnsMode();
         BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
@@ -4554,8 +4557,11 @@ void BHTDismissColumnsMode(void) {
     }
     gBHTColumnsIntent = NO;
     gBHTSelectingHomeForColumns = NO;
-    NFBLogEvent(@"BHTDismissColumnsMode()");
+    NFBLogSnapshot(@"dismiss.entry");
     NFBSetInlineColumnsEnabled(NO);
+    // Capture the cleanup result after the async restore settles, to catch leftover artifacts.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NFBLogSnapshot(@"dismiss+0.30"); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.90 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NFBLogSnapshot(@"dismiss+0.90"); });
     UIViewController *host = gBHTColumnsHostController;
     if (gBHTColumnsNavigationController) {
         [gBHTColumnsNavigationController willMoveToParentViewController:nil];
@@ -4574,6 +4580,23 @@ void BHTDismissColumnsMode(void) {
     gBHTColumnsPreviousKeyWindow = nil;
     if (previousWindow && !previousWindow.hidden) [previousWindow makeKeyWindow];
     if (host) BHTUpdateColumnsTabSelection(host, NO);
+}
+
+NSString *BHTColumnsLogFlags(void) {
+    NSInteger sel = -1;
+    NSString *selPage = @"?";
+    @try {
+        UIWindow *w = BHT_activeKeyWindow();
+        UIViewController *tb = w.rootViewController ? BHTFindControllerOfClass(w.rootViewController, NSClassFromString(@"T1TabBarViewController"), 0) : nil;
+        if (tb) {
+            NSNumber *si = [tb valueForKey:@"selectedIndex"];
+            if ([si respondsToSelector:@selector(integerValue)]) sel = si.integerValue;
+            NSArray *tv = [tb valueForKey:@"tabViews"];
+            if (sel >= 0 && sel < (NSInteger)tv.count) selPage = [tv[(NSUInteger)sel] valueForKey:@"scribePage"] ?: @"?";
+        }
+    } @catch (NSException *e) {}
+    return [NSString stringWithFormat:@"intent=%d selHome=%d apply=%d tabSel=%ld(%@)",
+            gBHTColumnsIntent ? 1 : 0, gBHTSelectingHomeForColumns ? 1 : 0, gBHTApplyingColumnsTabSelection ? 1 : 0, (long)sel, selPage];
 }
 
 NSString *BHTColumnsModeDiagnostic(void) {
@@ -4655,7 +4678,7 @@ void BHTPresentColumnsMode(void) {
         return;
     }
     gBHTColumnsIntent = YES;
-    NFBLogEvent(@"BHTPresentColumnsMode()");
+    NFBLogSnapshot(@"present.entry");
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (now - gBHTLastColumnsOpen < 0.20) {
         NFBSetInlineColumnsEnabled(YES);
@@ -4695,9 +4718,10 @@ void BHTPresentColumnsMode(void) {
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         gBHTSelectingHomeForColumns = NO;
-        if (!gBHTColumnsIntent) return;
+        if (!gBHTColumnsIntent) { NFBLogSnapshot(@"present+0.45(intent dropped)"); return; }
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
+        NFBLogSnapshot(@"present+0.45");
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.90 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gBHTColumnsIntent) return;

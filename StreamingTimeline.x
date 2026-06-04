@@ -34,6 +34,8 @@ static BOOL nfb_streamTriggerColumns(void);
 static void nfb_revealAllColumnTops(void);
 static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active);
 static void nfb_appendTopChromeDiag(NSMutableString *s);
+void NFBLogSnapshot(NSString *reason);             // compact 1-line state snapshot (records only while recording)
+extern NSString *BHTColumnsLogFlags(void);          // columns flags + tab selectedIndex, from Tweak.x
 static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void);
 static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc);
 static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging);
@@ -2206,6 +2208,44 @@ static void nfb_appendTopChromeDiag(NSMutableString *s) {
     }
 }
 
+// Compact, single-line state snapshot for the recorded log — dropped in at key events (present /
+// dismiss / tab select / home appear-disappear / cleanup) so a stuck or corrupted state can be
+// reconstructed from a single paste. No-op unless recording; never mutates UI; KVC guarded.
+void NFBLogSnapshot(NSString *reason) {
+    if (!gNFBLogRecording) return;
+    if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ NFBLogSnapshot(reason); }); return; }
+    NSMutableString *s = [NSMutableString stringWithFormat:@"snap[%@] ", reason ?: @"?"];
+    @try { NSString *f = BHTColumnsLogFlags(); if (f.length) [s appendFormat:@"%@ ", f]; } @catch (NSException *e) {}
+    [s appendFormat:@"inline=%d ", gInlineColumnsEnabled ? 1 : 0];
+    UIWindow *kw = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) { if (!w.hidden && w.isKeyWindow) { kw = w; break; } }
+    UIViewController *root = kw.rootViewController;
+    UIViewController *top = root; int pd = 0;
+    while (top.presentedViewController && pd < 8) { top = top.presentedViewController; pd++; }
+    [s appendFormat:@"root=%@ top=%@ pres=%d ", root ? NSStringFromClass(root.class) : @"nil", top ? NSStringFromClass(top.class) : @"nil", pd];
+    UIViewController *paging = nfb_findVisibleHomePagingController();
+    [s appendFormat:@"paging=%@/win%d ", paging ? NSStringFromClass(paging.class) : @"nil", (paging && [paging isViewLoaded] && paging.view.window) ? 1 : 0];
+    UIScrollView *h = paging ? nfb_horizontalPagingScrollViewOf(paging) : nil;
+    if (h) [s appendFormat:@"h.off=%.0f c=%.0f b=%.0f pg=%d drag=%d ", h.contentOffset.x, h.contentSize.width, h.bounds.size.width, h.pagingEnabled ? 1 : 0, (h.isDragging || h.isTracking || h.isDecelerating) ? 1 : 0];
+    NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
+    [s appendFormat:@"cols=%lu[", (unsigned long)pages.count];
+    NSUInteger i = 0;
+    for (UIViewController *p in pages) {
+        UIScrollView *sv = [p isViewLoaded] ? nfb_mainScrollViewOf(p) : nil;
+        [s appendFormat:@"%lu:w%d/h%.0f ", (unsigned long)i, ([p isViewLoaded] && p.view.window) ? 1 : 0, sv ? sv.contentSize.height : -1.0];
+        i++;
+    }
+    [s appendString:@"] "];
+    [s appendFormat:@"allTopBtn=%d/sup%d ", gColumnsAllTopButton ? 1 : 0, (gColumnsAllTopButton && gColumnsAllTopButton.superview) ? 1 : 0];
+    UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
+    UIViewController *container = paging ? nfb_parentControllerNamed(paging, @"HomeTimelineContainer") : nil;
+    NSInteger chrome = 0;
+    if (segmented && [segmented isViewLoaded]) chrome += nfb_countSavedColumnsChromeInView(segmented.view, 0);
+    if (container && [container isViewLoaded]) chrome += nfb_countSavedColumnsChromeInView(container.view, 0);
+    [s appendFormat:@"chromeHidden=%ld", (long)chrome];
+    NFBLogEvent(s);
+}
+
 static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) {
     UIViewController *paging = nfb_findVisibleHomePagingController();
     UIScrollView *h = paging ? nfb_horizontalPagingScrollViewOf(paging) : nil;
@@ -2321,8 +2361,8 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 
 // Button lifecycle on the stable Home container.
 %hook THFHomeTimelineContainerViewController
-- (void)viewDidAppear:(BOOL)animated { %orig; NFBLogEvent([NSString stringWithFormat:@"homeContainer viewDidAppear cols=%d", gInlineColumnsEnabled]); nfb_syncHomeTimelineTabIdentifierFromController(self); nfb_installButton(self.view.window); }
-- (void)viewDidDisappear:(BOOL)animated { %orig; NFBLogEvent(@"homeContainer viewDidDisappear"); nfb_removeButton(); }
+- (void)viewDidAppear:(BOOL)animated { %orig; NFBLogSnapshot(@"homeContainer.appear"); nfb_syncHomeTimelineTabIdentifierFromController(self); nfb_installButton(self.view.window); }
+- (void)viewDidDisappear:(BOOL)animated { %orig; NFBLogSnapshot(@"homeContainer.disappear"); nfb_removeButton(); }
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
     %orig(size, coordinator);
     if (!gInlineColumnsEnabled) return;
