@@ -34,6 +34,10 @@ static BOOL nfb_streamTriggerColumns(void);
 static void nfb_revealAllColumnTops(void);
 static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active);
 static void nfb_appendTopChromeDiag(NSMutableString *s);
+static void nfb_appendCoveringViewsDiag(NSMutableString *s);
+static void nfb_appendGestureDiag(NSMutableString *s);
+static void nfb_appendSpacesCandidatesDiag(NSMutableString *s);
+static NSString *nfb_buildDiagnosticReport(void);
 void NFBLogSnapshot(NSString *reason);             // compact 1-line state snapshot (records only while recording)
 extern NSString *BHTColumnsLogFlags(void);          // columns flags + tab selectedIndex, from Tweak.x
 static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void);
@@ -992,7 +996,15 @@ void NFBLogStartRecording(void) {
     NFBLogEvent(@"=== REC START ===");
 }
 NSString *NFBLogStopRecording(void) {
-    if (gNFBLogRecording) NFBLogEvent(@"=== REC STOP ===");
+    if (gNFBLogRecording) {
+        NFBLogEvent(@"=== FINAL DIAG START ===");
+        NSString *diag = nfb_buildDiagnosticReport();
+        for (NSString *line in [diag componentsSeparatedByString:@"\n"]) {
+            if (line.length) NFBLogEvent(line);
+        }
+        NFBLogEvent(@"=== FINAL DIAG END ===");
+        NFBLogEvent(@"=== REC STOP ===");
+    }
     gNFBLogRecording = NO;
     @try { [gNFBLogFile closeFile]; } @catch (NSException *e) {}
     gNFBLogFile = nil;
@@ -1108,15 +1120,8 @@ NSString *NFBLogSavedFileContents(void) {
     [self present:ac];
 }
 - (void)showDiag {
-    UIViewController *active = gActiveItemsVC;
-    NSMutableString *s = [NSMutableString string];
-    [s appendFormat:@"active=%@\n", active ? NSStringFromClass([active class]) : @"(nil)"];
-    if (active) nfb_appendScrollDiag(s, active);
-    NSString *columnsMode = BHTColumnsModeDiagnostic();
-    if (columnsMode.length) [s appendString:columnsMode];
-    nfb_appendColumnsDiag(s, active);
-    nfb_appendTopChromeDiag(s);   // dump every top-of-screen view so the iPad segment bar is visible
-    nfb_dumpTree(nfb_homeRoot(active), 0, s);
+    NSString *report = nfb_buildDiagnosticReport();
+    NSMutableString *s = [report mutableCopy] ?: [NSMutableString string];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"診断情報" message:s preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"コピー" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIPasteboard.generalPasteboard.string = s; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
@@ -2779,28 +2784,242 @@ static void nfb_appendColumnsChromeDiag(NSMutableString *s, UIView *view, UIView
     }
 }
 
-static void nfb_appendTopChromeDiagInView(NSMutableString *s, UIView *view, UIView *root, int depth) {
-    if (!view || !root || depth > 12 || view.hidden || view.alpha < 0.01) return;
-    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
-    if (CGRectGetMinY(frame) <= 240.0 && frame.size.height >= 14.0 && frame.size.height <= 240.0 && frame.size.width >= 80.0) {
-        NSString *cls = NSStringFromClass(view.class);
-        BOOL barLike = [cls containsString:@"Segment"] || [cls containsString:@"Bar"] || [cls containsString:@"Label"] || [cls containsString:@"Header"] || [cls containsString:@"Tab"];
-        NSMutableString *txt = [NSMutableString string];
-        nfb_appendDescendantText(view, txt, 0);
-        NSString *t = [txt stringByReplacingOccurrencesOfString:@"\n" withString:@"|"];
-        if (t.length > 44) t = [t substringToIndex:44];
-        if (t.length || barLike) {
-            [s appendFormat:@"  top d=%d class=%@ f=(%.0f,%.0f,%.0f,%.0f) hidden=%d text=%@\n",
-                depth, cls, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height, view.hidden ? 1 : 0, t.length ? t : @"-"];
+static NSString *nfb_diagShortString(NSString *value, NSUInteger maxLen) {
+    if (!value.length) return @"-";
+    NSString *single = [[value stringByReplacingOccurrencesOfString:@"\n" withString:@"|"] stringByReplacingOccurrencesOfString:@"\r" withString:@"|"];
+    single = [single stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (single.length > maxLen) single = [[single substringToIndex:maxLen] stringByAppendingString:@"..."];
+    return single.length ? single : @"-";
+}
+
+static NSString *nfb_diagTextForView(UIView *view, NSUInteger maxLen) {
+    NSMutableString *txt = [NSMutableString string];
+    NSString *direct = nfb_textOfView(view);
+    if (direct.length) [txt appendString:direct];
+    nfb_appendDescendantText(view, txt, 0);
+    NSString *ax = view.accessibilityLabel;
+    if (ax.length && ![txt containsString:ax]) {
+        if (txt.length) [txt appendString:@"|"];
+        [txt appendString:ax];
+    }
+    NSString *identifier = view.accessibilityIdentifier;
+    if (identifier.length && ![txt containsString:identifier]) {
+        if (txt.length) [txt appendString:@"|"];
+        [txt appendFormat:@"id:%@", identifier];
+    }
+    return nfb_diagShortString(txt, maxLen);
+}
+
+static NSString *nfb_diagGestureSummaryForView(UIView *view) {
+    if (!view.gestureRecognizers.count) return @"-";
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
+        NSString *cls = NSStringFromClass(gesture.class);
+        NSString *delegate = gesture.delegate ? NSStringFromClass([gesture.delegate class]) : @"nil";
+        BOOL edgeMenu = nfb_columnsShouldTreatGestureAsEdgeMenu(gesture);
+        NSMutableString *part = [NSMutableString stringWithFormat:@"%@ en%d st%ld edgeMenu%d cancel%d del=%@",
+            cls, gesture.enabled ? 1 : 0, (long)gesture.state, edgeMenu ? 1 : 0,
+            gesture.cancelsTouchesInView ? 1 : 0, delegate];
+        if ([gesture isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
+            [part appendFormat:@" edges%lu", (unsigned long)((UIScreenEdgePanGestureRecognizer *)gesture).edges];
+        }
+        [parts addObject:part];
+        if (parts.count >= 5) {
+            [parts addObject:@"..."];
+            break;
         }
     }
-    for (UIView *sub in view.subviews) nfb_appendTopChromeDiagInView(s, sub, root, depth + 1);
+    return [parts componentsJoinedByString:@";"];
+}
+
+static NSString *nfb_diagScrollSummaryForView(UIView *view) {
+    if (![view isKindOfClass:[UIScrollView class]]) return @"-";
+    UIScrollView *sv = (UIScrollView *)view;
+    return [NSString stringWithFormat:@"off=(%.1f,%.1f) content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f) paging=%d bounceH=%d drag=%d",
+        sv.contentOffset.x, sv.contentOffset.y,
+        sv.contentSize.width, sv.contentSize.height,
+        sv.bounds.size.width, sv.bounds.size.height,
+        sv.contentInset.top, sv.contentInset.left, sv.contentInset.bottom, sv.contentInset.right,
+        sv.adjustedContentInset.top, sv.adjustedContentInset.left, sv.adjustedContentInset.bottom, sv.adjustedContentInset.right,
+        sv.pagingEnabled ? 1 : 0,
+        sv.alwaysBounceHorizontal ? 1 : 0,
+        (sv.isDragging || sv.isTracking || sv.isDecelerating) ? 1 : 0];
+}
+
+static BOOL nfb_diagStringLooksSpaces(NSString *value) {
+    if (!value.length) return NO;
+    NSString *lower = [value lowercaseString];
+    return [lower containsString:@"space"] ||
+        [lower containsString:@"spaces"] ||
+        [value containsString:@"スペース"] ||
+        [value containsString:@"スペースバー"] ||
+        [value containsString:@"進行中"];
+}
+
+static void nfb_appendTopChromeDiagInView(NSMutableString *s, UIView *view, UIView *root, int depth, NSInteger *count) {
+    if (!view || !root || depth > 12 || *count >= 180) return;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    BOOL saved = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey) != nil;
+    BOOL collapsed = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey) != nil;
+    if (CGRectGetMinY(frame) <= 320.0 && frame.size.height >= 1.0 && frame.size.height <= 320.0 && frame.size.width >= 36.0) {
+        NSString *cls = NSStringFromClass(view.class);
+        BOOL barLike = [cls containsString:@"Segment"] || [cls containsString:@"Bar"] || [cls containsString:@"Label"] ||
+            [cls containsString:@"Header"] || [cls containsString:@"Tab"] || [cls containsString:@"Space"] ||
+            [cls containsString:@"Fleet"] || [cls containsString:@"Audio"] || [cls containsString:@"Voice"];
+        NSString *t = nfb_diagTextForView(view, 72);
+        BOOL hasText = ![t isEqualToString:@"-"];
+        BOOL chromeLike = barLike || nfb_viewLooksLikeHomeSegmentBar(view, root) || nfb_viewLooksLikeSpacesChrome(view, root);
+        BOOL interesting = hasText || chromeLike || saved || collapsed || view.gestureRecognizers.count ||
+            ((view.hidden || view.alpha < 0.99) && CGRectGetMinY(frame) <= 240.0 && frame.size.height >= 8.0);
+        if (interesting) {
+            (*count)++;
+            [s appendFormat:@"  top d=%d class=%@ f=(%.0f,%.0f,%.0f,%.0f) hidden=%d alpha=%.2f ui=%d gestures=%lu saved=%d collapsed=%d hc=%@ super=%@ text=%@\n",
+                depth, cls, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+                view.hidden ? 1 : 0, view.alpha, view.userInteractionEnabled ? 1 : 0,
+                (unsigned long)view.gestureRecognizers.count, saved ? 1 : 0, collapsed ? 1 : 0,
+                nfb_columnsConstraintSummaryForView(view),
+                view.superview ? NSStringFromClass(view.superview.class) : @"nil",
+                t];
+        }
+    }
+    for (UIView *sub in view.subviews) {
+        nfb_appendTopChromeDiagInView(s, sub, root, depth + 1, count);
+        if (*count >= 180) break;
+    }
 }
 static void nfb_appendTopChromeDiag(NSMutableString *s) {
-    [s appendString:@"--- topChrome (MinY<=240, bar-like / has text) ---\n"];
+    [s appendString:@"--- topChrome (MinY<=320, includes hidden/transparent candidates) ---\n"];
+    NSInteger count = 0;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        nfb_appendTopChromeDiagInView(s, w, w, 0, &count);
+        if (count >= 180) break;
+    }
+    if (count >= 180) [s appendString:@"  top truncated=1 limit=180\n"];
+}
+
+static void nfb_appendCoveringViewsDiagInView(NSMutableString *s, UIView *view, UIView *root, UIView *pagingView, CGRect focus, int depth, NSInteger *count) {
+    if (!view || !root || depth > 14 || *count >= 120) return;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    BOOL intersects = CGRectIntersectsRect(frame, focus);
+    BOOL containsPaging = pagingView && nfb_viewContainsDescendant(view, pagingView);
+    BOOL pagingSurface = nfb_columnsPagingSurface(view);
+    BOOL saved = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey) != nil;
+    BOOL collapsed = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey) != nil;
+    NSString *cls = NSStringFromClass(view.class);
+    NSString *text = nfb_diagTextForView(view, 72);
+    BOOL hasText = ![text isEqualToString:@"-"];
+    BOOL chromeLike = nfb_viewLooksLikeHomeSegmentBar(view, root) || nfb_viewLooksLikeSpacesChrome(view, root) ||
+        [cls containsString:@"Segment"] || [cls containsString:@"Bar"] || [cls containsString:@"Header"] ||
+        [cls containsString:@"Space"] || [cls containsString:@"Fleet"] || [cls containsString:@"Audio"] ||
+        [cls containsString:@"Voice"];
+    BOOL potentialBlocker = view.userInteractionEnabled && !containsPaging && !pagingSurface &&
+        frame.size.width >= 36.0 && frame.size.height >= 1.0 &&
+        (CGRectGetMinY(frame) <= 320.0 || (gInlineColumnsEnabled && frame.size.height >= 32.0));
+    BOOL interesting = intersects && depth > 0 && !containsPaging && !pagingSurface &&
+        (saved || collapsed || chromeLike || hasText || view.gestureRecognizers.count || potentialBlocker);
+    if (interesting) {
+        (*count)++;
+        [s appendFormat:@"cover[%ld] d=%d class=%@ f=(%.1f,%.1f,%.1f,%.1f) hidden=%d alpha=%.2f ui=%d gestures=%@ saved=%d collapsed=%d hc=%@ super=%@ text=%@\n",
+            (long)*count, depth, cls,
+            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+            view.hidden ? 1 : 0, view.alpha, view.userInteractionEnabled ? 1 : 0,
+            nfb_diagGestureSummaryForView(view), saved ? 1 : 0, collapsed ? 1 : 0,
+            nfb_columnsConstraintSummaryForView(view),
+            view.superview ? NSStringFromClass(view.superview.class) : @"nil",
+            text];
+    }
+    for (UIView *subview in view.subviews) {
+        nfb_appendCoveringViewsDiagInView(s, subview, root, pagingView, focus, depth + 1, count);
+    }
+}
+
+static void nfb_appendCoveringViewsDiag(NSMutableString *s) {
+    [s appendString:@"--- coveringViews (non-paging views intersecting column/top area) ---\n"];
+    UIViewController *paging = nfb_findVisibleHomePagingController();
+    UIView *pagingView = (paging && [paging isViewLoaded]) ? paging.view : nil;
+    NSInteger count = 0;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        CGRect focus = w.bounds;
+        if (pagingView && pagingView.window == w) {
+            focus = pagingView.superview ? [pagingView.superview convertRect:pagingView.frame toView:w] : [pagingView convertRect:pagingView.bounds toView:w];
+            focus = CGRectInset(focus, -4.0, -80.0);
+        }
+        [s appendFormat:@"coverWindow key=%d hidden=%d alpha=%.2f root=%@ focus=(%.1f,%.1f,%.1f,%.1f)\n",
+            w.isKeyWindow ? 1 : 0, w.hidden ? 1 : 0, w.alpha,
+            w.rootViewController ? NSStringFromClass(w.rootViewController.class) : @"nil",
+            focus.origin.x, focus.origin.y, focus.size.width, focus.size.height];
+        nfb_appendCoveringViewsDiagInView(s, w, w, pagingView, focus, 0, &count);
+    }
+}
+
+static void nfb_appendGestureDiagInView(NSMutableString *s, UIView *view, UIView *root, int depth, NSInteger *count) {
+    if (!view || !root || depth > 16 || *count >= 160) return;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    NSString *viewClass = NSStringFromClass(view.class);
+    for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
+        NSString *gestureClass = NSStringFromClass(gesture.class);
+        BOOL edgeMenu = nfb_columnsShouldTreatGestureAsEdgeMenu(gesture);
+        BOOL interesting = edgeMenu || [gestureClass containsString:@"Pan"] || [gestureClass containsString:@"Swipe"] ||
+            [gestureClass containsString:@"Edge"] || [viewClass containsString:@"Scroll"] ||
+            [viewClass containsString:@"Paging"] || CGRectGetMinY(frame) <= 320.0;
+        if (!interesting) continue;
+        (*count)++;
+        NSString *delegate = gesture.delegate ? NSStringFromClass([gesture.delegate class]) : @"nil";
+        NSString *edges = @"-";
+        if ([gesture isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
+            edges = [NSString stringWithFormat:@"%lu", (unsigned long)((UIScreenEdgePanGestureRecognizer *)gesture).edges];
+        }
+        [s appendFormat:@"gesture[%ld] d=%d view=%@ f=(%.1f,%.1f,%.1f,%.1f) hidden=%d alpha=%.2f g=%@ en=%d st=%ld edgeMenu=%d edges=%@ cancel=%d del=%@ scroll=%@\n",
+            (long)*count, depth, viewClass,
+            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+            view.hidden ? 1 : 0, view.alpha,
+            gestureClass, gesture.enabled ? 1 : 0, (long)gesture.state,
+            edgeMenu ? 1 : 0, edges, gesture.cancelsTouchesInView ? 1 : 0,
+            delegate, nfb_diagScrollSummaryForView(view)];
+        if (*count >= 160) break;
+    }
+    for (UIView *subview in view.subviews) {
+        nfb_appendGestureDiagInView(s, subview, root, depth + 1, count);
+    }
+}
+
+static void nfb_appendGestureDiag(NSMutableString *s) {
+    [s appendString:@"--- gestures (pan/edge/menu candidates) ---\n"];
+    NSInteger count = 0;
     for (UIWindow *w in UIApplication.sharedApplication.windows) {
         if (w.hidden || w.alpha < 0.01) continue;
-        nfb_appendTopChromeDiagInView(s, w, w, 0);
+        nfb_appendGestureDiagInView(s, w, w, 0, &count);
+    }
+}
+
+static void nfb_appendSpacesCandidatesDiagInView(NSMutableString *s, UIView *view, UIView *root, int depth, NSInteger *count) {
+    if (!view || !root || depth > 14 || *count >= 100) return;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    NSString *cls = NSStringFromClass(view.class);
+    NSString *text = nfb_diagTextForView(view, 96);
+    BOOL classLooksSpaces = [cls containsString:@"Space"] || [cls containsString:@"Fleet"] ||
+        [cls containsString:@"Audio"] || [cls containsString:@"Voice"] ||
+        [cls containsString:@"Presence"] || [cls containsString:@"Broadcast"];
+    BOOL looksSpaces = nfb_viewLooksLikeSpacesChrome(view, root) || classLooksSpaces || nfb_diagStringLooksSpaces(text);
+    if (looksSpaces) {
+        (*count)++;
+        [s appendFormat:@"spaces[%ld] d=%d class=%@ f=(%.1f,%.1f,%.1f,%.1f) hidden=%d alpha=%.2f ui=%d gestures=%@ hc=%@ super=%@ text=%@\n",
+            (long)*count, depth, cls,
+            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+            view.hidden ? 1 : 0, view.alpha, view.userInteractionEnabled ? 1 : 0,
+            nfb_diagGestureSummaryForView(view), nfb_columnsConstraintSummaryForView(view),
+            view.superview ? NSStringFromClass(view.superview.class) : @"nil", text];
+    }
+    for (UIView *subview in view.subviews) {
+        nfb_appendSpacesCandidatesDiagInView(s, subview, root, depth + 1, count);
+    }
+}
+
+static void nfb_appendSpacesCandidatesDiag(NSMutableString *s) {
+    [s appendString:@"--- spacesCandidates ---\n"];
+    NSInteger count = 0;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        nfb_appendSpacesCandidatesDiagInView(s, w, w, 0, &count);
     }
 }
 
@@ -2961,6 +3180,23 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
     if (container && [container isViewLoaded] && paging && [paging isViewLoaded] && container != segmented) {
         nfb_appendColumnsChromeDiag(s, container.view, paging.view, container.view, 0);
     }
+}
+
+static NSString *nfb_buildDiagnosticReport(void) {
+    UIViewController *active = gActiveItemsVC;
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"active=%@\n", active ? NSStringFromClass([active class]) : @"(nil)"];
+    if (active) nfb_appendScrollDiag(s, active);
+    NSString *columnsMode = nil;
+    @try { columnsMode = BHTColumnsModeDiagnostic(); } @catch (NSException *e) { columnsMode = nil; }
+    if (columnsMode.length) [s appendString:columnsMode];
+    nfb_appendColumnsDiag(s, active);
+    nfb_appendTopChromeDiag(s);
+    nfb_appendCoveringViewsDiag(s);
+    nfb_appendGestureDiag(s);
+    nfb_appendSpacesCandidatesDiag(s);
+    nfb_dumpTree(nfb_homeRoot(active), 0, s);
+    return s;
 }
 
 static void nfb_layoutActiveHomePaging(void) {
