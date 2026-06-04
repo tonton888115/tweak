@@ -1499,7 +1499,15 @@ static CGFloat gColumnsHiddenBarHeight = 0.0;   // height of the hidden home seg
 static BOOL nfb_columnsShouldTreatGestureAsEdgeMenu(UIGestureRecognizer *gesture) {
     if (!gesture) return NO;
     NSString *cls = NSStringFromClass(gesture.class);
-    return [gesture isKindOfClass:UIScreenEdgePanGestureRecognizer.class] || [cls containsString:@"EdgePan"];
+    NSString *delegateClass = gesture.delegate ? NSStringFromClass([gesture.delegate class]) : @"";
+    BOOL splitOrNavPan = [gesture isKindOfClass:UIPanGestureRecognizer.class] &&
+        ([delegateClass containsString:@"T1AppSplitViewController"] ||
+         [delegateClass containsString:@"NavigationControllerTransitionAnimator"] ||
+         [delegateClass containsString:@"UINavigationInteractiveTransition"]);
+    return [gesture isKindOfClass:UIScreenEdgePanGestureRecognizer.class] ||
+           [cls containsString:@"EdgePan"] ||
+           [cls containsString:@"ParallaxTransitionPan"] ||
+           splitOrNavPan;
 }
 
 static NSInteger nfb_setColumnsEdgeMenuGesturesInView(UIView *view, BOOL enabled, int depth) {
@@ -1740,6 +1748,15 @@ static BOOL nfb_columnsPagingSurface(UIView *view) {
     return [cls containsString:@"Paging"] || ([view isKindOfClass:UIScrollView.class] && view.bounds.size.height > 240.0);
 }
 
+static void nfb_setColumnsChromeDescendantsHidden(UIView *view, BOOL hidden, int depth) {
+    if (!view || depth > 8) return;
+    for (UIView *subview in view.subviews) {
+        if (nfb_columnsProtectedView(subview) || nfb_columnsPagingSurface(subview)) continue;
+        nfb_setColumnsChromeViewHidden(subview, hidden);
+        nfb_setColumnsChromeDescendantsHidden(subview, hidden, depth + 1);
+    }
+}
+
 static BOOL nfb_viewContainsColumnsPagingSurface(UIView *view, int depth) {
     if (!view || depth > 8) return NO;
     if (nfb_columnsPagingSurface(view)) return YES;
@@ -1793,6 +1810,7 @@ static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView
     BOOL did = NO;
     if (view != pagingView && !containsPaging && !pagingSurface && !containsPagingSurface && nfb_columnsChromeCandidate(view, root)) {
         nfb_setColumnsChromeViewHidden(view, YES);
+        nfb_setColumnsChromeDescendantsHidden(view, YES, 0);
         nfb_collapseColumnsChromeAncestorsForView(view, root);
         did = YES;
     }
@@ -1899,6 +1917,7 @@ static NSInteger nfb_setColumnsGlobalTopChromeHiddenInView(UIView *view, UIView 
             if (bf.size.height > 1.0) gColumnsHiddenBarHeight = bf.size.height;
         }
         nfb_setColumnsChromeViewHidden(view, YES);
+        nfb_setColumnsChromeDescendantsHidden(view, YES, 0);
         nfb_collapseColumnsChromeAncestorsForView(view, root);
         count++;
     }
@@ -1998,7 +2017,10 @@ static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC
     nfb_collectSegmentedChromeViewsInViewTree(root, bars, seen, root, 0);
     for (UIView *bar in bars) {
         nfb_setColumnsChromeViewHidden(bar, gInlineColumnsEnabled);
-        if (gInlineColumnsEnabled) nfb_collapseColumnsChromeAncestorsForView(bar, root);
+        if (gInlineColumnsEnabled) {
+            nfb_setColumnsChromeDescendantsHidden(bar, YES, 0);
+            nfb_collapseColumnsChromeAncestorsForView(bar, root);
+        }
     }
 }
 
@@ -2016,8 +2038,9 @@ static CGFloat nfb_columnsColumnWidth(CGFloat viewportWidth) {
 }
 
 static CGFloat nfb_columnsTopShift(void) {
-    CGFloat shift = gColumnsHiddenBarHeight;
-    return MIN(MAX(shift, 0.0), 56.0);
+    // Segment/header chrome is collapsed in place. Shifting pages again leaves the
+    // timeline under the navigation chrome and creates the visible top gap.
+    return 0.0;
 }
 
 static void nfb_rememberColumnOriginalViewState(UIView *view) {
@@ -2285,7 +2308,10 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     }
     if (host && gColumnsAllTopButton) {
         CGRect hostBounds = host.bounds;
-        gColumnsAllTopButton.frame = CGRectMake(MAX(12.0, hostBounds.size.width - 128.0), 10.0, 116.0, 34.0);
+        CGFloat safeTop = host.window ? host.window.safeAreaInsets.top : host.safeAreaInsets.top;
+        CGFloat buttonY = MAX(12.0, safeTop + 56.0);
+        buttonY = MIN(buttonY, MAX(12.0, hostBounds.size.height - 56.0));
+        gColumnsAllTopButton.frame = CGRectMake(MAX(12.0, hostBounds.size.width - 128.0), buttonY, 116.0, 34.0);
         [host bringSubviewToFront:gColumnsAllTopButton];
     }
 
@@ -3310,6 +3336,16 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 }
 
 #pragma mark - Hooks
+
+%hook UIGestureRecognizer
+- (void)setEnabled:(BOOL)enabled {
+    if (enabled && gInlineColumnsEnabled && nfb_columnsShouldTreatGestureAsEdgeMenu(self)) {
+        %orig(NO);
+        return;
+    }
+    %orig(enabled);
+}
+%end
 
 // Button lifecycle on the stable Home container.
 %hook THFHomeTimelineContainerViewController

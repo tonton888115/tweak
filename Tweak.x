@@ -77,6 +77,16 @@ static BOOL BHTShouldHideSpacesBarNow(void) {
     return [BHTManager hideSpacesBar] || NFBInlineColumnsEnabled();
 }
 
+static char kBHTSpacesChromeSavedKey;
+static char kBHTSpacesChromeHiddenKey;
+static char kBHTSpacesChromeAlphaKey;
+static char kBHTSpacesChromeInteractionKey;
+static char kBHTSpacesChromeFrameKey;
+static char kBHTSpacesChromeBoundsKey;
+static char kBHTSpacesChromeClipsKey;
+static char kBHTSpacesChromeConstraintsKey;
+static char kBHTSpacesChromeGesturesKey;
+
 static BOOL BHTConstraintLooksLikeSpacesHeight(NSLayoutConstraint *constraint, UIView *view) {
     if (!constraint || !view) return NO;
     BOOL firstHeight = constraint.firstItem == view && constraint.firstAttribute == NSLayoutAttributeHeight;
@@ -86,8 +96,56 @@ static BOOL BHTConstraintLooksLikeSpacesHeight(NSLayoutConstraint *constraint, U
     return c > 0.5 && c <= 260.0;
 }
 
+static NSArray<NSLayoutConstraint *> *BHTSpacesChromeHeightConstraintsForView(UIView *view) {
+    if (!view) return @[];
+    NSMutableArray<NSLayoutConstraint *> *matches = [NSMutableArray array];
+    for (NSLayoutConstraint *constraint in view.constraints) {
+        if (BHTConstraintLooksLikeSpacesHeight(constraint, view)) [matches addObject:constraint];
+    }
+    for (NSLayoutConstraint *constraint in view.superview.constraints) {
+        if (BHTConstraintLooksLikeSpacesHeight(constraint, view)) [matches addObject:constraint];
+    }
+    return matches;
+}
+
+static void BHTSaveSpacesChromeViewIfNeeded(UIView *view) {
+    if (!view || objc_getAssociatedObject(view, &kBHTSpacesChromeSavedKey)) return;
+    objc_setAssociatedObject(view, &kBHTSpacesChromeSavedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeHiddenKey, @(view.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeAlphaKey, @(view.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeInteractionKey, @(view.userInteractionEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeFrameKey, [NSValue valueWithCGRect:view.frame], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeBoundsKey, [NSValue valueWithCGRect:view.bounds], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeClipsKey, @(view.clipsToBounds), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    NSMutableArray<NSDictionary *> *savedConstraints = [NSMutableArray array];
+    for (NSLayoutConstraint *constraint in BHTSpacesChromeHeightConstraintsForView(view)) {
+        [savedConstraints addObject:@{@"constraint": constraint, @"constant": @(constraint.constant)}];
+    }
+    if (savedConstraints.count) {
+        objc_setAssociatedObject(view, &kBHTSpacesChromeConstraintsKey, savedConstraints, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    NSMutableArray<NSDictionary *> *savedGestures = [NSMutableArray array];
+    for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
+        [savedGestures addObject:@{@"gesture": gesture, @"enabled": @(gesture.enabled)}];
+    }
+    if (savedGestures.count) {
+        objc_setAssociatedObject(view, &kBHTSpacesChromeGesturesKey, savedGestures, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 static void BHTCollapseSpacesChromeView(UIView *view) {
     if (!view || !BHTShouldHideSpacesBarNow()) return;
+    BHTSaveSpacesChromeViewIfNeeded(view);
+    NSArray<NSDictionary *> *savedConstraints = objc_getAssociatedObject(view, &kBHTSpacesChromeConstraintsKey);
+    for (NSDictionary *entry in savedConstraints) {
+        NSLayoutConstraint *constraint = entry[@"constraint"];
+        if (constraint) constraint.constant = 0.0;
+    }
+    for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
+        gesture.enabled = NO;
+    }
     view.hidden = YES;
     view.alpha = 0.0;
     view.userInteractionEnabled = NO;
@@ -110,6 +168,68 @@ static void BHTCollapseSpacesChromeView(UIView *view) {
     }
 }
 
+static void BHTRestoreSpacesChromeView(UIView *view) {
+    if (!view || !objc_getAssociatedObject(view, &kBHTSpacesChromeSavedKey)) return;
+    NSArray<NSDictionary *> *savedConstraints = objc_getAssociatedObject(view, &kBHTSpacesChromeConstraintsKey);
+    for (NSDictionary *entry in savedConstraints) {
+        NSLayoutConstraint *constraint = entry[@"constraint"];
+        NSNumber *constant = entry[@"constant"];
+        if (constraint && constant) constraint.constant = constant.doubleValue;
+    }
+    NSArray<NSDictionary *> *savedGestures = objc_getAssociatedObject(view, &kBHTSpacesChromeGesturesKey);
+    for (NSDictionary *entry in savedGestures) {
+        UIGestureRecognizer *gesture = entry[@"gesture"];
+        NSNumber *enabled = entry[@"enabled"];
+        if (gesture && enabled) gesture.enabled = enabled.boolValue;
+    }
+    NSValue *frame = objc_getAssociatedObject(view, &kBHTSpacesChromeFrameKey);
+    NSValue *bounds = objc_getAssociatedObject(view, &kBHTSpacesChromeBoundsKey);
+    NSNumber *clips = objc_getAssociatedObject(view, &kBHTSpacesChromeClipsKey);
+    NSNumber *hidden = objc_getAssociatedObject(view, &kBHTSpacesChromeHiddenKey);
+    NSNumber *alpha = objc_getAssociatedObject(view, &kBHTSpacesChromeAlphaKey);
+    NSNumber *interactive = objc_getAssociatedObject(view, &kBHTSpacesChromeInteractionKey);
+    if (frame) view.frame = frame.CGRectValue;
+    if (bounds) view.bounds = bounds.CGRectValue;
+    if (clips) view.clipsToBounds = clips.boolValue;
+    view.hidden = hidden ? hidden.boolValue : NO;
+    view.alpha = alpha ? alpha.doubleValue : 1.0;
+    view.userInteractionEnabled = interactive ? interactive.boolValue : YES;
+    objc_setAssociatedObject(view, &kBHTSpacesChromeSavedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeInteractionKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeFrameKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeBoundsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeClipsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeConstraintsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kBHTSpacesChromeGesturesKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void BHTRestoreSpacesChromeTree(UIView *view, NSInteger depth) {
+    if (!view || depth > 8) return;
+    BHTRestoreSpacesChromeView(view);
+    for (UIView *subview in view.subviews) {
+        BHTRestoreSpacesChromeTree(subview, depth + 1);
+    }
+}
+
+static void BHTRestoreSpacesChromeViewAndNearbyContainers(UIView *view) {
+    if (!view) return;
+    BHTRestoreSpacesChromeTree(view, 0);
+    UIView *current = view.superview;
+    for (NSInteger depth = 0; current && depth < 3; depth++, current = current.superview) {
+        BHTRestoreSpacesChromeView(current);
+    }
+}
+
+static void BHTRestoreAllSavedSpacesChrome(void) {
+    if ([BHTManager hideSpacesBar]) return;
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (!window) continue;
+        BHTRestoreSpacesChromeTree(window, 0);
+    }
+}
+
 static BOOL BHTLooksLikeSpacesChromeClass(UIView *view) {
     if (!view) return NO;
     NSString *cls = NSStringFromClass(view.class);
@@ -129,7 +249,7 @@ static void BHTCollapseSpacesChromeDescendants(UIView *view, NSInteger depth) {
     for (UIView *subview in view.subviews) {
         NSString *cls = NSStringFromClass(subview.class);
         CGRect frame = subview.frame;
-        BOOL shortChild = frame.size.height > 0.5 && frame.size.height <= 260.0 && frame.size.width >= 40.0;
+        BOOL shortChild = frame.size.height >= 0.0 && frame.size.height <= 260.0 && frame.size.width >= 40.0;
         BOOL scrollChild = [subview isKindOfClass:UIScrollView.class] ||
             [cls containsString:@"CollectionView"] || [cls containsString:@"ScrollView"];
         if (shortChild && (scrollChild || BHTLooksLikeSpacesChromeClass(subview))) {
@@ -140,9 +260,13 @@ static void BHTCollapseSpacesChromeDescendants(UIView *view, NSInteger depth) {
 }
 
 static void BHTCollapseSpacesChromeViewAndNearbyContainers(UIView *view) {
-    if (!view || !BHTShouldHideSpacesBarNow()) return;
-    BHTCollapseSpacesChromeView(view);
+    if (!view) return;
+    if (!BHTShouldHideSpacesBarNow()) {
+        BHTRestoreSpacesChromeViewAndNearbyContainers(view);
+        return;
+    }
     BHTCollapseSpacesChromeDescendants(view, 0);
+    BHTCollapseSpacesChromeView(view);
     UIView *current = view.superview;
     for (NSInteger depth = 0; current && depth < 3; depth++, current = current.superview) {
         NSString *cls = NSStringFromClass(current.class);
@@ -4932,6 +5056,7 @@ void BHTDismissColumnsMode(void) {
     gBHTSelectingHomeForColumns = NO;
     NFBLogSnapshot(@"dismiss.entry");
     NFBSetInlineColumnsEnabled(NO);
+    BHTRestoreAllSavedSpacesChrome();
     // Capture the cleanup result after the async restore settles, to catch leftover artifacts.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NFBLogSnapshot(@"dismiss+0.30"); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.90 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NFBLogSnapshot(@"dismiss+0.90"); });
@@ -5107,17 +5232,17 @@ void BHTPresentColumnsMode(void) {
     gBHTColumnsHostController = hostController;
 
     gBHTSelectingHomeForColumns = YES;
-    BOOL selectedHome = BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
+    __block BOOL selectedHome = BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
     NFBLogEvent([NSString stringWithFormat:@"present.selectHome=%d", selectedHome ? 1 : 0]);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gBHTColumnsIntent) return;
-        BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
+        if (!selectedHome) selectedHome = BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gBHTColumnsIntent) { gBHTSelectingHomeForColumns = NO; NFBLogSnapshot(@"present+0.55(intent dropped)"); return; }
-        if (!NFBInlineColumnsEnabled()) BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
+        if (!NFBInlineColumnsEnabled() && !selectedHome) selectedHome = BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
         gBHTSelectingHomeForColumns = NO;
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
@@ -5131,7 +5256,7 @@ void BHTPresentColumnsMode(void) {
         }
         BOOL oldSelectingHome = gBHTSelectingHomeForColumns;
         gBHTSelectingHomeForColumns = YES;
-        BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
+        if (!selectedHome) selectedHome = BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
         gBHTSelectingHomeForColumns = oldSelectingHome;
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
