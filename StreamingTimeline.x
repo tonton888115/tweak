@@ -1577,6 +1577,7 @@ static BOOL nfb_columnsShouldTreatGestureAsEdgeMenu(UIGestureRecognizer *gesture
            [cls containsString:@"EdgePan"] ||
            [cls containsString:@"ParallaxTransitionPan"] ||
            [cls containsString:@"FlexInteractionPan"] ||
+           [delegateClass containsString:@"FlexInteraction"] ||
            splitOrNavPan;
 }
 
@@ -2194,6 +2195,15 @@ static void nfb_collectSegmentedChromeViewsInViewTree(UIView *view, NSMutableArr
     }
 }
 
+static BOOL nfb_viewTreeContainsHomeSegmentBar(UIView *view, UIView *root, int depth) {
+    if (!view || !root || depth > 18) return NO;
+    if (nfb_viewLooksLikeHomeSegmentBar(view, root)) return YES;
+    for (UIView *subview in view.subviews) {
+        if (nfb_viewTreeContainsHomeSegmentBar(subview, root, depth + 1)) return YES;
+    }
+    return NO;
+}
+
 // Hide the Home segment bar (おすすめ / フォロー中 / pinned-list tabs) while columns mode is on by
 // targeting TFNScrollingSegmentedViewController's own scrolling control directly, instead of the
 // frame/text heuristics that were latching onto the wrong full-screen view. Runs from the
@@ -2201,7 +2211,9 @@ static void nfb_collectSegmentedChromeViewsInViewTree(UIView *view, NSMutableArr
 // finish yet. Gated to the Home instance and reuses the save/restore used by the rest of chrome.
 static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC) {
     if (!segmentedVC || ![segmentedVC isViewLoaded]) return;
-    if (!nfb_parentControllerNamed(segmentedVC, @"HomeTimelineContainer")) {
+    BOOL homeSegmented = nfb_parentControllerNamed(segmentedVC, @"HomeTimelineContainer") != nil ||
+        nfb_viewTreeContainsHomeSegmentBar(segmentedVC.view, segmentedVC.view, 0);
+    if (!homeSegmented) {
         nfb_restoreColumnsChromeInView(segmentedVC.view, 0);
         return; // Home only; search/explore segmented/search bars must never stay hidden here.
     }
