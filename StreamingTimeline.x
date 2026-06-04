@@ -1720,12 +1720,7 @@ static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView
     BOOL pagingSurface = nfb_columnsPagingSurface(view);
     BOOL containsPagingSurface = nfb_viewContainsColumnsPagingSurface(view, 0);
     if (pagingSurface) return NO;
-    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
-    BOOL fullScreenChromeLayer = view != root && view != pagingView && !containsPaging &&
-        !pagingSurface && !containsPagingSurface &&
-        CGRectGetMinY(frame) <= 280.0 && frame.size.width >= root.bounds.size.width * 0.6 &&
-        frame.size.height > 260.0 && frame.size.height <= root.bounds.size.height + 80.0 && depth <= 4;
-    if (view != pagingView && !containsPaging && !pagingSurface && !containsPagingSurface && (nfb_columnsChromeCandidate(view, root) || fullScreenChromeLayer)) {
+    if (view != pagingView && !containsPaging && !pagingSurface && !containsPagingSurface && nfb_columnsChromeCandidate(view, root)) {
         nfb_setColumnsChromeViewHidden(view, YES);
         return YES;
     }
@@ -1741,6 +1736,13 @@ static void nfb_restoreColumnsChromeInView(UIView *view, int depth) {
     nfb_setColumnsChromeViewHidden(view, NO);
     for (UIView *subview in view.subviews) {
         nfb_restoreColumnsChromeInView(subview, depth + 1);
+    }
+}
+
+static void nfb_restoreAllSavedColumnsChrome(void) {
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (!window) continue;
+        nfb_restoreColumnsChromeInView(window, 0);
     }
 }
 
@@ -1843,6 +1845,7 @@ static void nfb_setColumnsGlobalTopChromeHidden(BOOL hidden) {
         if (window.hidden || window.alpha < 0.01) continue;
         nfb_setColumnsGlobalTopChromeHiddenInView(window, window, hidden, 0);
     }
+    if (!hidden) nfb_restoreAllSavedColumnsChrome();
 }
 
 static void nfb_setColumnsSegmentedHiddenForPaging(UIViewController *paging, BOOL hidden) {
@@ -2242,21 +2245,39 @@ static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging) {
 
 static void nfb_requestColumnsPagingPreload(UIViewController *paging) {
     if (!paging) return;
+    static NSTimeInterval lastPreloadRequest = 0.0;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - lastPreloadRequest < 0.60) return;
+    lastPreloadRequest = now;
+    NFBLogEvent([NSString stringWithFormat:@"columnsPreload paging=%@",
+        paging ? NSStringFromClass(paging.class) : @"nil"]);
     UIViewController *segmented = nfb_parentControllerNamed(paging, @"Segmented");
     UIViewController *container = nfb_parentControllerNamed(paging, @"HomeTimelineContainer");
     if (container && [container respondsToSelector:@selector(loadInitialPinnedTimelines)]) {
         ((void(*)(id, SEL))objc_msgSend)(container, @selector(loadInitialPinnedTimelines));
     }
+    for (NSString *name in @[@"_t1_reloadContentViewControllerContentsWhenContentReady",
+                             @"_t1_reloadContentViewControllerContents"]) {
+        SEL sel = NSSelectorFromString(name);
+        if (container && [container respondsToSelector:sel]) {
+            ((void(*)(id, SEL))objc_msgSend)(container, sel);
+        }
+    }
     if (segmented && [segmented respondsToSelector:@selector(setPreloadContent:)]) {
         ((void(*)(id, SEL, BOOL))objc_msgSend)(segmented, @selector(setPreloadContent:), YES);
+    }
+    for (NSString *name in @[@"preloadContent", @"reloadLabelBarData",
+                             @"_tfn_reloadViewControllerDataIfNeeded",
+                             @"reloadViewControllerData"]) {
+        SEL sel = NSSelectorFromString(name);
+        if (segmented && [segmented respondsToSelector:sel]) {
+            ((void(*)(id, SEL))objc_msgSend)(segmented, sel);
+        }
     }
     if ([paging respondsToSelector:@selector(setPreloadPolicy:)]) {
         // Required for pinned-list pages that have not been opened manually; without this the
         // off-screen columns can remain loaded but empty.
         ((void(*)(id, SEL, NSInteger))objc_msgSend)(paging, @selector(setPreloadPolicy:), 2);
-    }
-    if (segmented && [segmented respondsToSelector:@selector(reloadVisibleTabs)]) {
-        ((void(*)(id, SEL))objc_msgSend)(segmented, @selector(reloadVisibleTabs));
     }
     for (NSString *name in @[@"reloadInvisibleViewControllers", @"reloadVisibleViewControllers", @"reloadViewControllers"]) {
         SEL sel = NSSelectorFromString(name);
@@ -2497,6 +2518,28 @@ static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void) {
     return pages;
 }
 
+static NSString *nfb_columnsPageSummary(UIViewController *paging) {
+    if (!paging) return @"-";
+    NSArray<UIViewController *> *all = nfb_allHomePagingTimelinePages(paging);
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    NSUInteger idx = 0;
+    for (UIViewController *page in all) {
+        NSString *identity = nfb_columnTimelineIdentity(page);
+        if (identity.length > 52) identity = [[identity substringToIndex:52] stringByAppendingString:@"..."];
+        UIScrollView *sv = [page isViewLoaded] ? nfb_mainScrollViewOf(page) : nil;
+        [parts addObject:[NSString stringWithFormat:@"%lu:%@ use%d rec%d h%.0f %@",
+            (unsigned long)idx,
+            page ? NSStringFromClass(page.class) : @"nil",
+            nfb_shouldUseTimelinePageAsColumn(page) ? 1 : 0,
+            nfb_isRecommendedHomeTimeline(page) ? 1 : 0,
+            sv ? sv.contentSize.height : -1.0,
+            identity.length ? identity : @"-"]];
+        idx++;
+        if (parts.count >= 6) break;
+    }
+    return [parts componentsJoinedByString:@";"];
+}
+
 static UIViewController *nfb_firstColumnTimelineAwayFromTopExcept(UIViewController *allowedRevealing) {
     for (UIViewController *page in nfb_currentColumnTimelinePages()) {
         if (![page isViewLoaded] || page.view.window == nil) continue;
@@ -2699,6 +2742,9 @@ void NFBLogSnapshot(NSString *reason) {
         i++;
     }
     [s appendString:@"] "];
+    if (gInlineColumnsEnabled || [reason containsString:@"present"]) {
+        [s appendFormat:@"pageList=%@ ", nfb_columnsPageSummary(paging)];
+    }
     [s appendFormat:@"allTopBtn=%d/sup%d ", gColumnsAllTopButton ? 1 : 0, (gColumnsAllTopButton && gColumnsAllTopButton.superview) ? 1 : 0];
     [s appendFormat:@"edgeGestures=%ld/en%ld ", (long)nfb_countColumnsEdgeMenuGestures(), (long)nfb_countEnabledColumnsEdgeMenuGestures()];
     UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
@@ -2837,7 +2883,10 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     }
     if (gInlineColumnsEnabled != enabled) NFBLogEvent([NSString stringWithFormat:@"NFBSetInlineColumns -> %d", enabled]);
     gInlineColumnsEnabled = enabled;
-    if (!enabled) nfb_updateColumnsEdgeMenuGesturesForOffset(0.0);
+    if (!enabled) {
+        nfb_updateColumnsEdgeMenuGesturesForOffset(0.0);
+        nfb_restoreAllSavedColumnsChrome();
+    }
     if (enabled) {
         UIViewController *paging = nfb_findAnyHomePagingController();
         if (paging) {
