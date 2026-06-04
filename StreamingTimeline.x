@@ -1939,14 +1939,6 @@ static BOOL nfb_globalTopColumnsChromeCandidate(UIView *view, UIView *root) {
     if (!nfb_viewContainsColumnsPagingSurface(view, 0) && nfb_viewLooksLikeHomeSegmentBar(view, root)) return YES;
     CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
     NSString *cls = NSStringFromClass(view.class);
-    BOOL topBackdrop = CGRectGetMinY(frame) <= 80.0 && frame.size.height >= 80.0 && frame.size.height <= 320.0 &&
-        frame.size.width >= root.bounds.size.width * 0.7 &&
-        !nfb_viewContainsColumnsPagingSurface(view, 0) &&
-        !nfb_viewContainsNavigationChrome(view, 0) &&
-        nfb_viewContainsHomeTopChrome(view, 0) &&
-        ([cls isEqualToString:@"UIView"] || [cls containsString:@"VisualEffect"] ||
-         [cls containsString:@"StackView"] || [cls containsString:@"CustomHitTest"]);
-    if (topBackdrop) return YES;
     if (CGRectGetMinY(frame) > 240.0 || frame.size.width < 24.0 || frame.size.height < 4.0 || frame.size.height > 220.0) return NO;
     NSString *text = nfb_textOfView(view);
     NSString *lower = text.lowercaseString;
