@@ -1579,6 +1579,15 @@ static BOOL nfb_globalTopColumnsChromeCandidate(UIView *view, UIView *root) {
     if ([cls containsString:@"HomeSegment"] || [cls containsString:@"Segmented"] ||
         [cls containsString:@"LabelBar"] || [cls containsString:@"HorizontalLabel"] ||
         [cls containsString:@"SegmentedLabel"]) return YES;
+    // Docked overlay bar below the nav bar (e.g. the Spaces "他N人" bar at y~150): a short, wide strip
+    // with text, sitting on top of the columns. The window walk stops at the paging surface, so this
+    // never sees a tweet cell inside a column — only sibling overlays.
+    if (CGRectGetMinY(frame) >= 110.0 && frame.size.height >= 20.0 && frame.size.height <= 120.0 &&
+        frame.size.width >= root.bounds.size.width * 0.7 && !nfb_viewContainsColumnsPagingSurface(view, 0)) {
+        NSMutableString *dockTxt = [NSMutableString string];
+        nfb_appendDescendantText(view, dockTxt, 0);
+        if (dockTxt.length) return YES;
+    }
     return NO;
 }
 
@@ -1942,6 +1951,12 @@ static void nfb_requestColumnsPagingPreload(UIViewController *paging) {
     }
     if (segmented && [segmented respondsToSelector:@selector(setPreloadContent:)]) {
         ((void(*)(id, SEL, BOOL))objc_msgSend)(segmented, @selector(setPreloadContent:), YES);
+    }
+    if ([paging respondsToSelector:@selector(setPreloadPolicy:)]) {
+        // Push the pager toward preloading every page so off-screen pinned-list columns fetch their
+        // data without the user pre-opening each list first. 2 is a guess at an "all/aggressive"
+        // policy; harmless if the enum differs.
+        ((void(*)(id, SEL, NSInteger))objc_msgSend)(paging, @selector(setPreloadPolicy:), 2);
     }
     if (segmented && [segmented respondsToSelector:@selector(reloadVisibleTabs)]) {
         ((void(*)(id, SEL))objc_msgSend)(segmented, @selector(reloadVisibleTabs));

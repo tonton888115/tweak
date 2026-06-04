@@ -4243,6 +4243,20 @@ static UIViewController *BHTFindControllerOfClass(UIViewController *root, Class 
     return nil;
 }
 
+// The key window's root can be a T1HostViewController that doesn't expose T1TabBarViewController as a
+// findable descendant (log showed tabSel=-1 → BHTSelectTabPage couldn't reselect Home, so Home never
+// came back). Fall back to scanning every window for the tab bar.
+static UIViewController *BHTFindTabBarController(void) {
+    Class cls = NSClassFromString(@"T1TabBarViewController");
+    if (!cls) return nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
+        if (w.hidden || w.alpha < 0.01) continue;
+        UIViewController *found = BHTFindControllerOfClass(w.rootViewController, cls, 0);
+        if (found) return found;
+    }
+    return nil;
+}
+
 static id BHTFindValueInControllerTree(UIViewController *root, NSString *key, NSInteger depth) {
     if (!root || !key.length || depth > 12) return nil;
     @try {
@@ -4282,6 +4296,7 @@ static NSInteger BHTTabIndexForPage(UIViewController *tabBarController, NSString
 
 static void BHTSelectTabPage(UIViewController *root, NSString *pageID) {
     UIViewController *tabBarController = BHTFindControllerOfClass(root, NSClassFromString(@"T1TabBarViewController"), 0);
+    if (!tabBarController) tabBarController = BHTFindTabBarController();   // root may be a T1HostViewController that hides it
     NSInteger index = BHTTabIndexForPage(tabBarController, pageID);
     if (index == NSNotFound) return;
     SEL sel = @selector(setSelectedIndex:);
@@ -4586,8 +4601,7 @@ NSString *BHTColumnsLogFlags(void) {
     NSInteger sel = -1;
     NSString *selPage = @"?";
     @try {
-        UIWindow *w = BHT_activeKeyWindow();
-        UIViewController *tb = w.rootViewController ? BHTFindControllerOfClass(w.rootViewController, NSClassFromString(@"T1TabBarViewController"), 0) : nil;
+        UIViewController *tb = BHTFindTabBarController();
         if (tb) {
             NSNumber *si = [tb valueForKey:@"selectedIndex"];
             if ([si respondsToSelector:@selector(integerValue)]) sel = si.integerValue;
