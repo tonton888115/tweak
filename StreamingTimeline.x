@@ -1573,6 +1573,7 @@ static BOOL nfb_columnsShouldTreatGestureAsEdgeMenu(UIGestureRecognizer *gesture
     return [gesture isKindOfClass:UIScreenEdgePanGestureRecognizer.class] ||
            [cls containsString:@"EdgePan"] ||
            [cls containsString:@"ParallaxTransitionPan"] ||
+           [cls containsString:@"FlexInteractionPan"] ||
            splitOrNavPan;
 }
 
@@ -1632,9 +1633,12 @@ static NSInteger nfb_countEnabledColumnsEdgeMenuGestures(void) {
 }
 
 static NSInteger nfb_setColumnsEdgeMenuGesturesEnabled(BOOL enabled) {
-    if (gColumnsEdgeMenuStateKnown && gColumnsEdgeMenuLastEnabled == enabled) return 0;
+    static NSTimeInterval lastSameStateScan = 0.0;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (gColumnsEdgeMenuStateKnown && gColumnsEdgeMenuLastEnabled == enabled && now - lastSameStateScan < 0.25) return 0;
     gColumnsEdgeMenuStateKnown = YES;
     gColumnsEdgeMenuLastEnabled = enabled;
+    lastSameStateScan = now;
     NSInteger count = 0;
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
         if (window.hidden || window.alpha < 0.01) continue;
@@ -1691,10 +1695,29 @@ static NSArray<NSLayoutConstraint *> *nfb_chromeHeightConstraintsForView(UIView 
 }
 
 static void nfb_collapseColumnsChromeView(UIView *view) {
-    if (!view || objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey)) return;
+    if (!view) return;
+    if (objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey)) {
+        NSArray<NSDictionary *> *savedConstraints = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeConstraintsKey);
+        for (NSDictionary *entry in savedConstraints) {
+            NSLayoutConstraint *constraint = entry[@"constraint"];
+            if (constraint) constraint.constant = 0.0;
+        }
+        CGRect frame = view.frame;
+        CGRect bounds = view.bounds;
+        if (frame.size.height > 0.5 && frame.size.height <= 300.0) {
+            frame.size.height = 0.0;
+            view.frame = frame;
+        }
+        if (bounds.size.height > 0.5 && bounds.size.height <= 300.0) {
+            bounds.size.height = 0.0;
+            view.bounds = bounds;
+        }
+        view.clipsToBounds = YES;
+        return;
+    }
     CGRect frame = view.frame;
     CGRect bounds = view.bounds;
-    BOOL shortChrome = frame.size.height > 0.5 && frame.size.height <= 260.0 && frame.size.width >= 24.0;
+    BOOL shortChrome = frame.size.height > 0.5 && frame.size.height <= 300.0 && frame.size.width >= 24.0;
     NSArray<NSLayoutConstraint *> *heightConstraints = nfb_chromeHeightConstraintsForView(view);
     if (!shortChrome && !heightConstraints.count) return;
 
@@ -1873,6 +1896,7 @@ static BOOL nfb_columnsChromeAncestorRowCandidate(UIView *view, UIView *child, U
     if (!view || !child || !root || view == root) return NO;
     if (nfb_columnsProtectedView(view) || nfb_columnsPagingSurface(view)) return NO;
     if (nfb_viewContainsColumnsPagingSurface(view, 0)) return NO;
+    if (nfb_viewContainsNavigationChrome(view, 0)) return NO;
     NSString *cls = NSStringFromClass(view.class);
     if ([cls containsString:@"NavigationBar"] || [cls containsString:@"UILayoutContainerView"] ||
         [cls containsString:@"TabBar"] || [cls containsString:@"TableView"] ||
@@ -1881,12 +1905,14 @@ static BOOL nfb_columnsChromeAncestorRowCandidate(UIView *view, UIView *child, U
     CGRect childFrame = child.superview ? [child.superview convertRect:child.frame toView:root] : child.frame;
     if (CGRectGetMinY(frame) > 260.0) return NO;
     if (frame.size.width < MIN(root.bounds.size.width * 0.45, 180.0)) return NO;
-    if (frame.size.height < 1.0 || frame.size.height > 90.0) return NO;
+    if (frame.size.height < 1.0 || frame.size.height > 180.0) return NO;
     if (fabs(CGRectGetMinY(frame) - CGRectGetMinY(childFrame)) > 10.0) return NO;
+    BOOL knownChromeChild = nfb_viewContainsHomeTopChrome(child, 0) || nfb_columnsChromeCandidate(child, root);
     BOOL genericRow = [cls containsString:@"StackView"] ||
         [cls containsString:@"LabelBar"] ||
         [cls containsString:@"HorizontalLabel"] ||
-        [cls containsString:@"Segment"];
+        [cls containsString:@"Segment"] ||
+        (knownChromeChild && ([cls isEqualToString:@"UIView"] || [cls containsString:@"CustomHitTest"]));
     return genericRow;
 }
 
@@ -1900,7 +1926,13 @@ static void nfb_collapseColumnsChromeAncestorsForView(UIView *view, UIView *root
         if (gColumnsHiddenBarHeight < 1.0 && frame.size.height > 1.0) {
             gColumnsHiddenBarHeight = frame.size.height;
         }
+        if (gNFBLogRecording && !objc_getAssociatedObject(current, &kNFBInlineColumnsChromeSavedKey)) {
+            NFBLogEvent([NSString stringWithFormat:@"columnsChromeHide ancestor class=%@ f=(%.0f,%.0f,%.0f,%.0f) child=%@",
+                NSStringFromClass(current.class), frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+                child ? NSStringFromClass(child.class) : @"nil"]);
+        }
         nfb_setColumnsChromeViewHidden(current, YES);
+        nfb_setColumnsChromeDescendantsHidden(current, YES, 0);
     }
 }
 
@@ -1962,7 +1994,8 @@ static BOOL nfb_viewLooksLikeHomeSegmentBar(UIView *view, UIView *root) {
     CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
     if (CGRectGetMinY(frame) > 240.0) return NO;
     if (frame.size.height < 20.0 || frame.size.height > 140.0) return NO;
-    if (frame.size.width < root.bounds.size.width * 0.5) return NO;
+    CGFloat minWidth = MIN(root.bounds.size.width * 0.45, 320.0);
+    if (frame.size.width < minWidth) return NO;
     NSMutableString *txt = [NSMutableString string];
     nfb_appendDescendantText(view, txt, 0);
     NSString *lower = txt.lowercaseString;
@@ -1993,6 +2026,13 @@ static BOOL nfb_globalTopColumnsChromeCandidate(UIView *view, UIView *root) {
     if (!nfb_viewContainsColumnsPagingSurface(view, 0) && nfb_viewLooksLikeHomeSegmentBar(view, root)) return YES;
     CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
     NSString *cls = NSStringFromClass(view.class);
+    BOOL containsTopChrome = nfb_viewContainsHomeTopChrome(view, 0);
+    if (containsTopChrome && !nfb_viewContainsColumnsPagingSurface(view, 0) &&
+        !nfb_viewContainsNavigationChrome(view, 0) &&
+        CGRectGetMinY(frame) <= 140.0 && frame.size.width >= MIN(root.bounds.size.width * 0.45, 320.0) &&
+        frame.size.height >= 1.0 && frame.size.height <= 300.0) {
+        return YES;
+    }
     if (CGRectGetMinY(frame) > 240.0 || frame.size.width < 24.0 || frame.size.height < 4.0 || frame.size.height > 220.0) return NO;
     NSString *text = nfb_textOfView(view);
     NSString *lower = text.lowercaseString;
@@ -2015,6 +2055,14 @@ static NSInteger nfb_setColumnsGlobalTopChromeHiddenInView(UIView *view, UIView 
         if (gColumnsHiddenBarHeight < 1.0 && nfb_viewLooksLikeHomeSegmentBar(view, root)) {
             CGRect bf = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
             if (bf.size.height > 1.0) gColumnsHiddenBarHeight = bf.size.height;
+        }
+        if (gNFBLogRecording && !objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey)) {
+            CGRect f = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+            NSString *text = nfb_textOfView(view);
+            if (text.length > 60) text = [[text substringToIndex:60] stringByAppendingString:@"..."];
+            NFBLogEvent([NSString stringWithFormat:@"columnsChromeHide global class=%@ f=(%.0f,%.0f,%.0f,%.0f) text=%@",
+                NSStringFromClass(view.class), f.origin.x, f.origin.y, f.size.width, f.size.height,
+                text.length ? text : @"-"]);
         }
         nfb_setColumnsChromeViewHidden(view, YES);
         nfb_setColumnsChromeDescendantsHidden(view, YES, 0);
@@ -2073,7 +2121,12 @@ static void nfb_addSegmentedChromeCandidate(NSMutableArray<UIView *> *views, NSH
     BOOL classMatch = [cls containsString:@"Segment"] || [cls containsString:@"LabelBar"] ||
         [cls containsString:@"HorizontalLabel"] || [cls containsString:@"SegmentedLabel"] ||
         [cls containsString:@"FleetLine"];
+    BOOL topChromeWrapper = view != root && nfb_viewContainsHomeTopChrome(view, 0) &&
+        !nfb_viewContainsColumnsPagingSurface(view, 0) && !nfb_viewContainsNavigationChrome(view, 0) &&
+        CGRectGetMinY(frame) <= 140.0 && frame.size.height <= 300.0 &&
+        frame.size.width >= MIN(root.bounds.size.width * 0.45, 320.0);
     if (nfb_viewLooksLikeHomeSegmentBar(view, root) || nfb_viewLooksLikeSpacesChrome(view, root) ||
+        topChromeWrapper ||
         (shortTop && classMatch)) {
         [views addObject:view];
     }

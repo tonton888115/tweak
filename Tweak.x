@@ -179,6 +179,13 @@ static void BHTCollapseSpacesChromeView(UIView *view) {
     }
 }
 
+static CGFloat BHTOriginalOrCurrentSpacesChromeHeight(UIView *view) {
+    if (!view) return 0.0;
+    NSValue *savedFrame = objc_getAssociatedObject(view, &kBHTSpacesChromeFrameKey);
+    if (savedFrame) return savedFrame.CGRectValue.size.height;
+    return view.frame.size.height;
+}
+
 static void BHTRestoreSpacesChromeView(UIView *view) {
     if (!view || !objc_getAssociatedObject(view, &kBHTSpacesChromeSavedKey)) return;
     NSArray<NSDictionary *> *savedConstraints = objc_getAssociatedObject(view, &kBHTSpacesChromeConstraintsKey);
@@ -284,13 +291,19 @@ static void BHTCollapseSpacesChromeViewAndNearbyContainers(UIView *view) {
     BHTCollapseSpacesChromeDescendants(view, 0);
     BHTCollapseSpacesChromeView(view);
     UIView *current = view.superview;
-    for (NSInteger depth = 0; current && depth < 3; depth++, current = current.superview) {
+    UIView *child = view;
+    for (NSInteger depth = 0; current && depth < 4; depth++, child = current, current = current.superview) {
         NSString *cls = NSStringFromClass(current.class);
         if ([cls containsString:@"Cell"] || [cls containsString:@"TableView"] || [cls containsString:@"CollectionView"]) break;
         CGRect frame = current.frame;
+        CGFloat childOriginalHeight = BHTOriginalOrCurrentSpacesChromeHeight(child);
+        BOOL wrapsOnlySpacesRow = childOriginalHeight > 0.5 && frame.size.height <= childOriginalHeight + 2.0;
         if (frame.size.height > 0.5 && frame.size.height <= 260.0 &&
-            frame.size.width >= 40.0 && (BHTLooksLikeSpacesChromeClass(current) || BHTLooksLikeSpacesChromeClass(view))) {
+            frame.size.width >= 40.0 &&
+            (BHTLooksLikeSpacesChromeClass(current) || wrapsOnlySpacesRow)) {
             BHTCollapseSpacesChromeView(current);
+        } else if (!BHTLooksLikeSpacesChromeClass(current) && !wrapsOnlySpacesRow) {
+            break;
         }
     }
 }
