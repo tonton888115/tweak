@@ -37,6 +37,7 @@ static void nfb_appendTopChromeDiag(NSMutableString *s);
 void NFBLogSnapshot(NSString *reason);             // compact 1-line state snapshot (records only while recording)
 extern NSString *BHTColumnsLogFlags(void);          // columns flags + tab selectedIndex, from Tweak.x
 static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void);
+static NSArray<UIViewController *> *nfb_allHomePagingTimelinePages(UIViewController *paging);
 static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc);
 static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging);
 static void nfb_requestColumnsPagingPreload(UIViewController *paging);
@@ -2051,7 +2052,9 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     nfb_removeColumnsOverlay();
     nfb_setColumnsSegmentedHiddenForPaging(paging, NO);
     UIScrollView *scrollView = nfb_horizontalPagingScrollViewOf(paging);
-    if (!scrollView || !objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey)) return;
+    if (!scrollView) return;
+
+    BOOL wasApplied = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) != nil;
 
     NSNumber *pagingEnabled = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey);
     NSNumber *bounceH = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsBounceHKey);
@@ -2069,10 +2072,54 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     if (scrollView.contentOffset.x != 0.0) {
         [scrollView setContentOffset:CGPointMake(0.0, scrollView.contentOffset.y) animated:NO];
     }
-    for (UIViewController *child in paging.childViewControllers) {
-        if ([child isViewLoaded]) {
-            child.view.hidden = NO;
-            child.view.alpha = 1.0;
+
+    // Do not rely solely on saved frames: if columns were re-entered while Home was off-window, the
+    // "original" saved state can already be a 340pt column frame. Rebuild the native paging geometry
+    // from the data source so normal Home is full-width again.
+    CGFloat pageWidth = scrollView.bounds.size.width;
+    CGFloat pageHeight = scrollView.bounds.size.height;
+    NSArray<UIViewController *> *allPages = nfb_allHomePagingTimelinePages(paging);
+    BOOL needsNativeRestore = wasApplied;
+    if (pageWidth > 100.0 && pageHeight > 100.0 && allPages.count) {
+        NSUInteger checkIdx = 0;
+        for (UIViewController *page in allPages) {
+            if ([page isViewLoaded]) {
+                CGRect f = page.view.frame;
+                if (fabs(f.origin.x - pageWidth * checkIdx) > 1.0 || fabs(f.size.width - pageWidth) > 1.0) {
+                    needsNativeRestore = YES;
+                    break;
+                }
+            }
+            checkIdx++;
+        }
+        CGFloat expectedContentWidth = MAX(pageWidth * allPages.count, pageWidth + 1.0);
+        if (fabs(scrollView.contentSize.width - expectedContentWidth) > 1.0) needsNativeRestore = YES;
+    }
+
+    if (needsNativeRestore && pageWidth > 100.0 && pageHeight > 100.0 && allPages.count) {
+        NSUInteger idx = 0;
+        for (UIViewController *page in allPages) {
+            if ([page isViewLoaded]) {
+                UIView *view = page.view;
+                if (view.superview != scrollView) [scrollView addSubview:view];
+                view.frame = CGRectMake(pageWidth * idx, 0.0, pageWidth, pageHeight);
+                view.autoresizingMask = UIViewAutoresizingFlexibleHeight;
+                view.alpha = 1.0;
+                view.hidden = NO;
+                [view setNeedsLayout];
+            }
+            idx++;
+        }
+        scrollView.contentSize = CGSizeMake(MAX(pageWidth * allPages.count, pageWidth + 1.0), pageHeight);
+        [scrollView setContentOffset:CGPointMake(0.0, scrollView.contentOffset.y) animated:NO];
+        [scrollView setNeedsLayout];
+        [scrollView layoutIfNeeded];
+    } else if (needsNativeRestore) {
+        for (UIViewController *child in paging.childViewControllers) {
+            if ([child isViewLoaded]) {
+                child.view.hidden = NO;
+                child.view.alpha = 1.0;
+            }
         }
     }
 
@@ -2084,6 +2131,15 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsDirectionalLockKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsContentSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsTargetContentWidthKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    if (needsNativeRestore) {
+        for (NSString *name in @[@"reloadVisibleViewControllers", @"reloadVisibleViewControllersForceUnload:", @"reloadViewControllers"]) {
+            SEL sel = NSSelectorFromString(name);
+            if (![paging respondsToSelector:sel]) continue;
+            if ([name hasSuffix:@":"]) ((void(*)(id, SEL, BOOL))objc_msgSend)(paging, sel, NO);
+            else ((void(*)(id, SEL))objc_msgSend)(paging, sel);
+        }
+    }
 }
 
 static void nfb_applyInlineColumns(UIViewController *paging) {
@@ -2091,8 +2147,7 @@ static void nfb_applyInlineColumns(UIViewController *paging) {
     nfb_layoutColumnsOverlayForPaging(paging);
 }
 
-static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void) {
-    UIViewController *paging = nfb_findVisibleHomePagingController();
+static NSArray<UIViewController *> *nfb_allHomePagingTimelinePages(UIViewController *paging) {
     if (!paging || ![paging isViewLoaded]) return @[];
     NSMutableArray<UIViewController *> *pages = [NSMutableArray array];
     id dataSource = nfb_pagingDataSource(paging);
@@ -2105,14 +2160,24 @@ static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void) {
             for (NSInteger item = 0; item < count; item++) {
                 NSIndexPath *indexPath = [NSIndexPath indexPathForItem:item inSection:section];
                 UIViewController *page = nfb_pagingViewControllerAtIndexPath(paging, indexPath);
-                if (!nfb_isTimelinePageController(page) || nfb_isRecommendedHomeTimeline(page) || [pages containsObject:page]) continue;
+                if (!nfb_isTimelinePageController(page) || [pages containsObject:page]) continue;
                 [pages addObject:page];
             }
         }
     }
     for (UIViewController *child in paging.childViewControllers) {
-        if (!nfb_isTimelinePageController(child) || nfb_isRecommendedHomeTimeline(child)) continue;
+        if (!nfb_isTimelinePageController(child)) continue;
         if (![pages containsObject:child]) [pages addObject:child];
+    }
+    return pages;
+}
+
+static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void) {
+    UIViewController *paging = nfb_findVisibleHomePagingController();
+    NSMutableArray<UIViewController *> *pages = [NSMutableArray array];
+    for (UIViewController *page in nfb_allHomePagingTimelinePages(paging)) {
+        if (nfb_isRecommendedHomeTimeline(page)) continue;
+        [pages addObject:page];
     }
     return pages;
 }

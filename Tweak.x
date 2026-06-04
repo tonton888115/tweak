@@ -4253,25 +4253,55 @@ static UIViewController *BHTFindControllerOfClass(UIViewController *root, Class 
 // (log: tabSel=-1 even with all-window VC search), so also find a tab VIEW and walk its responder
 // chain up to the T1TabBarViewController.
 static void BHTCollectTabViewsInView(UIView *view, NSMutableArray<UIView *> *tabViews, NSInteger depth);
+static BOOL BHTControllerLooksLikeTabBar(UIViewController *vc) {
+    if (!vc) return NO;
+    NSString *cls = NSStringFromClass(vc.class);
+    if ([cls containsString:@"TabBarViewController"]) return YES;
+    @try {
+        NSArray *tabViews = [vc valueForKey:@"tabViews"];
+        if (tabViews.count) return YES;
+    } @catch (NSException *e) {
+    }
+    return NO;
+}
+
+static UIViewController *BHTTabBarControllerForResponder(UIResponder *start) {
+    UIResponder *r = start;
+    for (int i = 0; r && i < 32; i++, r = r.nextResponder) {
+        if ([r isKindOfClass:UIViewController.class] && BHTControllerLooksLikeTabBar((UIViewController *)r)) {
+            return (UIViewController *)r;
+        }
+    }
+    return nil;
+}
+
+static NSString *BHTResponderChainSummary(UIResponder *start) {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    UIResponder *r = start;
+    for (int i = 0; r && i < 12; i++, r = r.nextResponder) {
+        [parts addObject:NSStringFromClass(r.class)];
+    }
+    return [parts componentsJoinedByString:@">"];
+}
+
 static UIViewController *BHTFindTabBarController(void) {
     Class cls = NSClassFromString(@"T1TabBarViewController");
-    if (!cls) return nil;
     UIViewController *last = gBHTLastTabBarController;
-    if (last && [last isKindOfClass:cls]) return last;
-    for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
-        if (w.hidden || w.alpha < 0.01) continue;
-        UIViewController *found = BHTFindControllerOfClass(w.rootViewController, cls, 0);
-        if (found) return found;
+    if (BHTControllerLooksLikeTabBar(last)) return last;
+    if (cls) {
+        for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
+            if (w.hidden || w.alpha < 0.01) continue;
+            UIViewController *found = BHTFindControllerOfClass(w.rootViewController, cls, 0);
+            if (found) return found;
+        }
     }
     for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
         if (w.hidden || w.alpha < 0.01) continue;
         NSMutableArray<UIView *> *tvs = [NSMutableArray array];
         BHTCollectTabViewsInView(w, tvs, 0);
         for (UIView *tv in tvs) {
-            UIResponder *r = tv.nextResponder;
-            for (int i = 0; r && i < 24; i++, r = r.nextResponder) {
-                if ([r isKindOfClass:cls]) return (UIViewController *)r;
-            }
+            UIViewController *found = BHTTabBarControllerForResponder(tv);
+            if (found) return found;
         }
     }
     return nil;
@@ -4621,17 +4651,23 @@ void BHTDismissColumnsMode(void) {
 NSString *BHTColumnsLogFlags(void) {
     NSInteger sel = -1;
     NSString *selPage = @"?";
+    NSInteger tabCount = -1;
+    NSString *tabClass = @"nil";
+    NSString *lastClass = gBHTLastTabBarController ? NSStringFromClass(gBHTLastTabBarController.class) : @"nil";
     @try {
         UIViewController *tb = BHTFindTabBarController();
         if (tb) {
+            tabClass = NSStringFromClass(tb.class);
             NSNumber *si = [tb valueForKey:@"selectedIndex"];
             if ([si respondsToSelector:@selector(integerValue)]) sel = si.integerValue;
             NSArray *tv = [tb valueForKey:@"tabViews"];
+            tabCount = (NSInteger)tv.count;
             if (sel >= 0 && sel < (NSInteger)tv.count) selPage = [tv[(NSUInteger)sel] valueForKey:@"scribePage"] ?: @"?";
         }
     } @catch (NSException *e) {}
-    return [NSString stringWithFormat:@"intent=%d selHome=%d apply=%d tabSel=%ld(%@)",
-            gBHTColumnsIntent ? 1 : 0, gBHTSelectingHomeForColumns ? 1 : 0, gBHTApplyingColumnsTabSelection ? 1 : 0, (long)sel, selPage];
+    return [NSString stringWithFormat:@"intent=%d selHome=%d apply=%d tabSel=%ld(%@) tabVC=%@ lastTabVC=%@ tabViews=%ld",
+            gBHTColumnsIntent ? 1 : 0, gBHTSelectingHomeForColumns ? 1 : 0, gBHTApplyingColumnsTabSelection ? 1 : 0,
+            (long)sel, selPage, tabClass, lastClass, (long)tabCount];
 }
 
 NSString *BHTColumnsModeDiagnostic(void) {
@@ -4815,7 +4851,10 @@ static void BHTPresentColumnsViewController(void) {
 %new
 - (void)bh_openColumns:(UITapGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateEnded) return;
-    NFBLogEvent(@"bh_openColumns (communities tap gesture)");
+    UIViewController *tabBar = BHTTabBarControllerForResponder(self);
+    if (tabBar) gBHTLastTabBarController = tabBar;
+    NFBLogEvent([NSString stringWithFormat:@"bh_openColumns page=%@ tabBar=%@ chain=%@",
+        BHTPageOfTabView((T1TabView *)self), tabBar ? NSStringFromClass(tabBar.class) : @"nil", BHTResponderChainSummary(self)]);
     BHTPresentColumnsViewController();
 }
 
@@ -4860,13 +4899,16 @@ static void BHTPresentColumnsViewController(void) {
 %new
 - (void)bh_homeTapped:(UITapGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateEnded) return;
-    NFBLogEvent([NSString stringWithFormat:@"bh_homeTapped (home gesture) intent=%d", gBHTColumnsIntent]);
-    if (!gBHTColumnsIntent) return;   // only act when columns mode is on; otherwise leave Home alone
-    BHTDismissColumnsMode();
+    UIViewController *tabBar = BHTTabBarControllerForResponder(self);
+    if (tabBar) gBHTLastTabBarController = tabBar;
+    NFBLogEvent([NSString stringWithFormat:@"bh_homeTapped intent=%d tabBar=%@ chain=%@",
+        gBHTColumnsIntent, tabBar ? NSStringFromClass(tabBar.class) : @"nil", BHTResponderChainSummary(self)]);
+    if (gBHTColumnsIntent) BHTDismissColumnsMode();
     UIWindow *window = BHT_activeKeyWindow();
-    if (window.rootViewController) {
-        BHTUpdateColumnsTabSelection(window.rootViewController, NO);
-        BHTSelectTabPage(window.rootViewController, @"home");   // force back to real Home (recover from a stuck state)
+    UIViewController *target = tabBar ?: window.rootViewController;
+    if (target) {
+        BHTUpdateColumnsTabSelection(target, NO);
+        BHTSelectTabPage(target, @"home");   // force back to real Home (recover from a stuck state)
     }
 }
 
