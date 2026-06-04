@@ -1484,11 +1484,14 @@ static char kNFBColumnsOriginalHiddenKey;
 static char kNFBColumnsOriginalAlphaKey;
 static char kNFBColumnsEdgeGestureSavedKey;
 static char kNFBColumnsEdgeGestureEnabledKey;
+static char kNFBColumnsSnapScheduledKey;
 static UIView *gColumnsOverlayView = nil;
 static UIScrollView *gColumnsOverlayScrollView = nil;
 static UIButton *gColumnsAllTopButton = nil;
 static NSArray<UIViewController *> *gColumnsOverlayPages = nil;
 static BOOL gInlineColumnsNeedsInitialOffsetReset = NO;
+static BOOL gColumnsEdgeMenuStateKnown = NO;
+static BOOL gColumnsEdgeMenuLastEnabled = YES;
 static char kNFBColumnLoadKickedKey;
 static char kNFBColumnScrollAdjustedKey;
 static char kNFBColumnScrollFrameKey;
@@ -1577,6 +1580,9 @@ static NSInteger nfb_countEnabledColumnsEdgeMenuGestures(void) {
 }
 
 static NSInteger nfb_setColumnsEdgeMenuGesturesEnabled(BOOL enabled) {
+    if (gColumnsEdgeMenuStateKnown && gColumnsEdgeMenuLastEnabled == enabled) return 0;
+    gColumnsEdgeMenuStateKnown = YES;
+    gColumnsEdgeMenuLastEnabled = enabled;
     NSInteger count = 0;
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
         if (window.hidden || window.alpha < 0.01) continue;
@@ -2065,7 +2071,14 @@ static void nfb_collectSegmentedChromeViewsInViewTree(UIView *view, NSMutableArr
 // finish yet. Gated to the Home instance and reuses the save/restore used by the rest of chrome.
 static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC) {
     if (!segmentedVC || ![segmentedVC isViewLoaded]) return;
-    if (!nfb_parentControllerNamed(segmentedVC, @"HomeTimelineContainer")) return; // Home only
+    if (!nfb_parentControllerNamed(segmentedVC, @"HomeTimelineContainer")) {
+        nfb_restoreColumnsChromeInView(segmentedVC.view, 0);
+        return; // Home only; search/explore segmented/search bars must never stay hidden here.
+    }
+    if (!gInlineColumnsEnabled) {
+        nfb_restoreColumnsChromeInView(segmentedVC.view, 0);
+        return;
+    }
     NSMutableArray<UIView *> *bars = [NSMutableArray array];
     NSHashTable<UIView *> *seen = [NSHashTable weakObjectsHashTable];
     UIView *root = segmentedVC.view;
@@ -2082,11 +2095,9 @@ static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC
     nfb_collectSegmentedChromeViewsFromObject(segmentedVC, bars, seen, root, 0);
     nfb_collectSegmentedChromeViewsInViewTree(root, bars, seen, root, 0);
     for (UIView *bar in bars) {
-        nfb_setColumnsChromeViewHidden(bar, gInlineColumnsEnabled);
-        if (gInlineColumnsEnabled) {
-            nfb_setColumnsChromeDescendantsHidden(bar, YES, 0);
-            nfb_collapseColumnsChromeAncestorsForView(bar, root);
-        }
+        nfb_setColumnsChromeViewHidden(bar, YES);
+        nfb_setColumnsChromeDescendantsHidden(bar, YES, 0);
+        nfb_collapseColumnsChromeAncestorsForView(bar, root);
     }
 }
 
@@ -2120,6 +2131,23 @@ static CGFloat nfb_columnsTopShift(void) {
     // Segment/header chrome is collapsed in place. Shifting pages again leaves the
     // timeline under the navigation chrome and creates the visible top gap.
     return 0.0;
+}
+
+static void nfb_scheduleColumnsSnapForScroll(UIScrollView *scrollView) {
+    if (!scrollView || objc_getAssociatedObject(scrollView, &kNFBColumnsSnapScheduledKey)) return;
+    objc_setAssociatedObject(scrollView, &kNFBColumnsSnapScheduledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UIScrollView *weakScroll = scrollView;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.14 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIScrollView *strongScroll = weakScroll;
+        if (!strongScroll) return;
+        objc_setAssociatedObject(strongScroll, &kNFBColumnsSnapScheduledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!gInlineColumnsEnabled || !objc_getAssociatedObject(strongScroll, &kNFBInlineColumnsAppliedKey)) return;
+        if (strongScroll.isDragging || strongScroll.isTracking || strongScroll.isDecelerating) {
+            nfb_scheduleColumnsSnapForScroll(strongScroll);
+            return;
+        }
+        nfb_layoutActiveHomePaging();
+    });
 }
 
 static void nfb_rememberColumnOriginalViewState(UIView *view) {
@@ -3442,6 +3470,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     if (!enabled) {
         gInlineColumnsNeedsInitialOffsetReset = NO;
         gColumnsHiddenBarHeight = 0.0;
+        gColumnsEdgeMenuStateKnown = NO;
         nfb_setColumnsEdgeMenuGesturesEnabled(YES);
         nfb_restoreAllSavedColumnsChrome();
     }
@@ -3450,6 +3479,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
             gColumnsHiddenBarHeight = 0.0;
             gInlineColumnsNeedsInitialOffsetReset = YES;
         }
+        gColumnsEdgeMenuStateKnown = NO;
         nfb_setColumnsEdgeMenuGesturesEnabled(NO);
         UIViewController *paging = nfb_findAnyHomePagingController();
         if (paging) {
@@ -3539,6 +3569,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     %orig(offset);
     if (gInlineColumnsEnabled && objc_getAssociatedObject(self, &kNFBInlineColumnsAppliedKey)) {
         nfb_updateColumnsEdgeMenuGesturesForScroll((UIScrollView *)self);
+        nfb_scheduleColumnsSnapForScroll((UIScrollView *)self);
     }
 }
 - (void)setContentSize:(CGSize)size {

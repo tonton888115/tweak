@@ -74,7 +74,7 @@ static NSTimeInterval lastCacheInvalidation = 0;
 static const NSTimeInterval CACHE_INVALIDATION_INTERVAL = 10.0; // 10 seconds
 
 static BOOL BHTShouldHideSpacesBarNow(void) {
-    return [BHTManager hideSpacesBar] || NFBInlineColumnsEnabled();
+    return [BHTManager hideSpacesBar];
 }
 
 static char kBHTSpacesChromeSavedKey;
