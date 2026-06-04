@@ -33,6 +33,7 @@ static void nfb_showNewTweetsPill(UIViewController *vc);
 static BOOL nfb_streamTriggerColumns(void);
 static void nfb_revealAllColumnTops(void);
 static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active);
+static void nfb_appendTopChromeDiag(NSMutableString *s);
 static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void);
 static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc);
 static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging);
@@ -1061,6 +1062,7 @@ NSString *NFBLogSavedFileContents(void) {
     NSString *columnsMode = BHTColumnsModeDiagnostic();
     if (columnsMode.length) [s appendString:columnsMode];
     nfb_appendColumnsDiag(s, active);
+    nfb_appendTopChromeDiag(s);   // dump every top-of-screen view so the iPad segment bar is visible
     nfb_dumpTree(nfb_homeRoot(active), 0, s);
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"診断情報" message:s preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"コピー" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIPasteboard.generalPasteboard.string = s; }]];
@@ -1845,6 +1847,21 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         nfb_kickEmptyColumnLoad(page);
         idx++;
     }
+    // On iPad the pager only loads the current page, so the off-screen pinned-list columns stay
+    // empty (contentSize.height==0 → blank columns = "only 1 column"). Keep nudging the pager to
+    // load its invisible pages (throttled) until every column has content.
+    {
+        BOOL anyEmpty = NO;
+        for (UIViewController *p in pages) {
+            UIScrollView *s = [p isViewLoaded] ? nfb_mainScrollViewOf(p) : nil;
+            if (s && s.contentSize.height < 60.0) { anyEmpty = YES; break; }
+        }
+        if (anyEmpty) {
+            static NSTimeInterval lastEmptyReload = 0.0;
+            NSTimeInterval now = CACurrentMediaTime();
+            if (now - lastEmptyReload > 1.0) { lastEmptyReload = now; nfb_requestColumnsPagingPreload(paging); }
+        }
+    }
     // Record the columns layout state (only when it CHANGES) so UI breakage / scroll catching is
     // visible in the recorded log: column frames flipping or contentSize flapping mid-drag = Twitter's
     // paging layout fighting ours. The live offset is logged for context but excluded from the
@@ -2161,6 +2178,31 @@ static void nfb_appendColumnsChromeDiag(NSMutableString *s, UIView *view, UIView
     }
     for (UIView *subview in view.subviews) {
         nfb_appendColumnsChromeDiag(s, subview, pagingView, root, depth + 1);
+    }
+}
+
+static void nfb_appendTopChromeDiagInView(NSMutableString *s, UIView *view, UIView *root, int depth) {
+    if (!view || !root || depth > 12 || view.hidden || view.alpha < 0.01) return;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    if (CGRectGetMinY(frame) <= 240.0 && frame.size.height >= 14.0 && frame.size.height <= 240.0 && frame.size.width >= 80.0) {
+        NSString *cls = NSStringFromClass(view.class);
+        BOOL barLike = [cls containsString:@"Segment"] || [cls containsString:@"Bar"] || [cls containsString:@"Label"] || [cls containsString:@"Header"] || [cls containsString:@"Tab"];
+        NSMutableString *txt = [NSMutableString string];
+        nfb_appendDescendantText(view, txt, 0);
+        NSString *t = [txt stringByReplacingOccurrencesOfString:@"\n" withString:@"|"];
+        if (t.length > 44) t = [t substringToIndex:44];
+        if (t.length || barLike) {
+            [s appendFormat:@"  top d=%d class=%@ f=(%.0f,%.0f,%.0f,%.0f) hidden=%d text=%@\n",
+                depth, cls, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height, view.hidden ? 1 : 0, t.length ? t : @"-"];
+        }
+    }
+    for (UIView *sub in view.subviews) nfb_appendTopChromeDiagInView(s, sub, root, depth + 1);
+}
+static void nfb_appendTopChromeDiag(NSMutableString *s) {
+    [s appendString:@"--- topChrome (MinY<=240, bar-like / has text) ---\n"];
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (w.hidden || w.alpha < 0.01) continue;
+        nfb_appendTopChromeDiagInView(s, w, w, 0);
     }
 }
 
