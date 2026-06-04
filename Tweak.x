@@ -1897,36 +1897,7 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
 }
 %end
 
-%hook T1TappableStatusFleetLineItemView
-- (void)didMoveToWindow {
-    %orig;
-    BHTCollapseSpacesChromeView((UIView *)self);
-}
-- (void)layoutSubviews {
-    %orig;
-    BHTCollapseSpacesChromeView((UIView *)self);
-}
-%end
-
-%hook _TtC14T1TwitterSwift17FleetLineItemView
-- (void)didMoveToWindow {
-    %orig;
-    BHTCollapseSpacesChromeView((UIView *)self);
-}
-- (void)layoutSubviews {
-    %orig;
-    BHTCollapseSpacesChromeView((UIView *)self);
-}
-%end
-
 %hook T1FleetLineHeaderController
-- (void)viewDidLayoutSubviews {
-    %orig;
-    UIViewController *controller = (UIViewController *)self;
-    if ([controller respondsToSelector:@selector(isViewLoaded)] && [controller respondsToSelector:@selector(view)] && [controller isViewLoaded]) {
-        BHTCollapseSpacesChromeView(controller.view);
-    }
-}
 - (void)setFleetLineView:(UIView *)view {
     %orig(view);
     BHTCollapseSpacesChromeView(view);
