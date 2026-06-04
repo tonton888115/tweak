@@ -186,6 +186,33 @@ static CGFloat BHTOriginalOrCurrentSpacesChromeHeight(UIView *view) {
     return view.frame.size.height;
 }
 
+static void BHTShrinkSpacesChromeParentByHeight(UIView *view, CGFloat removeHeight) {
+    if (!view || !BHTShouldHideSpacesBarNow() || removeHeight <= 0.5) return;
+    CGRect originalFrame = view.frame;
+    if (originalFrame.size.height <= removeHeight + 2.0 || originalFrame.size.height > 360.0) return;
+
+    BHTSaveSpacesChromeViewIfNeeded(view);
+    CGFloat targetHeight = MAX(0.0, originalFrame.size.height - removeHeight);
+
+    NSArray<NSDictionary *> *savedConstraints = objc_getAssociatedObject(view, &kBHTSpacesChromeConstraintsKey);
+    for (NSDictionary *entry in savedConstraints) {
+        NSLayoutConstraint *constraint = entry[@"constraint"];
+        if (constraint) constraint.constant = targetHeight;
+    }
+
+    CGRect frame = view.frame;
+    if (frame.size.height > targetHeight + 0.5) {
+        frame.size.height = targetHeight;
+        view.frame = frame;
+    }
+    CGRect bounds = view.bounds;
+    if (bounds.size.height > targetHeight + 0.5) {
+        bounds.size.height = targetHeight;
+        view.bounds = bounds;
+    }
+    view.clipsToBounds = YES;
+}
+
 static void BHTRestoreSpacesChromeView(UIView *view) {
     if (!view || !objc_getAssociatedObject(view, &kBHTSpacesChromeSavedKey)) return;
     NSArray<NSDictionary *> *savedConstraints = objc_getAssociatedObject(view, &kBHTSpacesChromeConstraintsKey);
@@ -302,6 +329,16 @@ static void BHTCollapseSpacesChromeViewAndNearbyContainers(UIView *view) {
             frame.size.width >= 40.0 &&
             (BHTLooksLikeSpacesChromeClass(current) || wrapsOnlySpacesRow)) {
             BHTCollapseSpacesChromeView(current);
+        } else if ([cls containsString:@"StackView"] && childOriginalHeight > 0.5 &&
+                   frame.size.height > childOriginalHeight + 2.0 &&
+                   frame.size.height <= 360.0 && frame.size.width >= 40.0) {
+            // The Spaces row is often one arranged subview in a Home top stack:
+            // hiding FleetLine leaves the parent stack's original height behind.
+            // Shrink only by the Spaces row height so the Home segment remains intact.
+            NFBLogEvent([NSString stringWithFormat:@"spacesChromeShrink parent=%@ h=%.1f remove=%.1f",
+                cls, frame.size.height, childOriginalHeight]);
+            BHTShrinkSpacesChromeParentByHeight(current, childOriginalHeight);
+            break;
         } else if (!BHTLooksLikeSpacesChromeClass(current) && !wrapsOnlySpacesRow) {
             break;
         }

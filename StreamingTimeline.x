@@ -39,6 +39,9 @@ static void nfb_appendTopChromeDiag(NSMutableString *s);
 static void nfb_appendCoveringViewsDiag(NSMutableString *s);
 static void nfb_appendGestureDiag(NSMutableString *s);
 static void nfb_appendSpacesCandidatesDiag(NSMutableString *s);
+static void nfb_appendSearchChromeDiag(NSMutableString *s);
+static void nfb_appendSavedColumnsChromeDiag(NSMutableString *s);
+static NSString *nfb_diagShortString(NSString *value, NSUInteger maxLen);
 static NSString *nfb_buildDiagnosticReport(void);
 void NFBLogSnapshot(NSString *reason);             // compact 1-line state snapshot (records only while recording)
 extern NSString *BHTColumnsLogFlags(void);          // columns flags + tab selectedIndex, from Tweak.x
@@ -1634,6 +1637,9 @@ static NSInteger nfb_countEnabledColumnsEdgeMenuGestures(void) {
 
 static NSInteger nfb_setColumnsEdgeMenuGesturesEnabled(BOOL enabled) {
     static NSTimeInterval lastSameStateScan = 0.0;
+    static NSNumber *lastLoggedEnabled = nil;
+    static NSInteger lastLoggedMatched = -1;
+    static NSInteger lastLoggedEnabledCount = -1;
     NSTimeInterval now = CACurrentMediaTime();
     if (gColumnsEdgeMenuStateKnown && gColumnsEdgeMenuLastEnabled == enabled && now - lastSameStateScan < 0.25) return 0;
     gColumnsEdgeMenuStateKnown = YES;
@@ -1643,6 +1649,17 @@ static NSInteger nfb_setColumnsEdgeMenuGesturesEnabled(BOOL enabled) {
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
         if (window.hidden || window.alpha < 0.01) continue;
         count += nfb_setColumnsEdgeMenuGesturesInView(window, enabled, 0);
+    }
+    if (gNFBLogRecording) {
+        NSInteger enabledCount = nfb_countEnabledColumnsEdgeMenuGestures();
+        if (!lastLoggedEnabled || lastLoggedEnabled.boolValue != enabled ||
+            lastLoggedMatched != count || lastLoggedEnabledCount != enabledCount) {
+            NFBLogEvent([NSString stringWithFormat:@"edgeMenuSet enabled=%d matched=%ld enabledNow=%ld",
+                enabled ? 1 : 0, (long)count, (long)enabledCount]);
+            lastLoggedEnabled = @(enabled);
+            lastLoggedMatched = count;
+            lastLoggedEnabledCount = enabledCount;
+        }
     }
     return count;
 }
@@ -1945,6 +1962,12 @@ static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView
     if (pagingSurface) return NO;
     BOOL did = NO;
     if (view != pagingView && !containsPaging && !pagingSurface && !containsPagingSurface && nfb_columnsChromeCandidate(view, root)) {
+        if (gNFBLogRecording && !objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey)) {
+            CGRect f = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+            NSString *text = nfb_diagShortString(nfb_textOfView(view), 60);
+            NFBLogEvent([NSString stringWithFormat:@"columnsChromeHide direct class=%@ f=(%.0f,%.0f,%.0f,%.0f) text=%@",
+                NSStringFromClass(view.class), f.origin.x, f.origin.y, f.size.width, f.size.height, text ?: @"-"]);
+        }
         nfb_setColumnsChromeViewHidden(view, YES);
         nfb_setColumnsChromeDescendantsHidden(view, YES, 0);
         nfb_collapseColumnsChromeAncestorsForView(view, root);
@@ -1973,6 +1996,23 @@ static void nfb_restoreAllSavedColumnsChrome(void) {
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
         if (!window) continue;
         nfb_restoreColumnsChromeInView(window, 0);
+    }
+}
+
+static void nfb_restoreAllSavedColumnsChromeSoon(NSString *reason) {
+    nfb_restoreAllSavedColumnsChrome();
+    if (gNFBLogRecording) {
+        NFBLogEvent([NSString stringWithFormat:@"columnsChromeRestore %@", reason ?: @"now"]);
+    }
+    NSArray<NSNumber *> *delays = @[@0.15, @0.45, @1.00];
+    for (NSNumber *delay in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (gInlineColumnsEnabled) return;
+            nfb_restoreAllSavedColumnsChrome();
+            if (gNFBLogRecording) {
+                NFBLogEvent([NSString stringWithFormat:@"columnsChromeRestore %@+%.2f", reason ?: @"deferred", delay.doubleValue]);
+            }
+        });
     }
 }
 
@@ -2162,6 +2202,7 @@ static void nfb_collectSegmentedChromeViewsInViewTree(UIView *view, NSMutableArr
 static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC) {
     if (!segmentedVC || ![segmentedVC isViewLoaded]) return;
     if (!nfb_parentControllerNamed(segmentedVC, @"HomeTimelineContainer")) {
+        nfb_restoreColumnsChromeInView(segmentedVC.view, 0);
         return; // Home only; search/explore segmented/search bars must never stay hidden here.
     }
     if (!gInlineColumnsEnabled) {
@@ -3152,6 +3193,86 @@ static NSString *nfb_diagScrollSummaryForView(UIView *view) {
         (sv.isDragging || sv.isTracking || sv.isDecelerating) ? 1 : 0];
 }
 
+static BOOL nfb_viewLooksLikeSearchChromeForDiag(UIView *view) {
+    if (!view) return NO;
+    NSString *cls = NSStringFromClass(view.class);
+    NSString *text = nfb_diagTextForView(view, 160);
+    NSString *lowerClass = cls.lowercaseString;
+    NSString *lowerText = text.lowercaseString;
+    return [lowerClass containsString:@"search"] ||
+        [lowerClass containsString:@"textfield"] ||
+        [lowerClass containsString:@"textinput"] ||
+        [cls containsString:@"UISearchBar"] ||
+        [cls containsString:@"UITextField"] ||
+        [lowerText containsString:@"search"] ||
+        [text containsString:@"検索"] ||
+        [text containsString:@"調べる"];
+}
+
+static void nfb_appendSearchChromeDiagInView(NSMutableString *s, UIView *view, UIView *root, int depth, NSInteger *count) {
+    if (!view || !root || depth > 18 || *count >= 140) return;
+    BOOL saved = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey) != nil;
+    BOOL collapsed = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey) != nil;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    BOOL topSized = CGRectGetMinY(frame) <= 340.0 && frame.size.width >= 24.0 && frame.size.height >= 1.0 && frame.size.height <= 340.0;
+    BOOL interesting = (topSized && nfb_viewLooksLikeSearchChromeForDiag(view)) || (saved || collapsed);
+    if (interesting) {
+        (*count)++;
+        [s appendFormat:@"searchChrome[%ld] d=%d class=%@ f=(%.1f,%.1f,%.1f,%.1f) hidden=%d alpha=%.2f ui=%d saved=%d collapsed=%d hc=%@ gestures=%@ super=%@ text=%@\n",
+            (long)*count, depth, NSStringFromClass(view.class),
+            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+            view.hidden ? 1 : 0, view.alpha, view.userInteractionEnabled ? 1 : 0,
+            saved ? 1 : 0, collapsed ? 1 : 0,
+            nfb_columnsConstraintSummaryForView(view),
+            nfb_diagGestureSummaryForView(view),
+            view.superview ? NSStringFromClass(view.superview.class) : @"nil",
+            nfb_diagTextForView(view, 120)];
+    }
+    for (UIView *subview in view.subviews) {
+        nfb_appendSearchChromeDiagInView(s, subview, root, depth + 1, count);
+    }
+}
+
+static void nfb_appendSearchChromeDiag(NSMutableString *s) {
+    [s appendString:@"--- searchChrome / saved chrome audit ---\n"];
+    NSInteger count = 0;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (w.hidden || w.alpha < 0.01) continue;
+        [s appendFormat:@"searchWindow key=%d root=%@\n",
+            w.isKeyWindow ? 1 : 0,
+            w.rootViewController ? NSStringFromClass(w.rootViewController.class) : @"nil"];
+        nfb_appendSearchChromeDiagInView(s, w, w, 0, &count);
+    }
+}
+
+static void nfb_appendSavedColumnsChromeDiagInView(NSMutableString *s, UIView *view, UIView *root, int depth, NSInteger *count) {
+    if (!view || !root || depth > 18 || *count >= 160) return;
+    BOOL saved = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey) != nil;
+    BOOL collapsed = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey) != nil;
+    if (saved || collapsed) {
+        (*count)++;
+        CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+        [s appendFormat:@"savedChrome[%ld] d=%d class=%@ f=(%.1f,%.1f,%.1f,%.1f) hidden=%d alpha=%.2f saved=%d collapsed=%d super=%@ text=%@\n",
+            (long)*count, depth, NSStringFromClass(view.class),
+            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+            view.hidden ? 1 : 0, view.alpha, saved ? 1 : 0, collapsed ? 1 : 0,
+            view.superview ? NSStringFromClass(view.superview.class) : @"nil",
+            nfb_diagTextForView(view, 100)];
+    }
+    for (UIView *subview in view.subviews) {
+        nfb_appendSavedColumnsChromeDiagInView(s, subview, root, depth + 1, count);
+    }
+}
+
+static void nfb_appendSavedColumnsChromeDiag(NSMutableString *s) {
+    [s appendString:@"--- savedColumnsChrome (all windows) ---\n"];
+    NSInteger count = 0;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (w.hidden || w.alpha < 0.01) continue;
+        nfb_appendSavedColumnsChromeDiagInView(s, w, w, 0, &count);
+    }
+}
+
 static BOOL nfb_diagStringLooksSpaces(NSString *value) {
     if (!value.length) return NO;
     NSString *lower = [value lowercaseString];
@@ -3518,6 +3639,8 @@ static NSString *nfb_buildDiagnosticReport(void) {
     if (columnsMode.length) [s appendString:columnsMode];
     nfb_appendColumnsDiag(s, active);
     nfb_appendTopChromeDiag(s);
+    nfb_appendSearchChromeDiag(s);
+    nfb_appendSavedColumnsChromeDiag(s);
     nfb_appendCoveringViewsDiag(s);
     nfb_appendGestureDiag(s);
     nfb_appendSpacesCandidatesDiag(s);
@@ -3570,7 +3693,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
         gColumnsHiddenBarHeight = 0.0;
         gColumnsEdgeMenuStateKnown = NO;
         nfb_setColumnsEdgeMenuGesturesEnabled(YES);
-        nfb_restoreAllSavedColumnsChrome();
+        nfb_restoreAllSavedColumnsChromeSoon(@"disable");
     }
     if (enabled) {
         if (changed) {
@@ -3610,7 +3733,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 
 // Button lifecycle on the stable Home container.
 %hook THFHomeTimelineContainerViewController
-- (void)viewDidAppear:(BOOL)animated { %orig; NFBLogSnapshot(@"homeContainer.appear"); nfb_syncHomeTimelineTabIdentifierFromController(self); nfb_installButton(self.view.window); if (gInlineColumnsEnabled) nfb_scheduleLayoutActiveHomePaging(); }
+- (void)viewDidAppear:(BOOL)animated { %orig; NFBLogSnapshot(@"homeContainer.appear"); nfb_syncHomeTimelineTabIdentifierFromController(self); nfb_installButton(self.view.window); if (gInlineColumnsEnabled) nfb_scheduleLayoutActiveHomePaging(); else nfb_restoreAllSavedColumnsChrome(); }
 - (void)viewDidDisappear:(BOOL)animated { %orig; NFBLogSnapshot(@"homeContainer.disappear"); nfb_removeButton(); }
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
     %orig(size, coordinator);
@@ -3668,7 +3791,6 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     %orig(offset);
     if (gInlineColumnsEnabled && objc_getAssociatedObject(self, &kNFBInlineColumnsAppliedKey)) {
         nfb_updateColumnsEdgeMenuGesturesForScroll((UIScrollView *)self);
-        nfb_scheduleColumnsSnapForScroll((UIScrollView *)self);
     }
 }
 - (void)setContentSize:(CGSize)size {
