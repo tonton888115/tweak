@@ -28,6 +28,7 @@
 #import "ModernSettingsViewController.h"
 
 extern void NFBSetInlineColumnsEnabled(BOOL enabled);
+extern BOOL NFBInlineColumnsEnabled(void);
 extern void NFBLogEvent(NSString *msg);       // operation-log recorder (no-op unless recording)
 extern void NFBLogSnapshot(NSString *reason); // compact state snapshot (no-op unless recording)
 NSString *BHTColumnsLogFlags(void);           // columns flags + tab selectedIndex, used by the snapshot
@@ -45,6 +46,7 @@ static BOOL BHTIsColumnsPageID(NSString *page);
 static NSString *BHTPageOfTabView(T1TabView *tabView);
 static NSArray<UIView *> *BHTTabViewsForController(UIViewController *controller);
 static BOOL BHTSelectTabPage(UIViewController *root, NSString *pageID);
+static BOOL BHTHandleTabSelectionRequest(UIViewController *tabBarController, NSInteger index, UIView *tabView, NSString *source);
 static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSelected);
 
 @class T1SettingsViewController;
@@ -640,31 +642,44 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
 
 - (void)setSelectedIndex:(NSInteger)selectedIndex {
     gBHTLastTabBarController = (UIViewController *)self;
-    NSString *page = nil;
-    if (!gBHTSelectingHomeForColumns) {
-        @try {
-            NSArray<UIView *> *tabViews = BHTTabViewsForController((UIViewController *)self);
-            if (selectedIndex >= 0 && selectedIndex < (NSInteger)tabViews.count) {
-                id tabView = tabViews[(NSUInteger)selectedIndex];
-                page = BHTPageOfTabView((T1TabView *)tabView);
-                NFBLogEvent([NSString stringWithFormat:@"tabBar.setSelectedIndex=%ld page=%@ selHome=%d intent=%d", (long)selectedIndex, page, gBHTSelectingHomeForColumns, gBHTColumnsIntent]);
-                if (BHTIsColumnsPageID(page)) {
-                    BHTPresentColumnsMode();
-                    BHTUpdateColumnsTabSelection((UIViewController *)self, YES);
-                    return;
-                } else {
-                    BHTDismissColumnsMode();
-                }
-            }
-        } @catch (NSException *e) {
-        }
-    }
+    if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, nil, @"setSelectedIndex")) return;
     %orig(selectedIndex);
     NFBLogSnapshot(@"setSelectedIndex.afterOrig");
-    if (!gBHTSelectingHomeForColumns && !BHTIsColumnsPageID(page)) {
-        BHTDismissColumnsMode();
+    if (!gBHTSelectingHomeForColumns) {
         BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
     }
+}
+
+- (void)setSelectedTabIndex:(NSInteger)selectedIndex {
+    gBHTLastTabBarController = (UIViewController *)self;
+    if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, nil, @"setSelectedTabIndex")) return;
+    %orig(selectedIndex);
+    NFBLogSnapshot(@"setSelectedTabIndex.afterOrig");
+    if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
+}
+
+- (void)selectTabAtIndex:(NSInteger)selectedIndex {
+    gBHTLastTabBarController = (UIViewController *)self;
+    if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, nil, @"selectTabAtIndex")) return;
+    %orig(selectedIndex);
+    NFBLogSnapshot(@"selectTabAtIndex.afterOrig");
+    if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
+}
+
+- (void)customTabBar:(id)tabBar selectTabAtIndex:(NSInteger)selectedIndex withView:(UIView *)tabView {
+    gBHTLastTabBarController = (UIViewController *)self;
+    if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, tabView, @"customTabBar")) return;
+    %orig(tabBar, selectedIndex, tabView);
+    NFBLogSnapshot(@"customTabBar.afterOrig");
+    if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
+}
+
+- (void)tabBarViewController:(id)tabBarController selectTabAtIndex:(NSInteger)selectedIndex withView:(UIView *)tabView {
+    gBHTLastTabBarController = (UIViewController *)self;
+    if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, tabView, @"tabBarViewController")) return;
+    %orig(tabBarController, selectedIndex, tabView);
+    NFBLogSnapshot(@"tabBarViewController.afterOrig");
+    if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
 }
 
 - (void)loadView {
@@ -1785,7 +1800,7 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
 
 %hook T1HomeTimelineItemsViewController
 - (void)_t1_initializeFleets {
-    if ([BHTManager hideSpacesBar]) {
+    if ([BHTManager hideSpacesBar] || NFBInlineColumnsEnabled()) {
         return;
     }
     return %orig;
@@ -1794,7 +1809,7 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
 
 %hook THFHomeTimelineItemsViewController
 - (void)_t1_initializeFleets {
-    if ([BHTManager hideSpacesBar]) {
+    if ([BHTManager hideSpacesBar] || NFBInlineColumnsEnabled()) {
         return;
     }
     return %orig;
@@ -4367,16 +4382,61 @@ static NSInteger BHTTabIndexForPage(UIViewController *tabBarController, NSString
     NSArray<UIView *> *tabViews = BHTTabViewsForController(tabBarController);
     NSInteger index = 0;
     for (id tabView in tabViews) {
-        NSString *page = nil;
-        @try {
-            page = [tabView valueForKey:@"scribePage"];
-        } @catch (NSException *e) {
-            page = nil;
-        }
+        NSString *page = BHTPageOfTabView((T1TabView *)tabView);
         if ([page isEqualToString:pageID]) return index;
         index++;
     }
     return NSNotFound;
+}
+
+static id BHTTabBarObjectForController(UIViewController *tabBarController) {
+    if (!tabBarController) return nil;
+    for (NSString *key in @[@"tabBar", @"customTabBar"]) {
+        @try {
+            id value = [tabBarController valueForKey:key];
+            if (value) return value;
+        } @catch (NSException *e) {
+        }
+    }
+    SEL provide = @selector(provideTabBar);
+    if ([tabBarController respondsToSelector:provide]) {
+        return ((id(*)(id, SEL))objc_msgSend)(tabBarController, provide);
+    }
+    return nil;
+}
+
+static BOOL BHTHandleTabSelectionRequest(UIViewController *tabBarController, NSInteger index, UIView *tabView, NSString *source) {
+    if (!tabBarController) return NO;
+    NSArray<UIView *> *tabViews = BHTTabViewsForController(tabBarController);
+    if (!tabView && index >= 0 && index < (NSInteger)tabViews.count) tabView = tabViews[(NSUInteger)index];
+    NSString *page = BHTPageOfTabView((T1TabView *)tabView);
+    NFBLogEvent([NSString stringWithFormat:@"tabSelect.%@ index=%ld page=%@ selHome=%d intent=%d",
+        source ?: @"?", (long)index, page, gBHTSelectingHomeForColumns ? 1 : 0, gBHTColumnsIntent ? 1 : 0]);
+    if (gBHTSelectingHomeForColumns) return NO;
+    if (BHTIsColumnsPageID(page)) {
+        BHTPresentColumnsMode();
+        BHTUpdateColumnsTabSelection(tabBarController, YES);
+        return YES;
+    }
+    if (gBHTColumnsIntent) {
+        BHTDismissColumnsMode();
+        BHTUpdateColumnsTabSelection(tabBarController, NO);
+    }
+    return NO;
+}
+
+static BOOL BHTCallIndexSelector(id target, SEL sel, NSInteger index, NSString *label) {
+    if (!target || ![target respondsToSelector:sel]) return NO;
+    NFBLogEvent([NSString stringWithFormat:@"selectTabPage.call %@", label]);
+    ((void(*)(id, SEL, NSInteger))objc_msgSend)(target, sel, index);
+    return YES;
+}
+
+static BOOL BHTCallDelegateTabSelector(id target, SEL sel, id firstArg, NSInteger index, UIView *tabView, NSString *label) {
+    if (!target || ![target respondsToSelector:sel]) return NO;
+    NFBLogEvent([NSString stringWithFormat:@"selectTabPage.call %@", label]);
+    ((void(*)(id, SEL, id, NSInteger, UIView *))objc_msgSend)(target, sel, firstArg, index, tabView);
+    return YES;
 }
 
 static BOOL BHTSelectTabPage(UIViewController *root, NSString *pageID) {
@@ -4387,14 +4447,34 @@ static BOOL BHTSelectTabPage(UIViewController *root, NSString *pageID) {
         return NO;
     }
     NSInteger index = BHTTabIndexForPage(tabBarController, pageID);
-    NFBLogEvent([NSString stringWithFormat:@"selectTabPage %@ index=%ld tabs=%lu tb=%@ root=%@",
+    NSArray<UIView *> *tabViews = BHTTabViewsForController(tabBarController);
+    UIView *tabView = (index >= 0 && index < (NSInteger)tabViews.count) ? tabViews[(NSUInteger)index] : nil;
+    id customTabBar = BHTTabBarObjectForController(tabBarController);
+    NFBLogEvent([NSString stringWithFormat:@"selectTabPage %@ index=%ld tabs=%lu tb=%@ bar=%@ root=%@ has[sel=%d setTab=%d setIdx=%d custom=%d vc=%d]",
         pageID, (long)index, (unsigned long)BHTTabViewsForController(tabBarController).count,
-        NSStringFromClass(tabBarController.class), root ? NSStringFromClass(root.class) : @"nil"]);
+        NSStringFromClass(tabBarController.class),
+        customTabBar ? NSStringFromClass([customTabBar class]) : @"nil",
+        root ? NSStringFromClass(root.class) : @"nil",
+        [tabBarController respondsToSelector:@selector(selectTabAtIndex:)] ? 1 : 0,
+        [tabBarController respondsToSelector:@selector(setSelectedTabIndex:)] ? 1 : 0,
+        [tabBarController respondsToSelector:@selector(setSelectedIndex:)] ? 1 : 0,
+        [tabBarController respondsToSelector:@selector(customTabBar:selectTabAtIndex:withView:)] ? 1 : 0,
+        [tabBarController respondsToSelector:@selector(tabBarViewController:selectTabAtIndex:withView:)] ? 1 : 0]);
     if (index == NSNotFound) return NO;
-    SEL sel = @selector(setSelectedIndex:);
-    if ([tabBarController respondsToSelector:sel]) {
-        ((void (*)(id, SEL, NSInteger))objc_msgSend)(tabBarController, sel, index);
-        return YES;
+    @try {
+        if (BHTCallDelegateTabSelector(tabBarController, @selector(customTabBar:selectTabAtIndex:withView:), customTabBar, index, tabView, @"customTabBar:selectTabAtIndex:withView:")) return YES;
+        if (BHTCallDelegateTabSelector(tabBarController, @selector(tabBarViewController:selectTabAtIndex:withView:), tabBarController, index, tabView, @"tabBarViewController:selectTabAtIndex:withView:")) return YES;
+        if (BHTCallIndexSelector(tabBarController, @selector(selectTabAtIndex:), index, @"selectTabAtIndex:")) return YES;
+        if (BHTCallIndexSelector(tabBarController, @selector(setSelectedTabIndex:), index, @"setSelectedTabIndex:")) return YES;
+        if (BHTCallIndexSelector(tabBarController, @selector(setSelectedIndex:), index, @"setSelectedIndex:")) return YES;
+        @try {
+            [tabBarController setValue:@(index) forKey:@"selectedIndex"];
+            NFBLogEvent(@"selectTabPage.call KVC selectedIndex");
+            return YES;
+        } @catch (NSException *e) {
+        }
+    } @catch (NSException *e) {
+        NFBLogEvent([NSString stringWithFormat:@"selectTabPage exception=%@", e.reason ?: @"?"]);
     }
     return NO;
 }

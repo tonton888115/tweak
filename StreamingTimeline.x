@@ -1595,6 +1595,7 @@ static BOOL nfb_columnsChromeCandidate(UIView *view, UIView *root) {
     NSString *text = nfb_textOfView(view);
     if ([text containsString:@"おすすめ"] || [text containsString:@"フォロー中"] ||
         [text.lowercaseString containsString:@"for you"] || [text.lowercaseString containsString:@"following"]) return YES;
+    if (nfb_stringLooksSpacesTimeline(text) || nfb_stringLooksSpacesTimeline(cls)) return YES;
     if ([cls containsString:@"Segment"] || [cls containsString:@"Tab"] || [cls containsString:@"LabelBar"]) return YES;
     if ([cls containsString:@"Bar"] && frame.size.height <= 180.0) return YES;
     return CGRectGetMaxY(frame) <= 220.0 && view.subviews.count > 0;
@@ -1689,9 +1690,21 @@ static BOOL nfb_viewLooksLikeHomeSegmentBar(UIView *view, UIView *root) {
     return hits >= 2;
 }
 
+static BOOL nfb_viewLooksLikeSpacesChrome(UIView *view, UIView *root) {
+    if (!view || !root || view == root || view.hidden || view.alpha < 0.01 || nfb_columnsProtectedView(view)) return NO;
+    if (nfb_viewContainsColumnsPagingSurface(view, 0)) return NO;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    if (frame.size.width < 80.0 || frame.size.height < 8.0 || frame.size.height > 260.0) return NO;
+    NSString *cls = NSStringFromClass(view.class);
+    NSMutableString *txt = [NSMutableString string];
+    nfb_appendDescendantText(view, txt, 0);
+    return nfb_stringLooksSpacesTimeline(cls) || nfb_stringLooksSpacesTimeline(txt);
+}
+
 static BOOL nfb_globalTopColumnsChromeCandidate(UIView *view, UIView *root) {
     if (!view || !root || view == root || view.hidden || view.alpha < 0.01 || nfb_columnsProtectedView(view)) return NO;
     if (nfb_columnsPagingSurface(view)) return NO;
+    if (nfb_viewLooksLikeSpacesChrome(view, root)) return YES;
     // Match the bar by its labels first (covers the nav-bar-hosted bar with a generic class).
     if (!nfb_viewContainsColumnsPagingSurface(view, 0) && nfb_viewLooksLikeHomeSegmentBar(view, root)) return YES;
     CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
