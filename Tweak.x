@@ -110,6 +110,35 @@ static void BHTCollapseSpacesChromeView(UIView *view) {
     }
 }
 
+static BOOL BHTLooksLikeSpacesChromeClass(UIView *view) {
+    if (!view) return NO;
+    NSString *cls = NSStringFromClass(view.class);
+    return [cls containsString:@"FleetLine"] ||
+           [cls containsString:@"UserPresence"] ||
+           [cls containsString:@"AudiospaceContainer"] ||
+           [cls containsString:@"VoiceRoomPrompt"] ||
+           [cls containsString:@"VoiceRoomLegacyCard"] ||
+           [cls containsString:@"VoiceRoomDockable"] ||
+           [cls containsString:@"VoiceRoomRetractable"] ||
+           [cls containsString:@"SpaceBar"] ||
+           [cls containsString:@"SpacesBar"];
+}
+
+static void BHTCollapseSpacesChromeViewAndNearbyContainers(UIView *view) {
+    if (!view || !BHTShouldHideSpacesBarNow()) return;
+    BHTCollapseSpacesChromeView(view);
+    UIView *current = view.superview;
+    for (NSInteger depth = 0; current && depth < 3; depth++, current = current.superview) {
+        NSString *cls = NSStringFromClass(current.class);
+        if ([cls containsString:@"Cell"] || [cls containsString:@"TableView"] || [cls containsString:@"CollectionView"]) break;
+        CGRect frame = current.frame;
+        if (frame.size.height > 0.5 && frame.size.height <= 260.0 &&
+            frame.size.width >= 40.0 && (BHTLooksLikeSpacesChromeClass(current) || BHTLooksLikeSpacesChromeClass(view))) {
+            BHTCollapseSpacesChromeView(current);
+        }
+    }
+}
+
 // Static helper function for recursive view traversal - OPTIMIZED VERSION
 static void BH_EnumerateSubviewsRecursively(UIView *view, void (^block)(UIView *currentView)) {
     if (!view || !block) return;
@@ -1878,39 +1907,64 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
 %hook T1FleetLineView
 - (void)didMoveToWindow {
     %orig;
-    BHTCollapseSpacesChromeView((UIView *)self);
+    BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self);
 }
 - (void)layoutSubviews {
     %orig;
-    BHTCollapseSpacesChromeView((UIView *)self);
+    BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self);
 }
 %end
 
 %hook T1ProfileHeaderUserPresenceView
 - (void)didMoveToWindow {
     %orig;
-    BHTCollapseSpacesChromeView((UIView *)self);
+    BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self);
 }
 - (void)layoutSubviews {
     %orig;
-    BHTCollapseSpacesChromeView((UIView *)self);
+    BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self);
 }
 %end
 
 %hook T1FleetLineHeaderController
 - (void)setFleetLineView:(UIView *)view {
     %orig(view);
-    BHTCollapseSpacesChromeView(view);
+    BHTCollapseSpacesChromeViewAndNearbyContainers(view);
 }
 - (void)setUserPresenceView:(UIView *)view {
     %orig(view);
-    BHTCollapseSpacesChromeView(view);
+    BHTCollapseSpacesChromeViewAndNearbyContainers(view);
 }
 - (void)setFleetLineViewContainerHeightConstraint:(NSLayoutConstraint *)constraint {
     if (BHTShouldHideSpacesBarNow()) constraint.constant = 0.0;
     %orig(constraint);
     if (BHTShouldHideSpacesBarNow()) constraint.constant = 0.0;
 }
+%end
+
+%hook T1LiveEventAudiospaceContainerView
+- (void)didMoveToWindow { %orig; BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self); }
+- (void)layoutSubviews { %orig; BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self); }
+%end
+
+%hook TASVoiceRoomPromptView
+- (void)didMoveToWindow { %orig; BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self); }
+- (void)layoutSubviews { %orig; BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self); }
+%end
+
+%hook T1VoiceRoomLegacyCardContentView
+- (void)didMoveToWindow { %orig; BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self); }
+- (void)layoutSubviews { %orig; BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self); }
+%end
+
+%hook T1VoiceRoomDockableView
+- (void)didMoveToWindow { %orig; BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self); }
+- (void)layoutSubviews { %orig; BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self); }
+%end
+
+%hook TASVoiceRoomRetractableBarContainerView
+- (void)didMoveToWindow { %orig; BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self); }
+- (void)layoutSubviews { %orig; BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self); }
 %end
 
 

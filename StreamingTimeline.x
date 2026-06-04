@@ -1482,6 +1482,12 @@ static UIScrollView *gColumnsOverlayScrollView = nil;
 static UIButton *gColumnsAllTopButton = nil;
 static NSArray<UIViewController *> *gColumnsOverlayPages = nil;
 static char kNFBColumnLoadKickedKey;
+static char kNFBColumnScrollAdjustedKey;
+static char kNFBColumnScrollFrameKey;
+static char kNFBColumnScrollAutoresizingKey;
+static char kNFBColumnScrollInsetKey;
+static char kNFBColumnScrollIndicatorInsetKey;
+static char kNFBColumnScrollAdjustmentBehaviorKey;
 static CGFloat gColumnsHiddenBarHeight = 0.0;   // height of the hidden home segment bar, for gap-closing
 
 static BOOL nfb_columnsShouldTreatGestureAsEdgeMenu(UIGestureRecognizer *gesture) {
@@ -1545,14 +1551,25 @@ static NSInteger nfb_countEnabledColumnsEdgeMenuGestures(void) {
     return count;
 }
 
-static NSInteger nfb_updateColumnsEdgeMenuGesturesForOffset(CGFloat offsetX) {
-    BOOL enableMenus = !gInlineColumnsEnabled || offsetX <= 2.0;
+static NSInteger nfb_setColumnsEdgeMenuGesturesEnabled(BOOL enabled) {
     NSInteger count = 0;
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
         if (window.hidden || window.alpha < 0.01) continue;
-        count += nfb_setColumnsEdgeMenuGesturesInView(window, enableMenus, 0);
+        count += nfb_setColumnsEdgeMenuGesturesInView(window, enabled, 0);
     }
     return count;
+}
+
+static NSInteger nfb_updateColumnsEdgeMenuGesturesForScroll(UIScrollView *scrollView) {
+    BOOL enableMenus = !gInlineColumnsEnabled;
+    if (gInlineColumnsEnabled && scrollView) {
+        BOOL scrollableColumns = scrollView.contentSize.width > scrollView.bounds.size.width + 8.0;
+        BOOL movingColumns = scrollView.isDragging || scrollView.isTracking || scrollView.isDecelerating;
+        // While a column rail is horizontally scrollable, the side-menu recognizer must not compete
+        // with a right-swipe inside the columns. It is restored only outside columns mode.
+        enableMenus = !scrollableColumns && !movingColumns && scrollView.contentOffset.x <= 2.0;
+    }
+    return nfb_setColumnsEdgeMenuGesturesEnabled(enableMenus);
 }
 
 static BOOL nfb_isHomePagingController(UIViewController *vc) {
@@ -1975,16 +1992,101 @@ static void nfb_restoreColumnOriginalViewState(UIView *view) {
     objc_setAssociatedObject(view, &kNFBColumnsOriginalAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static void nfb_restoreColumnScrollAdjustmentForPage(UIViewController *page) {
+    if (!page || ![page isViewLoaded]) return;
+    UIScrollView *sv = nfb_mainScrollViewOf(page);
+    if (!sv || !objc_getAssociatedObject(sv, &kNFBColumnScrollAdjustedKey)) return;
+    NSValue *frameValue = objc_getAssociatedObject(sv, &kNFBColumnScrollFrameKey);
+    NSNumber *autoresizing = objc_getAssociatedObject(sv, &kNFBColumnScrollAutoresizingKey);
+    NSValue *insetValue = objc_getAssociatedObject(sv, &kNFBColumnScrollInsetKey);
+    NSValue *indicatorValue = objc_getAssociatedObject(sv, &kNFBColumnScrollIndicatorInsetKey);
+    NSNumber *adjustmentBehavior = objc_getAssociatedObject(sv, &kNFBColumnScrollAdjustmentBehaviorKey);
+
+    CGFloat oldLogicalY = sv.contentOffset.y + sv.adjustedContentInset.top;
+    if (frameValue) sv.frame = frameValue.CGRectValue;
+    if (autoresizing) sv.autoresizingMask = autoresizing.unsignedIntegerValue;
+    if (insetValue) sv.contentInset = insetValue.UIEdgeInsetsValue;
+    if (indicatorValue) sv.scrollIndicatorInsets = indicatorValue.UIEdgeInsetsValue;
+    if (@available(iOS 11.0, *)) {
+        if (adjustmentBehavior) sv.contentInsetAdjustmentBehavior = adjustmentBehavior.integerValue;
+    }
+    if (!sv.isDragging && !sv.isTracking && !sv.isDecelerating) {
+        CGFloat restoredY = oldLogicalY - sv.adjustedContentInset.top;
+        if (isfinite(restoredY) && fabs(restoredY - sv.contentOffset.y) > 1.0) {
+            [sv setContentOffset:CGPointMake(sv.contentOffset.x, restoredY) animated:NO];
+        }
+    }
+
+    objc_setAssociatedObject(sv, &kNFBColumnScrollAdjustedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(sv, &kNFBColumnScrollFrameKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(sv, &kNFBColumnScrollAutoresizingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(sv, &kNFBColumnScrollInsetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(sv, &kNFBColumnScrollIndicatorInsetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(sv, &kNFBColumnScrollAdjustmentBehaviorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void nfb_adjustColumnScrollForPage(UIViewController *page, UIView *pageView) {
+    if (!page || !pageView || ![page isViewLoaded]) return;
+    UIScrollView *sv = nfb_mainScrollViewOf(page);
+    if (!sv || !sv.superview) return;
+    if (!objc_getAssociatedObject(sv, &kNFBColumnScrollAdjustedKey)) {
+        objc_setAssociatedObject(sv, &kNFBColumnScrollAdjustedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(sv, &kNFBColumnScrollFrameKey, [NSValue valueWithCGRect:sv.frame], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(sv, &kNFBColumnScrollAutoresizingKey, @(sv.autoresizingMask), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(sv, &kNFBColumnScrollInsetKey, [NSValue valueWithUIEdgeInsets:sv.contentInset], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(sv, &kNFBColumnScrollIndicatorInsetKey, [NSValue valueWithUIEdgeInsets:sv.scrollIndicatorInsets], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (@available(iOS 11.0, *)) {
+            objc_setAssociatedObject(sv, &kNFBColumnScrollAdjustmentBehaviorKey, @(sv.contentInsetAdjustmentBehavior), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+
+    CGFloat oldAdjustedTop = sv.adjustedContentInset.top;
+    CGFloat oldLogicalY = sv.contentOffset.y + oldAdjustedTop;
+    BOOL wasAtTop = fabs(sv.contentOffset.y + oldAdjustedTop) <= 2.0;
+
+    CGRect targetFrame = [pageView convertRect:pageView.bounds toView:sv.superview];
+    if (targetFrame.size.width > 80.0 && targetFrame.size.height > 200.0 &&
+        (fabs(sv.frame.origin.y - targetFrame.origin.y) > 0.5 ||
+         fabs(sv.frame.size.height - targetFrame.size.height) > 0.5 ||
+         fabs(sv.frame.size.width - targetFrame.size.width) > 0.5)) {
+        sv.frame = targetFrame;
+        sv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    }
+
+    if (@available(iOS 11.0, *)) {
+        sv.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    }
+    UIEdgeInsets inset = sv.contentInset;
+    if (fabs(inset.top) > 0.5) {
+        inset.top = 0.0;
+        sv.contentInset = inset;
+    }
+    UIEdgeInsets indicatorInset = sv.scrollIndicatorInsets;
+    if (fabs(indicatorInset.top) > 0.5) {
+        indicatorInset.top = 0.0;
+        sv.scrollIndicatorInsets = indicatorInset;
+    }
+    if (!sv.isDragging && !sv.isTracking && !sv.isDecelerating) {
+        CGFloat newY = wasAtTop ? -sv.adjustedContentInset.top : oldLogicalY - sv.adjustedContentInset.top;
+        if (isfinite(newY) && fabs(newY - sv.contentOffset.y) > 1.0) {
+            [sv setContentOffset:CGPointMake(sv.contentOffset.x, newY) animated:NO];
+        }
+    }
+}
+
 static void nfb_removeColumnsOverlay(void) {
     NSArray<UIViewController *> *pages = gColumnsOverlayPages ?: @[];
     for (UIViewController *page in pages) {
+        nfb_restoreColumnScrollAdjustmentForPage(page);
         if ([page isViewLoaded]) nfb_restoreColumnOriginalViewState(page.view);
     }
     UIViewController *paging = nfb_findAnyHomePagingController();
     for (UIViewController *page in paging.childViewControllers) {
+        nfb_restoreColumnScrollAdjustmentForPage(page);
         if ([page isViewLoaded]) nfb_restoreColumnOriginalViewState(page.view);
     }
     for (UIViewController *page in nfb_currentColumnTimelinePages()) {
+        nfb_restoreColumnScrollAdjustmentForPage(page);
         if ([page isViewLoaded]) nfb_restoreColumnOriginalViewState(page.view);
     }
     [gColumnsOverlayView removeFromSuperview];
@@ -2108,7 +2210,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nativeScrollView.showsHorizontalScrollIndicator = NO;
     nativeScrollView.clipsToBounds = YES;
     nativeScrollView.directionalLockEnabled = YES;
-    nfb_updateColumnsEdgeMenuGesturesForOffset(nativeScrollView.contentOffset.x);
+    nfb_updateColumnsEdgeMenuGesturesForScroll(nativeScrollView);
     // Always pin OUR column contentSize. Store the target before setting it because the
     // TFNPagingScrollView hook also sees this assignment.
     CGFloat targetContentWidth = MAX(columnWidth * pages.count, bounds.size.width + 1.0);
@@ -2154,8 +2256,9 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         [pageView setNeedsLayout];
         if (!columnsScrollDragging) {
             [pageView layoutIfNeeded];
-            nfb_kickEmptyColumnLoad(page);
         }
+        nfb_adjustColumnScrollForPage(page, pageView);
+        if (!columnsScrollDragging) nfb_kickEmptyColumnLoad(page);
         idx++;
     }
     // On iPad the pager only loads the current page, so the off-screen pinned-list columns stay
@@ -2446,6 +2549,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     if (needsNativeRestore && pageWidth > 100.0 && pageHeight > 100.0 && allPages.count) {
         NSUInteger idx = 0;
         for (UIViewController *page in allPages) {
+            nfb_restoreColumnScrollAdjustmentForPage(page);
             if ([page isViewLoaded]) {
                 UIView *view = page.view;
                 if (view.superview != scrollView) [scrollView addSubview:view];
@@ -2463,6 +2567,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
         [scrollView layoutIfNeeded];
     } else if (needsNativeRestore) {
         for (UIViewController *child in paging.childViewControllers) {
+            nfb_restoreColumnScrollAdjustmentForPage(child);
             if ([child isViewLoaded]) {
                 child.view.hidden = NO;
                 child.view.alpha = 1.0;
@@ -2839,8 +2944,10 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
             frame.origin.x, frame.origin.y, frame.size.width, frame.size.height];
         if (sv) {
             CGFloat topY = -sv.adjustedContentInset.top;
-            [s appendFormat:@" scroll=%@ offset=(%.1f,%.1f) topY=%.1f content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f)",
-                NSStringFromClass(sv.class), sv.contentOffset.x, sv.contentOffset.y, topY,
+            CGRect svFrame = sv.superview ? [sv.superview convertRect:sv.frame toView:page.view] : sv.frame;
+            [s appendFormat:@" scroll=%@ sframe=(%.1f,%.1f,%.1f,%.1f) offset=(%.1f,%.1f) topY=%.1f content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f)",
+                NSStringFromClass(sv.class), svFrame.origin.x, svFrame.origin.y, svFrame.size.width, svFrame.size.height,
+                sv.contentOffset.x, sv.contentOffset.y, topY,
                 sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height,
                 sv.contentInset.top, sv.contentInset.left, sv.contentInset.bottom, sv.contentInset.right,
                 sv.adjustedContentInset.top, sv.adjustedContentInset.left, sv.adjustedContentInset.bottom, sv.adjustedContentInset.right];
@@ -2898,7 +3005,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     gInlineColumnsEnabled = enabled;
     if (!enabled) {
         gColumnsHiddenBarHeight = 0.0;
-        nfb_updateColumnsEdgeMenuGesturesForOffset(0.0);
+        nfb_setColumnsEdgeMenuGesturesEnabled(YES);
         nfb_restoreAllSavedColumnsChrome();
     }
     if (enabled) {
@@ -2975,7 +3082,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 - (void)setContentOffset:(CGPoint)offset {
     %orig(offset);
     if (gInlineColumnsEnabled && objc_getAssociatedObject(self, &kNFBInlineColumnsAppliedKey)) {
-        nfb_updateColumnsEdgeMenuGesturesForOffset(((UIScrollView *)self).contentOffset.x);
+        nfb_updateColumnsEdgeMenuGesturesForScroll((UIScrollView *)self);
     }
 }
 - (void)setContentSize:(CGSize)size {
