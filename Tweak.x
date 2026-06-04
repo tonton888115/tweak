@@ -124,9 +124,25 @@ static BOOL BHTLooksLikeSpacesChromeClass(UIView *view) {
            [cls containsString:@"SpacesBar"];
 }
 
+static void BHTCollapseSpacesChromeDescendants(UIView *view, NSInteger depth) {
+    if (!view || !BHTShouldHideSpacesBarNow() || depth > 6) return;
+    for (UIView *subview in view.subviews) {
+        NSString *cls = NSStringFromClass(subview.class);
+        CGRect frame = subview.frame;
+        BOOL shortChild = frame.size.height > 0.5 && frame.size.height <= 260.0 && frame.size.width >= 40.0;
+        BOOL scrollChild = [subview isKindOfClass:UIScrollView.class] ||
+            [cls containsString:@"CollectionView"] || [cls containsString:@"ScrollView"];
+        if (shortChild && (scrollChild || BHTLooksLikeSpacesChromeClass(subview))) {
+            BHTCollapseSpacesChromeView(subview);
+        }
+        BHTCollapseSpacesChromeDescendants(subview, depth + 1);
+    }
+}
+
 static void BHTCollapseSpacesChromeViewAndNearbyContainers(UIView *view) {
     if (!view || !BHTShouldHideSpacesBarNow()) return;
     BHTCollapseSpacesChromeView(view);
+    BHTCollapseSpacesChromeDescendants(view, 0);
     UIView *current = view.superview;
     for (NSInteger depth = 0; current && depth < 3; depth++, current = current.superview) {
         NSString *cls = NSStringFromClass(current.class);

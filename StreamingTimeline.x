@@ -1475,6 +1475,7 @@ static char kNFBInlineColumnsChromeBoundsKey;
 static char kNFBInlineColumnsChromeClipsKey;
 static char kNFBInlineColumnsChromeConstraintsKey;
 static char kNFBInlineColumnsChromeCollapsedKey;
+static char kNFBInlineColumnsChromeGesturesKey;
 static char kNFBColumnsOriginalSuperviewKey;
 static char kNFBColumnsOriginalFrameKey;
 static char kNFBColumnsOriginalAutoresizingKey;
@@ -1566,15 +1567,11 @@ static NSInteger nfb_setColumnsEdgeMenuGesturesEnabled(BOOL enabled) {
 }
 
 static NSInteger nfb_updateColumnsEdgeMenuGesturesForScroll(UIScrollView *scrollView) {
-    BOOL enableMenus = !gInlineColumnsEnabled;
-    if (gInlineColumnsEnabled && scrollView) {
-        BOOL scrollableColumns = scrollView.contentSize.width > scrollView.bounds.size.width + 8.0;
-        BOOL movingColumns = scrollView.isDragging || scrollView.isTracking || scrollView.isDecelerating;
-        // While a column rail is horizontally scrollable, the side-menu recognizer must not compete
-        // with a right-swipe inside the columns. It is restored only outside columns mode.
-        enableMenus = !scrollableColumns && !movingColumns && scrollView.contentOffset.x <= 2.0;
-    }
-    return nfb_setColumnsEdgeMenuGesturesEnabled(enableMenus);
+    (void)scrollView;
+    // In columns mode, any edge-menu recognizer competes with horizontal column swipes. Do not
+    // special-case the left edge: on iPad the rail can be barely non-scrollable and still exposes
+    // the split/sidebar menu during a right swipe inside the columns.
+    return nfb_setColumnsEdgeMenuGesturesEnabled(!gInlineColumnsEnabled);
 }
 
 static BOOL nfb_isHomePagingController(UIViewController *vc) {
@@ -1671,6 +1668,16 @@ static void nfb_setColumnsChromeViewHidden(UIView *view, BOOL hidden) {
             objc_setAssociatedObject(view, &kNFBInlineColumnsChromeHiddenKey, @(view.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(view, &kNFBInlineColumnsChromeAlphaKey, @(view.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(view, &kNFBInlineColumnsChromeInteractionKey, @(view.userInteractionEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            NSMutableArray<NSDictionary *> *gestures = [NSMutableArray array];
+            for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
+                [gestures addObject:@{@"gesture": gesture, @"enabled": @(gesture.enabled)}];
+            }
+            if (gestures.count) {
+                objc_setAssociatedObject(view, &kNFBInlineColumnsChromeGesturesKey, gestures, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        }
+        for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
+            gesture.enabled = NO;
         }
         view.hidden = YES;
         view.alpha = 0.0;
@@ -1683,6 +1690,12 @@ static void nfb_setColumnsChromeViewHidden(UIView *view, BOOL hidden) {
     NSNumber *wasHidden = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeHiddenKey);
     NSNumber *alpha = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeAlphaKey);
     NSNumber *interactive = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeInteractionKey);
+    NSArray<NSDictionary *> *gestures = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeGesturesKey);
+    for (NSDictionary *entry in gestures) {
+        UIGestureRecognizer *gesture = entry[@"gesture"];
+        NSNumber *enabled = entry[@"enabled"];
+        if (gesture && enabled) gesture.enabled = enabled.boolValue;
+    }
     view.hidden = wasHidden ? wasHidden.boolValue : NO;
     view.alpha = alpha ? alpha.doubleValue : 1.0;
     view.userInteractionEnabled = interactive ? interactive.boolValue : YES;
@@ -1690,6 +1703,7 @@ static void nfb_setColumnsChromeViewHidden(UIView *view, BOOL hidden) {
     objc_setAssociatedObject(view, &kNFBInlineColumnsChromeHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBInlineColumnsChromeAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBInlineColumnsChromeInteractionKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeGesturesKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static BOOL nfb_columnsChromeCandidate(UIView *view, UIView *root) {
@@ -1735,6 +1749,40 @@ static BOOL nfb_viewContainsColumnsPagingSurface(UIView *view, int depth) {
     return NO;
 }
 
+static BOOL nfb_columnsChromeAncestorRowCandidate(UIView *view, UIView *child, UIView *root) {
+    if (!view || !child || !root || view == root) return NO;
+    if (nfb_columnsProtectedView(view) || nfb_columnsPagingSurface(view)) return NO;
+    if (nfb_viewContainsColumnsPagingSurface(view, 0)) return NO;
+    NSString *cls = NSStringFromClass(view.class);
+    if ([cls containsString:@"NavigationBar"] || [cls containsString:@"UILayoutContainerView"] ||
+        [cls containsString:@"TabBar"] || [cls containsString:@"TableView"] ||
+        [cls containsString:@"CollectionView"]) return NO;
+    CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
+    CGRect childFrame = child.superview ? [child.superview convertRect:child.frame toView:root] : child.frame;
+    if (CGRectGetMinY(frame) > 260.0) return NO;
+    if (frame.size.width < MIN(root.bounds.size.width * 0.45, 180.0)) return NO;
+    if (frame.size.height < 1.0 || frame.size.height > 90.0) return NO;
+    if (fabs(CGRectGetMinY(frame) - CGRectGetMinY(childFrame)) > 10.0) return NO;
+    BOOL genericRow = [cls isEqualToString:@"UIView"] || [cls containsString:@"StackView"] ||
+        [cls containsString:@"CustomHitTest"] || [cls containsString:@"Header"] ||
+        [cls containsString:@"Bar"];
+    return genericRow;
+}
+
+static void nfb_collapseColumnsChromeAncestorsForView(UIView *view, UIView *root) {
+    if (!view || !root) return;
+    UIView *child = view;
+    UIView *current = view.superview;
+    for (NSInteger depth = 0; current && depth < 4; depth++, child = current, current = current.superview) {
+        if (!nfb_columnsChromeAncestorRowCandidate(current, child, root)) break;
+        CGRect frame = current.superview ? [current.superview convertRect:current.frame toView:root] : current.frame;
+        if (gColumnsHiddenBarHeight < 1.0 && frame.size.height > 1.0) {
+            gColumnsHiddenBarHeight = frame.size.height;
+        }
+        nfb_setColumnsChromeViewHidden(current, YES);
+    }
+}
+
 static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView *root, int depth) {
     if (!view || !root || depth > 8) return NO;
     if (nfb_columnsProtectedView(view)) return NO;
@@ -1742,11 +1790,12 @@ static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView
     BOOL pagingSurface = nfb_columnsPagingSurface(view);
     BOOL containsPagingSurface = nfb_viewContainsColumnsPagingSurface(view, 0);
     if (pagingSurface) return NO;
+    BOOL did = NO;
     if (view != pagingView && !containsPaging && !pagingSurface && !containsPagingSurface && nfb_columnsChromeCandidate(view, root)) {
         nfb_setColumnsChromeViewHidden(view, YES);
-        return YES;
+        nfb_collapseColumnsChromeAncestorsForView(view, root);
+        did = YES;
     }
-    BOOL did = NO;
     for (UIView *subview in view.subviews) {
         did = nfb_hideColumnsChromeInView(subview, pagingView, root, depth + 1) || did;
     }
@@ -1850,7 +1899,8 @@ static NSInteger nfb_setColumnsGlobalTopChromeHiddenInView(UIView *view, UIView 
             if (bf.size.height > 1.0) gColumnsHiddenBarHeight = bf.size.height;
         }
         nfb_setColumnsChromeViewHidden(view, YES);
-        return 1;
+        nfb_collapseColumnsChromeAncestorsForView(view, root);
+        count++;
     }
     if (!hidden && objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey)) {
         nfb_setColumnsChromeViewHidden(view, NO);
@@ -1948,6 +1998,7 @@ static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC
     nfb_collectSegmentedChromeViewsInViewTree(root, bars, seen, root, 0);
     for (UIView *bar in bars) {
         nfb_setColumnsChromeViewHidden(bar, gInlineColumnsEnabled);
+        if (gInlineColumnsEnabled) nfb_collapseColumnsChromeAncestorsForView(bar, root);
     }
 }
 
@@ -3246,6 +3297,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     }
     if (enabled) {
         if (changed) gColumnsHiddenBarHeight = 0.0;
+        nfb_setColumnsEdgeMenuGesturesEnabled(NO);
         UIViewController *paging = nfb_findAnyHomePagingController();
         if (paging) {
             if (changed) nfb_requestColumnsPagingPreload(paging, YES);
