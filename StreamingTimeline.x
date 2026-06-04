@@ -1488,6 +1488,7 @@ static UIView *gColumnsOverlayView = nil;
 static UIScrollView *gColumnsOverlayScrollView = nil;
 static UIButton *gColumnsAllTopButton = nil;
 static NSArray<UIViewController *> *gColumnsOverlayPages = nil;
+static BOOL gInlineColumnsNeedsInitialOffsetReset = NO;
 static char kNFBColumnLoadKickedKey;
 static char kNFBColumnScrollAdjustedKey;
 static char kNFBColumnScrollFrameKey;
@@ -1584,12 +1585,17 @@ static NSInteger nfb_setColumnsEdgeMenuGesturesEnabled(BOOL enabled) {
     return count;
 }
 
+static BOOL nfb_columnsShouldEnableEdgeMenuForScroll(UIScrollView *scrollView) {
+    if (!gInlineColumnsEnabled) return YES;
+    if (!scrollView) return NO;
+    return scrollView.contentOffset.x <= 2.0;
+}
+
 static NSInteger nfb_updateColumnsEdgeMenuGesturesForScroll(UIScrollView *scrollView) {
-    (void)scrollView;
-    // In columns mode, any edge-menu recognizer competes with horizontal column swipes. Do not
-    // special-case the left edge: on iPad the rail can be barely non-scrollable and still exposes
-    // the split/sidebar menu during a right swipe inside the columns.
-    return nfb_setColumnsEdgeMenuGesturesEnabled(!gInlineColumnsEnabled);
+    // In columns mode the app split/sidebar pan competes with horizontal column swipes. Keep it
+    // disabled while the columns are scrolled away from x=0, but restore it at the left edge where
+    // the user explicitly expects the side menu to work.
+    return nfb_setColumnsEdgeMenuGesturesEnabled(nfb_columnsShouldEnableEdgeMenuForScroll(scrollView));
 }
 
 static BOOL nfb_isHomePagingController(UIViewController *vc) {
@@ -2097,6 +2103,19 @@ static CGFloat nfb_columnsColumnWidth(CGFloat viewportWidth) {
     return MIN(340.0, MAX(200.0, viewportWidth));
 }
 
+static CGFloat nfb_columnsContentWidth(CGFloat columnWidth, NSUInteger pageCount, CGFloat viewportWidth) {
+    CGFloat base = columnWidth * MAX((CGFloat)pageCount, 1.0);
+    CGFloat trailing = MAX(0.0, viewportWidth - columnWidth);
+    return MAX(base + trailing, viewportWidth + 1.0);
+}
+
+static CGFloat nfb_columnsSnappedOffsetX(CGFloat offsetX, CGFloat columnWidth, CGFloat maxOffsetX) {
+    if (columnWidth < 1.0 || maxOffsetX <= 0.0) return 0.0;
+    CGFloat clamped = MIN(MAX(offsetX, 0.0), maxOffsetX);
+    CGFloat snapped = round(clamped / columnWidth) * columnWidth;
+    return MIN(MAX(snapped, 0.0), maxOffsetX);
+}
+
 static CGFloat nfb_columnsTopShift(void) {
     // Segment/header chrome is collapsed in place. Shifting pages again leaves the
     // timeline under the navigation chrome and creates the visible top gap.
@@ -2282,23 +2301,13 @@ static void nfb_ensureColumnsOverlayForPaging(UIViewController *paging) {
         gColumnsOverlayView = nil;
         gColumnsOverlayScrollView = nil;
     }
-    if (!gColumnsAllTopButton) {
-        gColumnsAllTopButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        gColumnsAllTopButton.frame = CGRectMake(0.0, 0.0, 116.0, 34.0);
-        gColumnsAllTopButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-        gColumnsAllTopButton.backgroundColor = UIColor.systemBlueColor;
-        gColumnsAllTopButton.layer.cornerRadius = 17.0;
-        gColumnsAllTopButton.layer.masksToBounds = YES;
-        gColumnsAllTopButton.titleLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightSemibold];
-        [gColumnsAllTopButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        [gColumnsAllTopButton setTitle:@"全カラム↑" forState:UIControlStateNormal];
-        [gColumnsAllTopButton addTarget:[NFBStreamHandler shared] action:@selector(revealAllColumnsTap) forControlEvents:UIControlEventTouchUpInside];
-    }
-    if (gColumnsAllTopButton.superview != host) {
+    // A permanently visible "all columns to top" button occupied the exact strip exposed after
+    // removing the Home segment/Spaces chrome, making it look like the bar was still there. Keep
+    // the action in the stream menu/new-tweets pill and do not place a persistent overlay on TL.
+    if (gColumnsAllTopButton) {
         [gColumnsAllTopButton removeFromSuperview];
-        [host addSubview:gColumnsAllTopButton];
+        gColumnsAllTopButton = nil;
     }
-    [host bringSubviewToFront:gColumnsAllTopButton];
 }
 
 // A column that the pager placed but never made "current" can sit empty (no fetch) — seen on iPad
@@ -2384,19 +2393,24 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nfb_updateColumnsEdgeMenuGesturesForScroll(nativeScrollView);
     // Always pin OUR column contentSize. Store the target before setting it because the
     // TFNPagingScrollView hook also sees this assignment.
-    CGFloat targetContentWidth = MAX(columnWidth * pages.count, bounds.size.width + 1.0);
+    CGFloat targetContentWidth = nfb_columnsContentWidth(columnWidth, pages.count, bounds.size.width);
     objc_setAssociatedObject(nativeScrollView, &kNFBInlineColumnsTargetContentWidthKey, @(targetContentWidth), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (!columnsScrollDragging || fabs(nativeScrollView.contentSize.width - targetContentWidth) > 1.0 || fabs(nativeScrollView.contentSize.height - height) > 1.0) {
         nativeScrollView.contentSize = CGSizeMake(targetContentWidth, height);
     }
     if (!columnsScrollDragging) {
-        if (firstColumnsApply && fabs(nativeScrollView.contentOffset.x) > 1.0) {
-            [nativeScrollView setContentOffset:CGPointMake(0.0, nativeScrollView.contentOffset.y) animated:NO];
+        CGFloat maxOffsetX = MAX(0.0, targetContentWidth - bounds.size.width);
+        BOOL resetToFirstColumn = firstColumnsApply || gInlineColumnsNeedsInitialOffsetReset;
+        CGFloat targetOffsetX = resetToFirstColumn ? 0.0 : nfb_columnsSnappedOffsetX(nativeScrollView.contentOffset.x, columnWidth, maxOffsetX);
+        if (fabs(nativeScrollView.contentOffset.x - targetOffsetX) > 1.0) {
+            if (gNFBLogRecording) {
+                NFBLogEvent([NSString stringWithFormat:@"columnsSnap from=%.1f to=%.1f w=%.1f max=%.1f reset=%d",
+                    nativeScrollView.contentOffset.x, targetOffsetX, columnWidth, maxOffsetX, resetToFirstColumn ? 1 : 0]);
+            }
+            [nativeScrollView setContentOffset:CGPointMake(targetOffsetX, nativeScrollView.contentOffset.y) animated:NO];
         }
-        CGFloat maxOffsetX = MAX(0.0, nativeScrollView.contentSize.width - bounds.size.width);
-        if (nativeScrollView.contentOffset.x > maxOffsetX) {
-            [nativeScrollView setContentOffset:CGPointMake(maxOffsetX, nativeScrollView.contentOffset.y) animated:NO];
-        }
+        gInlineColumnsNeedsInitialOffsetReset = NO;
+        nfb_updateColumnsEdgeMenuGesturesForScroll(nativeScrollView);
     }
     if (host && gColumnsAllTopButton) {
         CGRect hostBounds = host.bounds;
@@ -2456,7 +2470,9 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     // change-key, so plain scrolling doesn't flood the log.
     if (gNFBLogRecording) {
         BOOL drag = nativeScrollView.isDragging || nativeScrollView.isTracking || nativeScrollView.isDecelerating;
-        NSMutableString *key = [NSMutableString stringWithFormat:@"pages=%lu w=%.0f top=%.0f drag=%d content=%.0f hframe=(%.0f,%.0f,%.0f,%.0f)", (unsigned long)pages.count, columnWidth, topShift, drag ? 1 : 0, nativeScrollView.contentSize.width, nativeScrollView.frame.origin.x, nativeScrollView.frame.origin.y, nativeScrollView.frame.size.width, nativeScrollView.frame.size.height];
+        CGFloat maxOffsetX = MAX(0.0, nativeScrollView.contentSize.width - nativeScrollView.bounds.size.width);
+        CGFloat snapOffsetX = nfb_columnsSnappedOffsetX(nativeScrollView.contentOffset.x, columnWidth, maxOffsetX);
+        NSMutableString *key = [NSMutableString stringWithFormat:@"pages=%lu w=%.0f top=%.0f drag=%d content=%.0f max=%.0f snap=%.0f hframe=(%.0f,%.0f,%.0f,%.0f)", (unsigned long)pages.count, columnWidth, topShift, drag ? 1 : 0, nativeScrollView.contentSize.width, maxOffsetX, snapOffsetX, nativeScrollView.frame.origin.x, nativeScrollView.frame.origin.y, nativeScrollView.frame.size.width, nativeScrollView.frame.size.height];
         NSUInteger ci = 0;
         for (UIViewController *p in pages) {
             if ([p isViewLoaded]) { CGRect f = p.view.frame; [key appendFormat:@" c%lu=(%.0f,%.0f,%.0f,%.0f)", (unsigned long)ci, f.origin.x, f.origin.y, f.size.width, f.size.height]; }
@@ -3237,7 +3253,15 @@ void NFBLogSnapshot(NSString *reason) {
     UIViewController *paging = nfb_findVisibleHomePagingController();
     [s appendFormat:@"paging=%@/win%d ", paging ? NSStringFromClass(paging.class) : @"nil", (paging && [paging isViewLoaded] && paging.view.window) ? 1 : 0];
     UIScrollView *h = paging ? nfb_horizontalPagingScrollViewOf(paging) : nil;
-    if (h) [s appendFormat:@"h.off=%.0f c=%.0f b=%.0f pg=%d drag=%d ", h.contentOffset.x, h.contentSize.width, h.bounds.size.width, h.pagingEnabled ? 1 : 0, (h.isDragging || h.isTracking || h.isDecelerating) ? 1 : 0];
+    if (h) {
+        CGFloat cw = nfb_columnsColumnWidth(h.bounds.size.width);
+        CGFloat maxX = MAX(0.0, h.contentSize.width - h.bounds.size.width);
+        CGFloat snapX = nfb_columnsSnappedOffsetX(h.contentOffset.x, cw, maxX);
+        [s appendFormat:@"h.off=%.0f c=%.0f b=%.0f cw=%.0f snap=%.0f max=%.0f pg=%d drag=%d edgeAllow=%d ",
+            h.contentOffset.x, h.contentSize.width, h.bounds.size.width, cw, snapX, maxX,
+            h.pagingEnabled ? 1 : 0, (h.isDragging || h.isTracking || h.isDecelerating) ? 1 : 0,
+            nfb_columnsShouldEnableEdgeMenuForScroll(h) ? 1 : 0];
+    }
     NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
     [s appendFormat:@"cols=%lu[", (unsigned long)pages.count];
     NSUInteger i = 0;
@@ -3293,14 +3317,19 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
         gColumnsOverlayScrollView ? gColumnsOverlayScrollView.bounds.size.height : 0.0,
         gColumnsAllTopButton ? 1 : 0];
     if (h) {
-        CGFloat inferredWidth = pages.count ? (h.contentSize.width / MAX((CGFloat)pages.count, 1.0)) : 0.0;
-        [s appendFormat:@"nativeHScroll class=%@ frame=(%.1f,%.1f,%.1f,%.1f) offset=(%.1f,%.1f) content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f) paging=%d bounceH=%d inferredColumnWidth=%.1f topShift=%.1f\n",
+        CGFloat columnWidth = nfb_columnsColumnWidth(h.bounds.size.width);
+        CGFloat maxOffsetX = MAX(0.0, h.contentSize.width - h.bounds.size.width);
+        CGFloat snapOffsetX = nfb_columnsSnappedOffsetX(h.contentOffset.x, columnWidth, maxOffsetX);
+        NSNumber *targetWidth = objc_getAssociatedObject(h, &kNFBInlineColumnsTargetContentWidthKey);
+        [s appendFormat:@"nativeHScroll class=%@ frame=(%.1f,%.1f,%.1f,%.1f) offset=(%.1f,%.1f) content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f) paging=%d bounceH=%d columnWidth=%.1f snapOffset=%.1f maxOffset=%.1f targetContent=%.1f edgeAllow=%d topShift=%.1f\n",
             NSStringFromClass(h.class), h.frame.origin.x, h.frame.origin.y, h.frame.size.width, h.frame.size.height,
             h.contentOffset.x, h.contentOffset.y, h.contentSize.width, h.contentSize.height,
             h.bounds.size.width, h.bounds.size.height,
             h.contentInset.top, h.contentInset.left, h.contentInset.bottom, h.contentInset.right,
             h.adjustedContentInset.top, h.adjustedContentInset.left, h.adjustedContentInset.bottom, h.adjustedContentInset.right,
-            h.pagingEnabled ? 1 : 0, h.alwaysBounceHorizontal ? 1 : 0, inferredWidth, nfb_columnsTopShift()];
+            h.pagingEnabled ? 1 : 0, h.alwaysBounceHorizontal ? 1 : 0,
+            columnWidth, snapOffsetX, maxOffsetX, targetWidth ? targetWidth.doubleValue : 0.0,
+            nfb_columnsShouldEnableEdgeMenuForScroll(h) ? 1 : 0, nfb_columnsTopShift()];
     }
     UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
     UIViewController *container = paging ? nfb_parentControllerNamed(paging, @"HomeTimelineContainer") : nil;
@@ -3411,12 +3440,16 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     if (changed) NFBLogEvent([NSString stringWithFormat:@"NFBSetInlineColumns -> %d", enabled]);
     gInlineColumnsEnabled = enabled;
     if (!enabled) {
+        gInlineColumnsNeedsInitialOffsetReset = NO;
         gColumnsHiddenBarHeight = 0.0;
         nfb_setColumnsEdgeMenuGesturesEnabled(YES);
         nfb_restoreAllSavedColumnsChrome();
     }
     if (enabled) {
-        if (changed) gColumnsHiddenBarHeight = 0.0;
+        if (changed) {
+            gColumnsHiddenBarHeight = 0.0;
+            gInlineColumnsNeedsInitialOffsetReset = YES;
+        }
         nfb_setColumnsEdgeMenuGesturesEnabled(NO);
         UIViewController *paging = nfb_findAnyHomePagingController();
         if (paging) {
@@ -3434,8 +3467,13 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 %hook UIGestureRecognizer
 - (void)setEnabled:(BOOL)enabled {
     if (enabled && gInlineColumnsEnabled && nfb_columnsShouldTreatGestureAsEdgeMenu(self)) {
-        %orig(NO);
-        return;
+        UIScrollView *h = nil;
+        UIViewController *paging = nfb_findAnyHomePagingController();
+        if (paging) h = nfb_horizontalPagingScrollViewOf(paging);
+        if (!nfb_columnsShouldEnableEdgeMenuForScroll(h)) {
+            %orig(NO);
+            return;
+        }
     }
     %orig(enabled);
 }
