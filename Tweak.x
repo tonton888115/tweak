@@ -42,6 +42,9 @@ static __weak UIViewController *gBHTLastTabBarController = nil;
 // Communities can't be overridden by a stale "enable columns" block firing 0.4-0.9s later.
 static BOOL gBHTColumnsIntent = NO;
 static BOOL BHTIsColumnsPageID(NSString *page);
+static NSString *BHTPageOfTabView(T1TabView *tabView);
+static NSArray<UIView *> *BHTTabViewsForController(UIViewController *controller);
+static BOOL BHTSelectTabPage(UIViewController *root, NSString *pageID);
 static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSelected);
 
 @class T1SettingsViewController;
@@ -640,10 +643,10 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     NSString *page = nil;
     if (!gBHTSelectingHomeForColumns) {
         @try {
-            NSArray *tabViews = [self valueForKey:@"tabViews"];
+            NSArray<UIView *> *tabViews = BHTTabViewsForController((UIViewController *)self);
             if (selectedIndex >= 0 && selectedIndex < (NSInteger)tabViews.count) {
                 id tabView = tabViews[(NSUInteger)selectedIndex];
-                page = [tabView valueForKey:@"scribePage"];
+                page = BHTPageOfTabView((T1TabView *)tabView);
                 NFBLogEvent([NSString stringWithFormat:@"tabBar.setSelectedIndex=%ld page=%@ selHome=%d intent=%d", (long)selectedIndex, page, gBHTSelectingHomeForColumns, gBHTColumnsIntent]);
                 if (BHTIsColumnsPageID(page)) {
                     BHTPresentColumnsMode();
@@ -4376,15 +4379,24 @@ static NSInteger BHTTabIndexForPage(UIViewController *tabBarController, NSString
     return NSNotFound;
 }
 
-static void BHTSelectTabPage(UIViewController *root, NSString *pageID) {
+static BOOL BHTSelectTabPage(UIViewController *root, NSString *pageID) {
     UIViewController *tabBarController = BHTFindControllerOfClass(root, NSClassFromString(@"T1TabBarViewController"), 0);
     if (!tabBarController) tabBarController = BHTFindTabBarController();   // root may be a T1HostViewController that hides it
+    if (!tabBarController) {
+        NFBLogEvent([NSString stringWithFormat:@"selectTabPage %@ noTabBar root=%@", pageID, root ? NSStringFromClass(root.class) : @"nil"]);
+        return NO;
+    }
     NSInteger index = BHTTabIndexForPage(tabBarController, pageID);
-    if (index == NSNotFound) return;
+    NFBLogEvent([NSString stringWithFormat:@"selectTabPage %@ index=%ld tabs=%lu tb=%@ root=%@",
+        pageID, (long)index, (unsigned long)BHTTabViewsForController(tabBarController).count,
+        NSStringFromClass(tabBarController.class), root ? NSStringFromClass(root.class) : @"nil"]);
+    if (index == NSNotFound) return NO;
     SEL sel = @selector(setSelectedIndex:);
     if ([tabBarController respondsToSelector:sel]) {
         ((void (*)(id, SEL, NSInteger))objc_msgSend)(tabBarController, sel, index);
+        return YES;
     }
+    return NO;
 }
 
 static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSelected) {
@@ -4779,8 +4791,14 @@ void BHTPresentColumnsMode(void) {
     NFBLogSnapshot(@"present.entry");
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (now - gBHTLastColumnsOpen < 0.20) {
-        NFBSetInlineColumnsEnabled(YES);
         UIWindow *activeWindow = BHT_activeKeyWindow();
+        UIViewController *tabBarController = BHTFindControllerOfClass(activeWindow.rootViewController, NSClassFromString(@"T1TabBarViewController"), 0);
+        if (!tabBarController) tabBarController = BHTFindTabBarController();
+        BOOL oldSelectingHome = gBHTSelectingHomeForColumns;
+        gBHTSelectingHomeForColumns = YES;
+        BHTSelectTabPage(tabBarController ?: activeWindow.rootViewController, @"home");
+        gBHTSelectingHomeForColumns = oldSelectingHome;
+        NFBSetInlineColumnsEnabled(YES);
         if (activeWindow.rootViewController) BHTUpdateColumnsTabSelection(activeWindow.rootViewController, YES);
         return;
     }
@@ -4809,21 +4827,28 @@ void BHTPresentColumnsMode(void) {
     gBHTColumnsHostController = hostController;
 
     gBHTSelectingHomeForColumns = YES;
-    if (tabBarController) BHTSelectTabPage(window.rootViewController, @"home");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    BOOL selectedHome = BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
+    NFBLogEvent([NSString stringWithFormat:@"present.selectHome=%d", selectedHome ? 1 : 0]);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gBHTColumnsIntent) return;
+        BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!gBHTColumnsIntent) { gBHTSelectingHomeForColumns = NO; NFBLogSnapshot(@"present+0.55(intent dropped)"); return; }
+        BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
         gBHTSelectingHomeForColumns = NO;
-        if (!gBHTColumnsIntent) { NFBLogSnapshot(@"present+0.45(intent dropped)"); return; }
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
-        NFBLogSnapshot(@"present+0.45");
+        NFBLogSnapshot(@"present+0.55");
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.90 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.00 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gBHTColumnsIntent) return;
+        BOOL oldSelectingHome = gBHTSelectingHomeForColumns;
+        gBHTSelectingHomeForColumns = YES;
+        BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
+        gBHTSelectingHomeForColumns = oldSelectingHome;
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
     });
@@ -4899,7 +4924,7 @@ static void BHTPresentColumnsViewController(void) {
 
     if (!objc_getAssociatedObject(self, &kBHTColumnsTapGestureKey)) {
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bh_openColumns:)];
-        tap.cancelsTouchesInView = NO;
+        tap.cancelsTouchesInView = YES;
         tap.delaysTouchesBegan = NO;
         tap.delaysTouchesEnded = NO;
         [self addGestureRecognizer:tap];
