@@ -4323,13 +4323,45 @@ static id BHTFindValueInControllerTree(UIViewController *root, NSString *key, NS
     return nil;
 }
 
-static NSInteger BHTTabIndexForPage(UIViewController *tabBarController, NSString *pageID) {
+static NSArray<UIView *> *BHTAllTabViewsForController(UIViewController *controller);
+
+static NSArray<UIView *> *BHTTabViewsForController(UIViewController *controller) {
+    NSMutableArray<UIView *> *result = [NSMutableArray array];
     NSArray *tabViews = nil;
     @try {
-        tabViews = [tabBarController valueForKey:@"tabViews"];
+        tabViews = [controller valueForKey:@"tabViews"];
     } @catch (NSException *e) {
         tabViews = nil;
     }
+    for (id tabView in tabViews) {
+        if ([tabView isKindOfClass:UIView.class]) [result addObject:tabView];
+    }
+    if (!result.count) [result addObjectsFromArray:BHTAllTabViewsForController(controller)];
+    return result;
+}
+
+static NSInteger BHTSelectedTabIndexForTabViews(NSArray<UIView *> *tabViews) {
+    NSInteger index = 0;
+    for (UIView *tabView in tabViews) {
+        BOOL selected = NO;
+        @try {
+            if ([tabView respondsToSelector:@selector(isSelected)]) {
+                selected = ((BOOL(*)(id, SEL))objc_msgSend)(tabView, @selector(isSelected));
+            } else {
+                id value = [tabView valueForKey:@"selected"];
+                if ([value respondsToSelector:@selector(boolValue)]) selected = [value boolValue];
+            }
+        } @catch (NSException *e) {
+            selected = NO;
+        }
+        if (selected) return index;
+        index++;
+    }
+    return -1;
+}
+
+static NSInteger BHTTabIndexForPage(UIViewController *tabBarController, NSString *pageID) {
+    NSArray<UIView *> *tabViews = BHTTabViewsForController(tabBarController);
     NSInteger index = 0;
     for (id tabView in tabViews) {
         NSString *page = nil;
@@ -4355,21 +4387,13 @@ static void BHTSelectTabPage(UIViewController *root, NSString *pageID) {
     }
 }
 
-static NSArray<UIView *> *BHTAllTabViewsForController(UIViewController *controller);
-
 static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSelected) {
     Class tabBarClass = NSClassFromString(@"T1TabBarViewController");
     if (!root || !tabBarClass) return;
     UIViewController *tabBarController = [root isKindOfClass:tabBarClass] ? root : BHTFindControllerOfClass(root, tabBarClass, 0);
     if (!tabBarController) tabBarController = BHTFindTabBarController();
     if (!tabBarController) tabBarController = root;
-    NSArray *tabViews = nil;
-    @try {
-        tabViews = [tabBarController valueForKey:@"tabViews"];
-    } @catch (NSException *e) {
-        tabViews = nil;
-    }
-    if (!tabViews.count) tabViews = BHTAllTabViewsForController(tabBarController);
+    NSArray *tabViews = BHTTabViewsForController(tabBarController);
     if (!tabViews.count) return;
 
     gBHTApplyingColumnsTabSelection = YES;
@@ -4658,10 +4682,13 @@ NSString *BHTColumnsLogFlags(void) {
         UIViewController *tb = BHTFindTabBarController();
         if (tb) {
             tabClass = NSStringFromClass(tb.class);
-            NSNumber *si = [tb valueForKey:@"selectedIndex"];
-            if ([si respondsToSelector:@selector(integerValue)]) sel = si.integerValue;
-            NSArray *tv = [tb valueForKey:@"tabViews"];
+            NSArray<UIView *> *tv = BHTTabViewsForController(tb);
             tabCount = (NSInteger)tv.count;
+            @try {
+                NSNumber *si = [tb valueForKey:@"selectedIndex"];
+                if ([si respondsToSelector:@selector(integerValue)]) sel = si.integerValue;
+            } @catch (NSException *e2) {}
+            if (sel < 0) sel = BHTSelectedTabIndexForTabViews(tv);
             if (sel >= 0 && sel < (NSInteger)tv.count) selPage = [tv[(NSUInteger)sel] valueForKey:@"scribePage"] ?: @"?";
         }
     } @catch (NSException *e) {}

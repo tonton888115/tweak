@@ -1416,12 +1416,66 @@ static char kNFBColumnsOriginalFrameKey;
 static char kNFBColumnsOriginalAutoresizingKey;
 static char kNFBColumnsOriginalHiddenKey;
 static char kNFBColumnsOriginalAlphaKey;
+static char kNFBColumnsEdgeGestureSavedKey;
+static char kNFBColumnsEdgeGestureEnabledKey;
 static UIView *gColumnsOverlayView = nil;
 static UIScrollView *gColumnsOverlayScrollView = nil;
 static UIButton *gColumnsAllTopButton = nil;
 static NSArray<UIViewController *> *gColumnsOverlayPages = nil;
 static char kNFBColumnLoadKickedKey;
 static CGFloat gColumnsHiddenBarHeight = 0.0;   // height of the hidden home segment bar, for gap-closing
+
+static BOOL nfb_columnsShouldTreatGestureAsEdgeMenu(UIGestureRecognizer *gesture) {
+    if (!gesture) return NO;
+    NSString *cls = NSStringFromClass(gesture.class);
+    return [gesture isKindOfClass:UIScreenEdgePanGestureRecognizer.class] || [cls containsString:@"EdgePan"];
+}
+
+static NSInteger nfb_setColumnsEdgeMenuGesturesInView(UIView *view, BOOL enabled, int depth) {
+    if (!view || depth > 14) return 0;
+    NSInteger count = 0;
+    for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
+        if (!nfb_columnsShouldTreatGestureAsEdgeMenu(gesture)) continue;
+        if (!objc_getAssociatedObject(gesture, &kNFBColumnsEdgeGestureSavedKey)) {
+            objc_setAssociatedObject(gesture, &kNFBColumnsEdgeGestureSavedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(gesture, &kNFBColumnsEdgeGestureEnabledKey, @(gesture.enabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        NSNumber *wasEnabled = objc_getAssociatedObject(gesture, &kNFBColumnsEdgeGestureEnabledKey);
+        gesture.enabled = enabled ? (wasEnabled ? wasEnabled.boolValue : YES) : NO;
+        count++;
+    }
+    for (UIView *subview in view.subviews) count += nfb_setColumnsEdgeMenuGesturesInView(subview, enabled, depth + 1);
+    return count;
+}
+
+static NSInteger nfb_countColumnsEdgeMenuGesturesInView(UIView *view, int depth) {
+    if (!view || depth > 14) return 0;
+    NSInteger count = 0;
+    for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
+        if (nfb_columnsShouldTreatGestureAsEdgeMenu(gesture)) count++;
+    }
+    for (UIView *subview in view.subviews) count += nfb_countColumnsEdgeMenuGesturesInView(subview, depth + 1);
+    return count;
+}
+
+static NSInteger nfb_countColumnsEdgeMenuGestures(void) {
+    NSInteger count = 0;
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window.hidden || window.alpha < 0.01) continue;
+        count += nfb_countColumnsEdgeMenuGesturesInView(window, 0);
+    }
+    return count;
+}
+
+static NSInteger nfb_updateColumnsEdgeMenuGesturesForOffset(CGFloat offsetX) {
+    BOOL enableMenus = !gInlineColumnsEnabled || offsetX <= 2.0;
+    NSInteger count = 0;
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window.hidden || window.alpha < 0.01) continue;
+        count += nfb_setColumnsEdgeMenuGesturesInView(window, enableMenus, 0);
+    }
+    return count;
+}
 
 static BOOL nfb_isHomePagingController(UIViewController *vc) {
     return nfb_parentControllerNamed(vc, @"HomeTimelineContainer") != nil;
@@ -1816,6 +1870,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nativeScrollView.showsHorizontalScrollIndicator = NO;
     nativeScrollView.clipsToBounds = YES;
     nativeScrollView.directionalLockEnabled = YES;
+    nfb_updateColumnsEdgeMenuGesturesForOffset(nativeScrollView.contentOffset.x);
     // Always pin OUR column contentSize. Store the target before setting it because the
     // TFNPagingScrollView hook also sees this assignment.
     CGFloat targetContentWidth = MAX(columnWidth * pages.count, bounds.size.width + 1.0);
@@ -1850,9 +1905,13 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         if (pageView.superview != nativeScrollView) [nativeScrollView addSubview:pageView];
         pageView.hidden = NO;
         pageView.alpha = 1.0;
-        // Shift the column up by the hidden segment bar's height so the table content fills the gap
-        // the bar left behind. We keep the table's own contentInset, so the at-top math is unchanged.
-        CGFloat topShift = MIN(MAX(gColumnsHiddenBarHeight, 0.0), 80.0);
+        CGFloat topShift = 0.0;
+        UIScrollView *pageScroll = nfb_mainScrollViewOf(page);
+        if (pageScroll && pageScroll.adjustedContentInset.top > 88.0) {
+            CGFloat safeTop = pageView.window ? pageView.window.safeAreaInsets.top : 0.0;
+            CGFloat desiredShift = pageScroll.adjustedContentInset.top - MAX(88.0, safeTop + 44.0);
+            topShift = MIN(MAX(desiredShift, 0.0), MAX(gColumnsHiddenBarHeight - 8.0, 0.0));
+        }
         pageView.frame = CGRectMake(columnWidth * idx, -topShift, columnWidth, height + topShift);
         pageView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
         [pageView setNeedsLayout];
@@ -2324,6 +2383,7 @@ void NFBLogSnapshot(NSString *reason) {
     }
     [s appendString:@"] "];
     [s appendFormat:@"allTopBtn=%d/sup%d ", gColumnsAllTopButton ? 1 : 0, (gColumnsAllTopButton && gColumnsAllTopButton.superview) ? 1 : 0];
+    [s appendFormat:@"edgeGestures=%ld ", (long)nfb_countColumnsEdgeMenuGestures()];
     UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
     UIViewController *container = paging ? nfb_parentControllerNamed(paging, @"HomeTimelineContainer") : nil;
     NSInteger chrome = 0;
@@ -2441,6 +2501,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     }
     if (gInlineColumnsEnabled != enabled) NFBLogEvent([NSString stringWithFormat:@"NFBSetInlineColumns -> %d", enabled]);
     gInlineColumnsEnabled = enabled;
+    if (!enabled) nfb_updateColumnsEdgeMenuGesturesForOffset(0.0);
     nfb_scheduleLayoutActiveHomePaging();
 }
 
@@ -2502,6 +2563,12 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 // (1808) — including mid-drag — which let the scroll run past the 340pt columns and snap back.
 // Only for the columns-applied home pager, force the width to the current column target.
 %hook TFNPagingScrollView
+- (void)setContentOffset:(CGPoint)offset {
+    %orig(offset);
+    if (gInlineColumnsEnabled && objc_getAssociatedObject(self, &kNFBInlineColumnsAppliedKey)) {
+        nfb_updateColumnsEdgeMenuGesturesForOffset(((UIScrollView *)self).contentOffset.x);
+    }
+}
 - (void)setContentSize:(CGSize)size {
     if (gInlineColumnsEnabled && objc_getAssociatedObject(self, &kNFBInlineColumnsAppliedKey)) {
         NSNumber *targetWidth = objc_getAssociatedObject(self, &kNFBInlineColumnsTargetContentWidthKey);
