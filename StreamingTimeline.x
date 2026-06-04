@@ -1808,6 +1808,12 @@ static CGFloat nfb_columnsColumnWidth(CGFloat viewportWidth) {
     return MIN(340.0, MAX(200.0, viewportWidth));
 }
 
+static CGFloat nfb_columnsTopShift(void) {
+    CGFloat shift = gColumnsHiddenBarHeight;
+    if (shift < 1.0) shift = 44.0;
+    return MIN(MAX(shift, 0.0), 56.0);
+}
+
 static void nfb_rememberColumnOriginalViewState(UIView *view) {
     if (!view || objc_getAssociatedObject(view, &kNFBColumnsOriginalSuperviewKey)) return;
     objc_setAssociatedObject(view, &kNFBColumnsOriginalSuperviewKey, view.superview, OBJC_ASSOCIATION_ASSIGN);
@@ -1940,14 +1946,17 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nfb_ensureColumnsOverlayForPaging(paging);
     UIScrollView *nativeScrollView = nfb_horizontalPagingScrollViewOf(paging);
     if (!nativeScrollView) return;
+    nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
 
     UIView *host = nfb_columnsHostViewForPaging(paging);
     CGRect bounds = nativeScrollView.bounds;
     if (bounds.size.width < 120.0 || bounds.size.height < 240.0) return;
     CGFloat columnWidth = nfb_columnsColumnWidth(bounds.size.width);
     CGFloat height = bounds.size.height;
+    CGFloat topShift = nfb_columnsTopShift();
 
     gColumnsOverlayPages = [pages copy];
+    BOOL firstColumnsApply = objc_getAssociatedObject(nativeScrollView, &kNFBInlineColumnsAppliedKey) == nil;
     nfb_rememberInlineColumnsOriginals(nativeScrollView);
     nativeScrollView.pagingEnabled = NO;
     nativeScrollView.alwaysBounceHorizontal = YES;
@@ -1963,6 +1972,9 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     objc_setAssociatedObject(nativeScrollView, &kNFBInlineColumnsTargetContentWidthKey, @(targetContentWidth), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     nativeScrollView.contentSize = CGSizeMake(targetContentWidth, height);
     if (!columnsScrollDragging) {
+        if (firstColumnsApply && fabs(nativeScrollView.contentOffset.x) > 1.0) {
+            [nativeScrollView setContentOffset:CGPointMake(0.0, nativeScrollView.contentOffset.y) animated:NO];
+        }
         CGFloat maxOffsetX = MAX(0.0, nativeScrollView.contentSize.width - bounds.size.width);
         if (nativeScrollView.contentOffset.x > maxOffsetX) {
             [nativeScrollView setContentOffset:CGPointMake(maxOffsetX, nativeScrollView.contentOffset.y) animated:NO];
@@ -1992,7 +2004,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         if (pageView.superview != nativeScrollView) [nativeScrollView addSubview:pageView];
         pageView.hidden = NO;
         pageView.alpha = 1.0;
-        pageView.frame = CGRectMake(columnWidth * idx, 0.0, columnWidth, height);
+        pageView.frame = CGRectMake(columnWidth * idx, -topShift, columnWidth, height + topShift);
         pageView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
         [pageView setNeedsLayout];
         [pageView layoutIfNeeded];

@@ -47,6 +47,7 @@ static NSString *BHTPageOfTabView(T1TabView *tabView);
 static NSArray<UIView *> *BHTTabViewsForController(UIViewController *controller);
 static BOOL BHTSelectTabPage(UIViewController *root, NSString *pageID);
 static BOOL BHTHandleTabSelectionRequest(UIViewController *tabBarController, NSInteger index, UIView *tabView, NSString *source);
+static void BHTApplyTabVisibility(T1TabView *tabView);
 static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSelected);
 
 @class T1SettingsViewController;
@@ -71,6 +72,10 @@ static NSMapTable<T1ImmersiveFullScreenViewController *, UILabel *> *playerToTim
 static NSMapTable<T1ImmersiveFullScreenViewController *, NSNumber *> *labelSearchCache = nil;
 static NSTimeInterval lastCacheInvalidation = 0;
 static const NSTimeInterval CACHE_INVALIDATION_INTERVAL = 10.0; // 10 seconds
+
+static BOOL BHTShouldHideSpacesBarNow(void) {
+    return [BHTManager hideSpacesBar] || NFBInlineColumnsEnabled();
+}
 
 // Static helper function for recursive view traversal - OPTIMIZED VERSION
 static void BH_EnumerateSubviewsRecursively(UIView *view, void (^block)(UIView *currentView)) {
@@ -685,11 +690,8 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
 - (void)loadView {
     %orig;
     gBHTLastTabBarController = (UIViewController *)self;
-    NSArray <NSString *> *hiddenBars = [BHCustomTabBarUtility getHiddenTabBars];
     for (T1TabView *tabView in self.tabViews) {
-        if ([hiddenBars containsObject:tabView.scribePage]) {
-            [tabView setHidden:true];
-        }
+        BHTApplyTabVisibility(tabView);
         if ([tabView respondsToSelector:@selector(bh_setupColumnsTabIfNeeded)]) {
             [tabView performSelector:@selector(bh_setupColumnsTabIfNeeded)];
         }
@@ -1800,7 +1802,19 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
 
 %hook T1HomeTimelineItemsViewController
 - (void)_t1_initializeFleets {
-    if ([BHTManager hideSpacesBar] || NFBInlineColumnsEnabled()) {
+    if (BHTShouldHideSpacesBarNow()) {
+        return;
+    }
+    return %orig;
+}
+- (void)_t1_configureFleets {
+    if (BHTShouldHideSpacesBarNow()) {
+        return;
+    }
+    return %orig;
+}
+- (void)_t1_configureFleets_helper {
+    if (BHTShouldHideSpacesBarNow()) {
         return;
     }
     return %orig;
@@ -1809,10 +1823,60 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
 
 %hook THFHomeTimelineItemsViewController
 - (void)_t1_initializeFleets {
-    if ([BHTManager hideSpacesBar] || NFBInlineColumnsEnabled()) {
+    if (BHTShouldHideSpacesBarNow()) {
         return;
     }
     return %orig;
+}
+- (void)_t1_configureFleets {
+    if (BHTShouldHideSpacesBarNow()) {
+        return;
+    }
+    return %orig;
+}
+- (void)_t1_configureFleets_helper {
+    if (BHTShouldHideSpacesBarNow()) {
+        return;
+    }
+    return %orig;
+}
+%end
+
+%hook T1FleetLineView
+- (void)didMoveToWindow {
+    %orig;
+    if (BHTShouldHideSpacesBarNow()) {
+        ((UIView *)self).hidden = YES;
+        ((UIView *)self).alpha = 0.0;
+        ((UIView *)self).userInteractionEnabled = NO;
+    }
+}
+- (void)layoutSubviews {
+    %orig;
+    if (BHTShouldHideSpacesBarNow()) {
+        ((UIView *)self).hidden = YES;
+        ((UIView *)self).alpha = 0.0;
+        ((UIView *)self).userInteractionEnabled = NO;
+    }
+}
+%end
+
+%hook T1ProfileHeaderUserPresenceView
+- (void)didMoveToWindow {
+    %orig;
+    if (BHTShouldHideSpacesBarNow()) {
+        ((UIView *)self).hidden = YES;
+        ((UIView *)self).alpha = 0.0;
+        ((UIView *)self).userInteractionEnabled = NO;
+    }
+}
+- (void)layoutSubviews {
+    %orig;
+    if (BHTShouldHideSpacesBarNow()) {
+        ((UIView *)self).hidden = YES;
+        ((UIView *)self).alpha = 0.0;
+        ((UIView *)self).userInteractionEnabled = NO;
+    }
 }
 %end
 
@@ -4253,6 +4317,28 @@ static BOOL BHTIsHomeTabView(T1TabView *tabView) {
     return [title containsString:@"ホーム"] || [lower isEqualToString:@"home"];
 }
 
+static void BHTApplyTabVisibility(T1TabView *tabView) {
+    if (!tabView) return;
+    NSString *page = BHTPageOfTabView(tabView);
+    NSArray<NSString *> *hiddenBars = [BHCustomTabBarUtility getHiddenTabBars] ?: @[];
+    BOOL isColumns = BHTIsColumnsTabView(tabView);
+    BOOL shouldHide = page.length && [hiddenBars containsObject:page] && !isColumns;
+    if (shouldHide) {
+        if (!tabView.hidden || tabView.alpha > 0.01 || tabView.userInteractionEnabled) {
+            NFBLogEvent([NSString stringWithFormat:@"hideCustomTab page=%@", page]);
+        }
+        tabView.hidden = YES;
+        tabView.alpha = 0.0;
+        tabView.userInteractionEnabled = NO;
+        return;
+    }
+    if (isColumns) {
+        tabView.hidden = NO;
+        tabView.alpha = 1.0;
+        tabView.userInteractionEnabled = YES;
+    }
+}
+
 static UIViewController *BHTFindControllerOfClass(UIViewController *root, Class targetClass, NSInteger depth) {
     if (!root || !targetClass || depth > 12) return nil;
     if ([root isKindOfClass:targetClass]) return root;
@@ -4504,6 +4590,8 @@ static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSel
         for (id tabView in tabViews) {
             NSString *page = BHTPageOfTabView((T1TabView *)tabView);
             BOOL isColumns = BHTIsColumnsTabView((T1TabView *)tabView);
+            BHTApplyTabVisibility((T1TabView *)tabView);
+            if (((UIView *)tabView).hidden && !isColumns) { idx++; continue; }
             BOOL shouldSelect;
             if (columnsSelected) {
                 shouldSelect = isColumns ? YES : NO;
@@ -5001,6 +5089,7 @@ static void BHTPresentColumnsViewController(void) {
     }
     self.accessibilityLabel = BHTColumnsTabTitle();
     self.userInteractionEnabled = YES;
+    BHTApplyTabVisibility((T1TabView *)self);
 
     if (!objc_getAssociatedObject(self, &kBHTColumnsTapGestureKey)) {
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bh_openColumns:)];
@@ -5062,6 +5151,7 @@ static void BHTPresentColumnsViewController(void) {
         }
     }
     [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
+    BHTApplyTabVisibility((T1TabView *)self);
 }
 
 - (void)_t1_updateImageViewAnimated:(_Bool)animated {
@@ -5070,6 +5160,7 @@ static void BHTPresentColumnsViewController(void) {
     // Always apply theming logic (handles both enabled and disabled cases)
     [self performSelector:@selector(bh_applyCurrentThemeToIcon)];
     [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
+    BHTApplyTabVisibility((T1TabView *)self);
 }
 
 - (void)setSelected:(_Bool)selected {
@@ -5078,6 +5169,7 @@ static void BHTPresentColumnsViewController(void) {
     // Always apply theming logic (handles both enabled and disabled cases)
     [self performSelector:@selector(bh_applyCurrentThemeToIcon)];
     [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
+    BHTApplyTabVisibility((T1TabView *)self);
     if (!gBHTApplyingColumnsTabSelection && selected && BHTIsColumnsTabView((T1TabView *)self)) {
         dispatch_async(dispatch_get_main_queue(), ^{
             BHTPresentColumnsViewController();
@@ -5114,6 +5206,7 @@ static void BHTPresentColumnsViewController(void) {
     %orig;
     [self performSelector:@selector(bh_setupColumnsTabIfNeeded)];
     [self performSelector:@selector(bh_setupHomeTabIfNeeded)];
+    BHTApplyTabVisibility((T1TabView *)self);
 }
 
 %end
@@ -5126,13 +5219,19 @@ static void BHTPresentColumnsViewController(void) {
 - (void)_t1_updateTabBarAppearance {
     %orig;
 
+    NSArray *tabViews = [self valueForKey:@"tabViews"];
     // Apply our custom theming after Twitter updates the tab bar
     if ([BHTManager classicTabBarEnabled]) {
-        NSArray *tabViews = [self valueForKey:@"tabViews"];
         for (id tabView in tabViews) {
             if ([tabView respondsToSelector:@selector(bh_applyCurrentThemeToIcon)]) {
                 [tabView performSelector:@selector(bh_applyCurrentThemeToIcon)];
             }
+        }
+    }
+    for (id tabView in tabViews) {
+        Class tabClass = NSClassFromString(@"T1TabView");
+        if (tabClass && [tabView isKindOfClass:tabClass]) {
+            BHTApplyTabVisibility((T1TabView *)tabView);
         }
     }
 }
