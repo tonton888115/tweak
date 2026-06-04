@@ -36,6 +36,7 @@ void BHTDismissColumnsMode(void);
 NSString *BHTColumnsModeDiagnostic(void);
 static BOOL gBHTSelectingHomeForColumns = NO;
 static BOOL gBHTApplyingColumnsTabSelection = NO;
+static __weak UIViewController *gBHTLastTabBarController = nil;
 // Single source of truth for whether columns mode should currently be on. Present sets it YES,
 // dismiss sets it NO. All deferred re-enable work must check this so a quick Home tap right after
 // Communities can't be overridden by a stale "enable columns" block firing 0.4-0.9s later.
@@ -626,6 +627,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
 %hook T1TabBarViewController
 
 - (void)setTabBarScrolling:(BOOL)scrolling {
+    gBHTLastTabBarController = (UIViewController *)self;
     if ([BHTManager stopHidingTabBar]) {
         %orig(NO); // Force scrolling to NO if fading is prevented
     } else {
@@ -634,6 +636,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
 }
 
 - (void)setSelectedIndex:(NSInteger)selectedIndex {
+    gBHTLastTabBarController = (UIViewController *)self;
     NSString *page = nil;
     if (!gBHTSelectingHomeForColumns) {
         @try {
@@ -663,6 +666,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
 
 - (void)loadView {
     %orig;
+    gBHTLastTabBarController = (UIViewController *)self;
     NSArray <NSString *> *hiddenBars = [BHCustomTabBarUtility getHiddenTabBars];
     for (T1TabView *tabView in self.tabViews) {
         if ([hiddenBars containsObject:tabView.scribePage]) {
@@ -4252,6 +4256,8 @@ static void BHTCollectTabViewsInView(UIView *view, NSMutableArray<UIView *> *tab
 static UIViewController *BHTFindTabBarController(void) {
     Class cls = NSClassFromString(@"T1TabBarViewController");
     if (!cls) return nil;
+    UIViewController *last = gBHTLastTabBarController;
+    if (last && [last isKindOfClass:cls]) return last;
     for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
         if (w.hidden || w.alpha < 0.01) continue;
         UIViewController *found = BHTFindControllerOfClass(w.rootViewController, cls, 0);
@@ -4325,6 +4331,7 @@ static void BHTUpdateColumnsTabSelection(UIViewController *root, BOOL columnsSel
     Class tabBarClass = NSClassFromString(@"T1TabBarViewController");
     if (!root || !tabBarClass) return;
     UIViewController *tabBarController = [root isKindOfClass:tabBarClass] ? root : BHTFindControllerOfClass(root, tabBarClass, 0);
+    if (!tabBarController) tabBarController = BHTFindTabBarController();
     if (!tabBarController) tabBarController = root;
     NSArray *tabViews = nil;
     @try {

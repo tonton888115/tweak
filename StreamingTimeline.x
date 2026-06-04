@@ -1405,6 +1405,7 @@ static char kNFBInlineColumnsIndicatorKey;
 static char kNFBInlineColumnsClipsKey;
 static char kNFBInlineColumnsDirectionalLockKey;
 static char kNFBInlineColumnsContentSizeKey;
+static char kNFBInlineColumnsTargetContentWidthKey;
 static char kNFBInlineColumnsChromeSavedKey;
 static char kNFBInlineColumnsChromeHiddenKey;
 static char kNFBInlineColumnsChromeAlphaKey;
@@ -1814,11 +1815,11 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nativeScrollView.showsHorizontalScrollIndicator = NO;
     nativeScrollView.clipsToBounds = YES;
     nativeScrollView.directionalLockEnabled = YES;
-    // Always pin OUR column contentSize. The recorded log proved Twitter's %orig sets it to
-    // pages*fullWidth (=1808) mid-drag, which let the scroll run into empty space past the 1020-wide
-    // columns and then snap back — that is the "catch and bounce". Shrinking contentSize never
-    // interrupts an in-flight scroll; only the hard offset clamp does, so that stays behind !dragging.
-    nativeScrollView.contentSize = CGSizeMake(MAX(columnWidth * pages.count, bounds.size.width + 1.0), height);
+    // Always pin OUR column contentSize. Store the target before setting it because the
+    // TFNPagingScrollView hook also sees this assignment.
+    CGFloat targetContentWidth = MAX(columnWidth * pages.count, bounds.size.width + 1.0);
+    objc_setAssociatedObject(nativeScrollView, &kNFBInlineColumnsTargetContentWidthKey, @(targetContentWidth), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    nativeScrollView.contentSize = CGSizeMake(targetContentWidth, height);
     if (!columnsScrollDragging) {
         CGFloat maxOffsetX = MAX(0.0, nativeScrollView.contentSize.width - bounds.size.width);
         if (nativeScrollView.contentOffset.x > maxOffsetX) {
@@ -1952,6 +1953,11 @@ static void nfb_requestColumnsPagingPreload(UIViewController *paging) {
     if (segmented && [segmented respondsToSelector:@selector(setPreloadContent:)]) {
         ((void(*)(id, SEL, BOOL))objc_msgSend)(segmented, @selector(setPreloadContent:), YES);
     }
+    if ([paging respondsToSelector:@selector(setPreloadPolicy:)]) {
+        // Required for pinned-list pages that have not been opened manually; without this the
+        // off-screen columns can remain loaded but empty.
+        ((void(*)(id, SEL, NSInteger))objc_msgSend)(paging, @selector(setPreloadPolicy:), 2);
+    }
     if (segmented && [segmented respondsToSelector:@selector(reloadVisibleTabs)]) {
         ((void(*)(id, SEL))objc_msgSend)(segmented, @selector(reloadVisibleTabs));
     }
@@ -2077,6 +2083,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsClipsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsDirectionalLockKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsContentSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBInlineColumnsTargetContentWidthKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void nfb_applyInlineColumns(UIViewController *paging) {
@@ -2426,13 +2433,14 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 %end
 
 // Twitter's paging layout keeps resetting the horizontal scroll's contentSize to pages*fullWidth
-// (1808) — including mid-drag — which let the scroll run past the 340pt columns and snap back (the
-// "catch"). Only for the columns-applied home pager, ignore a WIDER contentSize and keep ours.
+// (1808) — including mid-drag — which let the scroll run past the 340pt columns and snap back.
+// Only for the columns-applied home pager, force the width to the current column target.
 %hook TFNPagingScrollView
 - (void)setContentSize:(CGSize)size {
     if (gInlineColumnsEnabled && objc_getAssociatedObject(self, &kNFBInlineColumnsAppliedKey)) {
-        CGFloat ours = ((UIScrollView *)self).contentSize.width;
-        if (ours > 1.0 && size.width > ours + 1.0) { %orig(CGSizeMake(ours, size.height)); return; }
+        NSNumber *targetWidth = objc_getAssociatedObject(self, &kNFBInlineColumnsTargetContentWidthKey);
+        CGFloat target = targetWidth.doubleValue;
+        if (target > 1.0) { %orig(CGSizeMake(target, size.height)); return; }
     }
     %orig(size);
 }
