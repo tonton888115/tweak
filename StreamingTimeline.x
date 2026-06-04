@@ -2215,6 +2215,11 @@ static CGFloat nfb_columnsSnappedOffsetX(CGFloat offsetX, CGFloat columnWidth, C
     return MIN(MAX(snapped, 0.0), maxOffsetX);
 }
 
+static CGFloat nfb_columnsClampedOffsetX(CGFloat offsetX, CGFloat maxOffsetX) {
+    if (maxOffsetX <= 0.0) return 0.0;
+    return MIN(MAX(offsetX, 0.0), maxOffsetX);
+}
+
 static CGFloat nfb_columnsTopShift(void) {
     // Segment/header chrome is collapsed in place. Shifting pages again leaves the
     // timeline under the navigation chrome and creates the visible top gap.
@@ -2517,10 +2522,10 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!columnsScrollDragging) {
         CGFloat maxOffsetX = MAX(0.0, targetContentWidth - bounds.size.width);
         BOOL resetToFirstColumn = firstColumnsApply || gInlineColumnsNeedsInitialOffsetReset;
-        CGFloat targetOffsetX = resetToFirstColumn ? 0.0 : nfb_columnsSnappedOffsetX(nativeScrollView.contentOffset.x, columnWidth, maxOffsetX);
+        CGFloat targetOffsetX = resetToFirstColumn ? 0.0 : nfb_columnsClampedOffsetX(nativeScrollView.contentOffset.x, maxOffsetX);
         if (fabs(nativeScrollView.contentOffset.x - targetOffsetX) > 1.0) {
             if (gNFBLogRecording) {
-                NFBLogEvent([NSString stringWithFormat:@"columnsSnap from=%.1f to=%.1f w=%.1f max=%.1f reset=%d",
+                NFBLogEvent([NSString stringWithFormat:@"columnsClamp from=%.1f to=%.1f w=%.1f max=%.1f reset=%d",
                     nativeScrollView.contentOffset.x, targetOffsetX, columnWidth, maxOffsetX, resetToFirstColumn ? 1 : 0]);
             }
             [nativeScrollView setContentOffset:CGPointMake(targetOffsetX, nativeScrollView.contentOffset.y) animated:NO];
