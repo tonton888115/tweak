@@ -2418,7 +2418,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 %hook T1URTViewController
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
     %orig;
-    if (!nfb_parentControllerNamed(self, @"HomeTimelineContainer")) return;
+    if (!nfb_parentControllerNamed((UIViewController *)self, @"HomeTimelineContainer")) return;
     // Icon refresh only — do NOT run the full visibility logic here (it fades/disables the button).
     nfb_noteActiveTimelineScroll(scrollView);
     nfb_updateStreamStateIconForVC(gActiveItemsVC);
@@ -2431,7 +2431,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 %hook TFNPagingScrollView
 - (void)setContentSize:(CGSize)size {
     if (gInlineColumnsEnabled && objc_getAssociatedObject(self, &kNFBInlineColumnsAppliedKey)) {
-        CGFloat ours = self.contentSize.width;
+        CGFloat ours = ((UIScrollView *)self).contentSize.width;
         if (ours > 1.0 && size.width > ours + 1.0) { %orig(CGSizeMake(ours, size.height)); return; }
     }
     %orig(size);
