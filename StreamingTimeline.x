@@ -2055,6 +2055,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     if (!scrollView) return;
 
     BOOL wasApplied = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) != nil;
+    if (!wasApplied) return;
 
     NSNumber *pagingEnabled = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey);
     NSNumber *bounceH = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsBounceHKey);
