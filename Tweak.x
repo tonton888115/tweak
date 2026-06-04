@@ -4245,7 +4245,10 @@ static UIViewController *BHTFindControllerOfClass(UIViewController *root, Class 
 
 // The key window's root can be a T1HostViewController that doesn't expose T1TabBarViewController as a
 // findable descendant (log showed tabSel=-1 → BHTSelectTabPage couldn't reselect Home, so Home never
-// came back). Fall back to scanning every window for the tab bar.
+// came back). The root can be a T1HostViewController that doesn't expose the tab bar as a child VC
+// (log: tabSel=-1 even with all-window VC search), so also find a tab VIEW and walk its responder
+// chain up to the T1TabBarViewController.
+static void BHTCollectTabViewsInView(UIView *view, NSMutableArray<UIView *> *tabViews, NSInteger depth);
 static UIViewController *BHTFindTabBarController(void) {
     Class cls = NSClassFromString(@"T1TabBarViewController");
     if (!cls) return nil;
@@ -4253,6 +4256,17 @@ static UIViewController *BHTFindTabBarController(void) {
         if (w.hidden || w.alpha < 0.01) continue;
         UIViewController *found = BHTFindControllerOfClass(w.rootViewController, cls, 0);
         if (found) return found;
+    }
+    for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
+        if (w.hidden || w.alpha < 0.01) continue;
+        NSMutableArray<UIView *> *tvs = [NSMutableArray array];
+        BHTCollectTabViewsInView(w, tvs, 0);
+        for (UIView *tv in tvs) {
+            UIResponder *r = tv.nextResponder;
+            for (int i = 0; r && i < 24; i++, r = r.nextResponder) {
+                if ([r isKindOfClass:cls]) return (UIViewController *)r;
+            }
+        }
     }
     return nil;
 }
@@ -4705,6 +4719,7 @@ void BHTPresentColumnsMode(void) {
     UIWindow *window = BHT_activeKeyWindow();
     if (!window.rootViewController) return;
     UIViewController *tabBarController = BHTFindControllerOfClass(window.rootViewController, NSClassFromString(@"T1TabBarViewController"), 0);
+    if (!tabBarController) tabBarController = BHTFindTabBarController();   // root may be a T1HostViewController
     UIViewController *hostController = tabBarController ?: window.rootViewController;
     if (!hostController || !hostController.view) return;
 

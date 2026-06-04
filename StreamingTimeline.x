@@ -1952,12 +1952,6 @@ static void nfb_requestColumnsPagingPreload(UIViewController *paging) {
     if (segmented && [segmented respondsToSelector:@selector(setPreloadContent:)]) {
         ((void(*)(id, SEL, BOOL))objc_msgSend)(segmented, @selector(setPreloadContent:), YES);
     }
-    if ([paging respondsToSelector:@selector(setPreloadPolicy:)]) {
-        // Push the pager toward preloading every page so off-screen pinned-list columns fetch their
-        // data without the user pre-opening each list first. 2 is a guess at an "all/aggressive"
-        // policy; harmless if the enum differs.
-        ((void(*)(id, SEL, NSInteger))objc_msgSend)(paging, @selector(setPreloadPolicy:), 2);
-    }
     if (segmented && [segmented respondsToSelector:@selector(reloadVisibleTabs)]) {
         ((void(*)(id, SEL))objc_msgSend)(segmented, @selector(reloadVisibleTabs));
     }
@@ -2238,6 +2232,11 @@ void NFBLogSnapshot(NSString *reason) {
     UIViewController *top = root; int pd = 0;
     while (top.presentedViewController && pd < 8) { top = top.presentedViewController; pd++; }
     [s appendFormat:@"root=%@ top=%@ pres=%d ", root ? NSStringFromClass(root.class) : @"nil", top ? NSStringFromClass(top.class) : @"nil", pd];
+    [s appendString:@"wins["];
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        [s appendFormat:@"%@%@/%@ ", w.isKeyWindow ? @"K" : @"-", w.hidden ? @"H" : @"-", w.rootViewController ? NSStringFromClass(w.rootViewController.class) : @"nil"];
+    }
+    [s appendString:@"] "];
     UIViewController *paging = nfb_findVisibleHomePagingController();
     [s appendFormat:@"paging=%@/win%d ", paging ? NSStringFromClass(paging.class) : @"nil", (paging && [paging isViewLoaded] && paging.view.window) ? 1 : 0];
     UIScrollView *h = paging ? nfb_horizontalPagingScrollViewOf(paging) : nil;
@@ -2423,6 +2422,19 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     // Icon refresh only — do NOT run the full visibility logic here (it fades/disables the button).
     nfb_noteActiveTimelineScroll(scrollView);
     nfb_updateStreamStateIconForVC(gActiveItemsVC);
+}
+%end
+
+// Twitter's paging layout keeps resetting the horizontal scroll's contentSize to pages*fullWidth
+// (1808) — including mid-drag — which let the scroll run past the 340pt columns and snap back (the
+// "catch"). Only for the columns-applied home pager, ignore a WIDER contentSize and keep ours.
+%hook TFNPagingScrollView
+- (void)setContentSize:(CGSize)size {
+    if (gInlineColumnsEnabled && objc_getAssociatedObject(self, &kNFBInlineColumnsAppliedKey)) {
+        CGFloat ours = self.contentSize.width;
+        if (ours > 1.0 && size.width > ours + 1.0) { %orig(CGSizeMake(ours, size.height)); return; }
+    }
+    %orig(size);
 }
 %end
 
