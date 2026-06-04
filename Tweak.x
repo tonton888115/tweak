@@ -77,6 +77,39 @@ static BOOL BHTShouldHideSpacesBarNow(void) {
     return [BHTManager hideSpacesBar] || NFBInlineColumnsEnabled();
 }
 
+static BOOL BHTConstraintLooksLikeSpacesHeight(NSLayoutConstraint *constraint, UIView *view) {
+    if (!constraint || !view) return NO;
+    BOOL firstHeight = constraint.firstItem == view && constraint.firstAttribute == NSLayoutAttributeHeight;
+    BOOL secondHeight = constraint.secondItem == view && constraint.secondAttribute == NSLayoutAttributeHeight;
+    if (!firstHeight && !secondHeight) return NO;
+    CGFloat c = fabs(constraint.constant);
+    return c > 0.5 && c <= 260.0;
+}
+
+static void BHTCollapseSpacesChromeView(UIView *view) {
+    if (!view || !BHTShouldHideSpacesBarNow()) return;
+    view.hidden = YES;
+    view.alpha = 0.0;
+    view.userInteractionEnabled = NO;
+    view.clipsToBounds = YES;
+    CGRect frame = view.frame;
+    if (frame.size.height > 0.5 && frame.size.height <= 260.0) {
+        frame.size.height = 0.0;
+        view.frame = frame;
+    }
+    CGRect bounds = view.bounds;
+    if (bounds.size.height > 0.5 && bounds.size.height <= 260.0) {
+        bounds.size.height = 0.0;
+        view.bounds = bounds;
+    }
+    for (NSLayoutConstraint *constraint in view.constraints) {
+        if (BHTConstraintLooksLikeSpacesHeight(constraint, view)) constraint.constant = 0.0;
+    }
+    for (NSLayoutConstraint *constraint in view.superview.constraints) {
+        if (BHTConstraintLooksLikeSpacesHeight(constraint, view)) constraint.constant = 0.0;
+    }
+}
+
 // Static helper function for recursive view traversal - OPTIMIZED VERSION
 static void BH_EnumerateSubviewsRecursively(UIView *view, void (^block)(UIView *currentView)) {
     if (!view || !block) return;
@@ -1845,38 +1878,67 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
 %hook T1FleetLineView
 - (void)didMoveToWindow {
     %orig;
-    if (BHTShouldHideSpacesBarNow()) {
-        ((UIView *)self).hidden = YES;
-        ((UIView *)self).alpha = 0.0;
-        ((UIView *)self).userInteractionEnabled = NO;
-    }
+    BHTCollapseSpacesChromeView((UIView *)self);
 }
 - (void)layoutSubviews {
     %orig;
-    if (BHTShouldHideSpacesBarNow()) {
-        ((UIView *)self).hidden = YES;
-        ((UIView *)self).alpha = 0.0;
-        ((UIView *)self).userInteractionEnabled = NO;
-    }
+    BHTCollapseSpacesChromeView((UIView *)self);
 }
 %end
 
 %hook T1ProfileHeaderUserPresenceView
 - (void)didMoveToWindow {
     %orig;
-    if (BHTShouldHideSpacesBarNow()) {
-        ((UIView *)self).hidden = YES;
-        ((UIView *)self).alpha = 0.0;
-        ((UIView *)self).userInteractionEnabled = NO;
-    }
+    BHTCollapseSpacesChromeView((UIView *)self);
 }
 - (void)layoutSubviews {
     %orig;
-    if (BHTShouldHideSpacesBarNow()) {
-        ((UIView *)self).hidden = YES;
-        ((UIView *)self).alpha = 0.0;
-        ((UIView *)self).userInteractionEnabled = NO;
+    BHTCollapseSpacesChromeView((UIView *)self);
+}
+%end
+
+%hook T1TappableStatusFleetLineItemView
+- (void)didMoveToWindow {
+    %orig;
+    BHTCollapseSpacesChromeView((UIView *)self);
+}
+- (void)layoutSubviews {
+    %orig;
+    BHTCollapseSpacesChromeView((UIView *)self);
+}
+%end
+
+%hook _TtC14T1TwitterSwift17FleetLineItemView
+- (void)didMoveToWindow {
+    %orig;
+    BHTCollapseSpacesChromeView((UIView *)self);
+}
+- (void)layoutSubviews {
+    %orig;
+    BHTCollapseSpacesChromeView((UIView *)self);
+}
+%end
+
+%hook T1FleetLineHeaderController
+- (void)viewDidLayoutSubviews {
+    %orig;
+    UIViewController *controller = (UIViewController *)self;
+    if ([controller respondsToSelector:@selector(isViewLoaded)] && [controller respondsToSelector:@selector(view)] && [controller isViewLoaded]) {
+        BHTCollapseSpacesChromeView(controller.view);
     }
+}
+- (void)setFleetLineView:(UIView *)view {
+    %orig(view);
+    BHTCollapseSpacesChromeView(view);
+}
+- (void)setUserPresenceView:(UIView *)view {
+    %orig(view);
+    BHTCollapseSpacesChromeView(view);
+}
+- (void)setFleetLineViewContainerHeightConstraint:(NSLayoutConstraint *)constraint {
+    if (BHTShouldHideSpacesBarNow()) constraint.constant = 0.0;
+    %orig(constraint);
+    if (BHTShouldHideSpacesBarNow()) constraint.constant = 0.0;
 }
 %end
 

@@ -1461,6 +1461,11 @@ static char kNFBInlineColumnsChromeSavedKey;
 static char kNFBInlineColumnsChromeHiddenKey;
 static char kNFBInlineColumnsChromeAlphaKey;
 static char kNFBInlineColumnsChromeInteractionKey;
+static char kNFBInlineColumnsChromeFrameKey;
+static char kNFBInlineColumnsChromeBoundsKey;
+static char kNFBInlineColumnsChromeClipsKey;
+static char kNFBInlineColumnsChromeConstraintsKey;
+static char kNFBInlineColumnsChromeCollapsedKey;
 static char kNFBColumnsOriginalSuperviewKey;
 static char kNFBColumnsOriginalFrameKey;
 static char kNFBColumnsOriginalAutoresizingKey;
@@ -1559,6 +1564,79 @@ static BOOL nfb_viewContainsDescendant(UIView *root, UIView *descendant) {
     return NO;
 }
 
+static BOOL nfb_constraintLooksLikeChromeHeight(NSLayoutConstraint *constraint, UIView *view) {
+    if (!constraint || !view) return NO;
+    BOOL firstHeight = constraint.firstItem == view && constraint.firstAttribute == NSLayoutAttributeHeight;
+    BOOL secondHeight = constraint.secondItem == view && constraint.secondAttribute == NSLayoutAttributeHeight;
+    if (!firstHeight && !secondHeight) return NO;
+    CGFloat c = fabs(constraint.constant);
+    return c > 0.5 && c <= 260.0;
+}
+
+static NSArray<NSLayoutConstraint *> *nfb_chromeHeightConstraintsForView(UIView *view) {
+    if (!view) return @[];
+    NSMutableArray<NSLayoutConstraint *> *matches = [NSMutableArray array];
+    for (NSLayoutConstraint *constraint in view.constraints) {
+        if (nfb_constraintLooksLikeChromeHeight(constraint, view)) [matches addObject:constraint];
+    }
+    for (NSLayoutConstraint *constraint in view.superview.constraints) {
+        if (nfb_constraintLooksLikeChromeHeight(constraint, view)) [matches addObject:constraint];
+    }
+    return matches;
+}
+
+static void nfb_collapseColumnsChromeView(UIView *view) {
+    if (!view || objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey)) return;
+    CGRect frame = view.frame;
+    CGRect bounds = view.bounds;
+    BOOL shortChrome = frame.size.height > 0.5 && frame.size.height <= 260.0 && frame.size.width >= 24.0;
+    NSArray<NSLayoutConstraint *> *heightConstraints = nfb_chromeHeightConstraintsForView(view);
+    if (!shortChrome && !heightConstraints.count) return;
+
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeFrameKey, [NSValue valueWithCGRect:frame], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeBoundsKey, [NSValue valueWithCGRect:bounds], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeClipsKey, @(view.clipsToBounds), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    NSMutableArray<NSDictionary *> *savedConstraints = [NSMutableArray array];
+    for (NSLayoutConstraint *constraint in heightConstraints) {
+        [savedConstraints addObject:@{@"constraint": constraint, @"constant": @(constraint.constant)}];
+        constraint.constant = 0.0;
+    }
+    if (savedConstraints.count) {
+        objc_setAssociatedObject(view, &kNFBInlineColumnsChromeConstraintsKey, savedConstraints, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    view.clipsToBounds = YES;
+    if (shortChrome) {
+        frame.size.height = 0.0;
+        bounds.size.height = 0.0;
+        view.frame = frame;
+        view.bounds = bounds;
+    }
+}
+
+static void nfb_restoreCollapsedColumnsChromeView(UIView *view) {
+    if (!view || !objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey)) return;
+    NSArray<NSDictionary *> *savedConstraints = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeConstraintsKey);
+    for (NSDictionary *entry in savedConstraints) {
+        NSLayoutConstraint *constraint = entry[@"constraint"];
+        NSNumber *constant = entry[@"constant"];
+        if (constraint && constant) constraint.constant = constant.doubleValue;
+    }
+    NSValue *frame = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeFrameKey);
+    NSValue *bounds = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeBoundsKey);
+    NSNumber *clips = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeClipsKey);
+    if (frame) view.frame = frame.CGRectValue;
+    if (bounds) view.bounds = bounds.CGRectValue;
+    if (clips) view.clipsToBounds = clips.boolValue;
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeFrameKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeBoundsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeClipsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeConstraintsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static void nfb_setColumnsChromeViewHidden(UIView *view, BOOL hidden) {
     if (!view) return;
     if (hidden) {
@@ -1571,9 +1649,11 @@ static void nfb_setColumnsChromeViewHidden(UIView *view, BOOL hidden) {
         view.hidden = YES;
         view.alpha = 0.0;
         view.userInteractionEnabled = NO;
+        nfb_collapseColumnsChromeView(view);
         return;
     }
     if (!objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey)) return;
+    nfb_restoreCollapsedColumnsChromeView(view);
     NSNumber *wasHidden = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeHiddenKey);
     NSNumber *alpha = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeAlphaKey);
     NSNumber *interactive = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeInteractionKey);
@@ -1923,7 +2003,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         // laid out and just retry the preload; restore only happens when columns mode is turned off.
         static NSTimeInterval lastColumnsPageRetry = 0.0;
         NSTimeInterval now = CACurrentMediaTime();
-        if (now - lastColumnsPageRetry > 0.75) {
+        if (!columnsScrollDragging && now - lastColumnsPageRetry > 0.75) {
             lastColumnsPageRetry = now;
             nfb_requestColumnsPagingPreload(paging);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1935,7 +2015,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if ((NSInteger)pages.count < expectedColumns) {
         static NSTimeInterval lastColumnsPreload = 0.0;
         NSTimeInterval now = CACurrentMediaTime();
-        if (now - lastColumnsPreload > 0.75) {
+        if (!columnsScrollDragging && now - lastColumnsPreload > 0.75) {
             lastColumnsPreload = now;
             nfb_requestColumnsPagingPreload(paging);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1970,7 +2050,9 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     // TFNPagingScrollView hook also sees this assignment.
     CGFloat targetContentWidth = MAX(columnWidth * pages.count, bounds.size.width + 1.0);
     objc_setAssociatedObject(nativeScrollView, &kNFBInlineColumnsTargetContentWidthKey, @(targetContentWidth), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    nativeScrollView.contentSize = CGSizeMake(targetContentWidth, height);
+    if (!columnsScrollDragging || fabs(nativeScrollView.contentSize.width - targetContentWidth) > 1.0 || fabs(nativeScrollView.contentSize.height - height) > 1.0) {
+        nativeScrollView.contentSize = CGSizeMake(targetContentWidth, height);
+    }
     if (!columnsScrollDragging) {
         if (firstColumnsApply && fabs(nativeScrollView.contentOffset.x) > 1.0) {
             [nativeScrollView setContentOffset:CGPointMake(0.0, nativeScrollView.contentOffset.y) animated:NO];
@@ -2007,8 +2089,10 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         pageView.frame = CGRectMake(columnWidth * idx, -topShift, columnWidth, height + topShift);
         pageView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
         [pageView setNeedsLayout];
-        [pageView layoutIfNeeded];
-        nfb_kickEmptyColumnLoad(page);
+        if (!columnsScrollDragging) {
+            [pageView layoutIfNeeded];
+            nfb_kickEmptyColumnLoad(page);
+        }
         idx++;
     }
     // On iPad the pager only loads the current page, so the off-screen pinned-list columns stay
@@ -2023,7 +2107,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         if (anyEmpty) {
             static NSTimeInterval lastEmptyReload = 0.0;
             NSTimeInterval now = CACurrentMediaTime();
-            if (now - lastEmptyReload > 1.0) { lastEmptyReload = now; nfb_requestColumnsPagingPreload(paging); }
+            if (!columnsScrollDragging && now - lastEmptyReload > 1.0) { lastEmptyReload = now; nfb_requestColumnsPagingPreload(paging); }
         }
     }
     // Record the columns layout state (only when it CHANGES) so UI breakage / scroll catching is
@@ -2032,7 +2116,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     // change-key, so plain scrolling doesn't flood the log.
     if (gNFBLogRecording) {
         BOOL drag = nativeScrollView.isDragging || nativeScrollView.isTracking || nativeScrollView.isDecelerating;
-        NSMutableString *key = [NSMutableString stringWithFormat:@"pages=%lu w=%.0f drag=%d content=%.0f", (unsigned long)pages.count, columnWidth, drag ? 1 : 0, nativeScrollView.contentSize.width];
+        NSMutableString *key = [NSMutableString stringWithFormat:@"pages=%lu w=%.0f top=%.0f drag=%d content=%.0f hframe=(%.0f,%.0f,%.0f,%.0f)", (unsigned long)pages.count, columnWidth, topShift, drag ? 1 : 0, nativeScrollView.contentSize.width, nativeScrollView.frame.origin.x, nativeScrollView.frame.origin.y, nativeScrollView.frame.size.width, nativeScrollView.frame.size.height];
         NSUInteger ci = 0;
         for (UIViewController *p in pages) {
             if ([p isViewLoaded]) { CGRect f = p.view.frame; [key appendFormat:@" c%lu=(%.0f,%.0f,%.0f,%.0f)", (unsigned long)ci, f.origin.x, f.origin.y, f.size.width, f.size.height]; }
@@ -2417,16 +2501,40 @@ static NSInteger nfb_countSavedColumnsChromeInView(UIView *view, int depth) {
     return count;
 }
 
+static NSInteger nfb_countCollapsedColumnsChromeInView(UIView *view, int depth) {
+    if (!view || depth > 12) return 0;
+    NSInteger count = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey) ? 1 : 0;
+    for (UIView *subview in view.subviews) {
+        count += nfb_countCollapsedColumnsChromeInView(subview, depth + 1);
+    }
+    return count;
+}
+
+static NSString *nfb_columnsConstraintSummaryForView(UIView *view) {
+    NSArray<NSLayoutConstraint *> *constraints = nfb_chromeHeightConstraintsForView(view);
+    if (!constraints.count) return @"-";
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSLayoutConstraint *constraint in constraints) {
+        [parts addObject:[NSString stringWithFormat:@"h%.1f/%d", constraint.constant, constraint.active ? 1 : 0]];
+        if (parts.count >= 4) break;
+    }
+    return [parts componentsJoinedByString:@","];
+}
+
 static void nfb_appendColumnsChromeDiag(NSMutableString *s, UIView *view, UIView *pagingView, UIView *root, int depth) {
-    if (!view || !root || depth > 3) return;
+    if (!view || !root || depth > 10) return;
     BOOL saved = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey) != nil;
+    BOOL collapsed = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey) != nil;
     BOOL containsPaging = nfb_viewContainsDescendant(view, pagingView);
     CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
-    if (saved || (!containsPaging && CGRectGetMinY(frame) <= 280.0 && frame.size.height >= 4.0)) {
+    if (saved || collapsed || (depth <= 4 && !containsPaging && CGRectGetMinY(frame) <= 280.0 && frame.size.height >= 4.0)) {
         NSString *text = nfb_textOfView(view);
-        [s appendFormat:@"columnsChrome d=%d saved=%d containsPaging=%d hidden=%d alpha=%.2f frame=(%.1f,%.1f,%.1f,%.1f) class=%@ text=%@\n",
-            depth, saved ? 1 : 0, containsPaging ? 1 : 0, view.hidden ? 1 : 0, view.alpha,
+        [s appendFormat:@"columnsChrome d=%d saved=%d collapsed=%d containsPaging=%d hidden=%d alpha=%.2f frame=(%.1f,%.1f,%.1f,%.1f) bounds=(%.1f,%.1f) super=%@ hc=%@ class=%@ text=%@\n",
+            depth, saved ? 1 : 0, collapsed ? 1 : 0, containsPaging ? 1 : 0, view.hidden ? 1 : 0, view.alpha,
             frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+            view.bounds.size.width, view.bounds.size.height,
+            view.superview ? NSStringFromClass(view.superview.class) : @"nil",
+            nfb_columnsConstraintSummaryForView(view),
             NSStringFromClass(view.class), text ?: @"(nil)"];
     }
     for (UIView *subview in view.subviews) {
@@ -2497,9 +2605,12 @@ void NFBLogSnapshot(NSString *reason) {
     UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
     UIViewController *container = paging ? nfb_parentControllerNamed(paging, @"HomeTimelineContainer") : nil;
     NSInteger chrome = 0;
+    NSInteger collapsedChrome = 0;
     if (segmented && [segmented isViewLoaded]) chrome += nfb_countSavedColumnsChromeInView(segmented.view, 0);
     if (container && [container isViewLoaded]) chrome += nfb_countSavedColumnsChromeInView(container.view, 0);
-    [s appendFormat:@"chromeHidden=%ld", (long)chrome];
+    if (segmented && [segmented isViewLoaded]) collapsedChrome += nfb_countCollapsedColumnsChromeInView(segmented.view, 0);
+    if (container && [container isViewLoaded]) collapsedChrome += nfb_countCollapsedColumnsChromeInView(container.view, 0);
+    [s appendFormat:@"chromeHidden=%ld/c%ld topShift=%.0f", (long)chrome, (long)collapsedChrome, nfb_columnsTopShift()];
     NFBLogEvent(s);
 }
 
@@ -2533,17 +2644,25 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
         gColumnsAllTopButton ? 1 : 0];
     if (h) {
         CGFloat inferredWidth = pages.count ? (h.contentSize.width / MAX((CGFloat)pages.count, 1.0)) : 0.0;
-        [s appendFormat:@"nativeHScroll class=%@ offset=(%.1f,%.1f) content=(%.1f,%.1f) bounds=(%.1f,%.1f) paging=%d bounceH=%d inferredColumnWidth=%.1f\n",
-            NSStringFromClass(h.class), h.contentOffset.x, h.contentOffset.y, h.contentSize.width, h.contentSize.height,
-            h.bounds.size.width, h.bounds.size.height, h.pagingEnabled ? 1 : 0, h.alwaysBounceHorizontal ? 1 : 0, inferredWidth];
+        [s appendFormat:@"nativeHScroll class=%@ frame=(%.1f,%.1f,%.1f,%.1f) offset=(%.1f,%.1f) content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f) paging=%d bounceH=%d inferredColumnWidth=%.1f topShift=%.1f\n",
+            NSStringFromClass(h.class), h.frame.origin.x, h.frame.origin.y, h.frame.size.width, h.frame.size.height,
+            h.contentOffset.x, h.contentOffset.y, h.contentSize.width, h.contentSize.height,
+            h.bounds.size.width, h.bounds.size.height,
+            h.contentInset.top, h.contentInset.left, h.contentInset.bottom, h.contentInset.right,
+            h.adjustedContentInset.top, h.adjustedContentInset.left, h.adjustedContentInset.bottom, h.adjustedContentInset.right,
+            h.pagingEnabled ? 1 : 0, h.alwaysBounceHorizontal ? 1 : 0, inferredWidth, nfb_columnsTopShift()];
     }
     UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
     UIViewController *container = paging ? nfb_parentControllerNamed(paging, @"HomeTimelineContainer") : nil;
     NSInteger hiddenChrome = 0;
+    NSInteger collapsedChrome = 0;
     if (segmented && [segmented isViewLoaded]) hiddenChrome += nfb_countSavedColumnsChromeInView(segmented.view, 0);
     if (container && [container isViewLoaded]) hiddenChrome += nfb_countSavedColumnsChromeInView(container.view, 0);
-    [s appendFormat:@"columnsChromeHidden=%ld segmented=%@ container=%@\n",
+    if (segmented && [segmented isViewLoaded]) collapsedChrome += nfb_countCollapsedColumnsChromeInView(segmented.view, 0);
+    if (container && [container isViewLoaded]) collapsedChrome += nfb_countCollapsedColumnsChromeInView(container.view, 0);
+    [s appendFormat:@"columnsChromeHidden=%ld collapsed=%ld segmented=%@ container=%@\n",
         (long)hiddenChrome,
+        (long)collapsedChrome,
         segmented ? NSStringFromClass(segmented.class) : @"(nil)",
         container ? NSStringFromClass(container.class) : @"(nil)"];
 
@@ -2563,15 +2682,20 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
             frame.origin.x, frame.origin.y, frame.size.width, frame.size.height];
         if (sv) {
             CGFloat topY = -sv.adjustedContentInset.top;
-            [s appendFormat:@" scroll=%@ offset=(%.1f,%.1f) topY=%.1f content=(%.1f,%.1f) bounds=(%.1f,%.1f)",
+            [s appendFormat:@" scroll=%@ offset=(%.1f,%.1f) topY=%.1f content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f)",
                 NSStringFromClass(sv.class), sv.contentOffset.x, sv.contentOffset.y, topY,
-                sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height];
+                sv.contentSize.width, sv.contentSize.height, sv.bounds.size.width, sv.bounds.size.height,
+                sv.contentInset.top, sv.contentInset.left, sv.contentInset.bottom, sv.contentInset.right,
+                sv.adjustedContentInset.top, sv.adjustedContentInset.left, sv.adjustedContentInset.bottom, sv.adjustedContentInset.right];
         }
         [s appendString:@"\n"];
         idx++;
     }
     if (segmented && [segmented isViewLoaded] && paging && [paging isViewLoaded]) {
         nfb_appendColumnsChromeDiag(s, segmented.view, paging.view, segmented.view, 0);
+    }
+    if (container && [container isViewLoaded] && paging && [paging isViewLoaded] && container != segmented) {
+        nfb_appendColumnsChromeDiag(s, container.view, paging.view, container.view, 0);
     }
 }
 
