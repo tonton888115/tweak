@@ -40,7 +40,7 @@ static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void);
 static NSArray<UIViewController *> *nfb_allHomePagingTimelinePages(UIViewController *paging);
 static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc);
 static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging);
-static void nfb_requestColumnsPagingPreload(UIViewController *paging);
+static void nfb_requestColumnsPagingPreload(UIViewController *paging, BOOL aggressive);
 static id nfb_pagingDataSource(UIViewController *paging);
 static NSIndexPath *nfb_pagingSelectedIndexPath(UIViewController *paging);
 static UIViewController *nfb_pagingViewControllerAtIndexPath(UIViewController *paging, NSIndexPath *indexPath);
@@ -1944,7 +1944,6 @@ static CGFloat nfb_columnsColumnWidth(CGFloat viewportWidth) {
 
 static CGFloat nfb_columnsTopShift(void) {
     CGFloat shift = gColumnsHiddenBarHeight;
-    if (shift < 1.0) shift = 44.0;
     return MIN(MAX(shift, 0.0), 56.0);
 }
 
@@ -2042,7 +2041,7 @@ static void nfb_kickEmptyColumnLoad(UIViewController *page) {
     NSString *cls = NSStringFromClass(page.class);
     if ([cls containsString:@"HomeTimelineItemsViewController"]) {
         UIViewController *paging = nfb_parentControllerNamed(page, @"Paging");
-        if (paging) nfb_requestColumnsPagingPreload(paging);
+        if (paging) nfb_requestColumnsPagingPreload(paging, NO);
         return;
     }
     if (objc_getAssociatedObject(page, &kNFBColumnLoadKickedKey)) return;
@@ -2069,7 +2068,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         NSTimeInterval now = CACurrentMediaTime();
         if (!columnsScrollDragging && now - lastColumnsPageRetry > 0.75) {
             lastColumnsPageRetry = now;
-            nfb_requestColumnsPagingPreload(paging);
+            nfb_requestColumnsPagingPreload(paging, NO);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nfb_layoutActiveHomePaging();
             });
@@ -2081,7 +2080,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         NSTimeInterval now = CACurrentMediaTime();
         if (!columnsScrollDragging && now - lastColumnsPreload > 0.75) {
             lastColumnsPreload = now;
-            nfb_requestColumnsPagingPreload(paging);
+            nfb_requestColumnsPagingPreload(paging, NO);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nfb_layoutActiveHomePaging();
             });
@@ -2171,7 +2170,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         if (anyEmpty) {
             static NSTimeInterval lastEmptyReload = 0.0;
             NSTimeInterval now = CACurrentMediaTime();
-            if (!columnsScrollDragging && now - lastEmptyReload > 1.0) { lastEmptyReload = now; nfb_requestColumnsPagingPreload(paging); }
+            if (!columnsScrollDragging && now - lastEmptyReload > 1.0) { lastEmptyReload = now; nfb_requestColumnsPagingPreload(paging, NO); }
         }
     }
     // Record the columns layout state (only when it CHANGES) so UI breakage / scroll catching is
@@ -2243,32 +2242,42 @@ static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging) {
     return MAX(1, (NSInteger)paging.childViewControllers.count);
 }
 
-static void nfb_requestColumnsPagingPreload(UIViewController *paging) {
+static void nfb_requestColumnsPagingPreload(UIViewController *paging, BOOL aggressive) {
     if (!paging) return;
-    static NSTimeInterval lastPreloadRequest = 0.0;
+    static NSTimeInterval lastAggressivePreloadRequest = 0.0;
+    static NSTimeInterval lastLightPreloadRequest = 0.0;
     NSTimeInterval now = CACurrentMediaTime();
-    if (now - lastPreloadRequest < 0.60) return;
-    lastPreloadRequest = now;
-    NFBLogEvent([NSString stringWithFormat:@"columnsPreload paging=%@",
+    if (aggressive) {
+        if (now - lastAggressivePreloadRequest < 1.20) return;
+        lastAggressivePreloadRequest = now;
+    } else {
+        if (now - lastLightPreloadRequest < 2.50) return;
+        lastLightPreloadRequest = now;
+    }
+    NFBLogEvent([NSString stringWithFormat:@"columnsPreload mode=%@ paging=%@",
+        aggressive ? @"aggressive" : @"light",
         paging ? NSStringFromClass(paging.class) : @"nil"]);
     UIViewController *segmented = nfb_parentControllerNamed(paging, @"Segmented");
     UIViewController *container = nfb_parentControllerNamed(paging, @"HomeTimelineContainer");
-    if (container && [container respondsToSelector:@selector(loadInitialPinnedTimelines)]) {
+    if (aggressive && container && [container respondsToSelector:@selector(loadInitialPinnedTimelines)]) {
         ((void(*)(id, SEL))objc_msgSend)(container, @selector(loadInitialPinnedTimelines));
     }
-    for (NSString *name in @[@"_t1_reloadContentViewControllerContentsWhenContentReady",
-                             @"_t1_reloadContentViewControllerContents"]) {
-        SEL sel = NSSelectorFromString(name);
-        if (container && [container respondsToSelector:sel]) {
-            ((void(*)(id, SEL))objc_msgSend)(container, sel);
+    if (aggressive) {
+        for (NSString *name in @[@"_t1_reloadContentViewControllerContentsWhenContentReady",
+                                 @"_t1_reloadContentViewControllerContents"]) {
+            SEL sel = NSSelectorFromString(name);
+            if (container && [container respondsToSelector:sel]) {
+                ((void(*)(id, SEL))objc_msgSend)(container, sel);
+            }
         }
     }
     if (segmented && [segmented respondsToSelector:@selector(setPreloadContent:)]) {
         ((void(*)(id, SEL, BOOL))objc_msgSend)(segmented, @selector(setPreloadContent:), YES);
     }
-    for (NSString *name in @[@"preloadContent", @"reloadLabelBarData",
-                             @"_tfn_reloadViewControllerDataIfNeeded",
-                             @"reloadViewControllerData"]) {
+    NSArray<NSString *> *segmentedSelectors = aggressive
+        ? @[@"preloadContent", @"reloadLabelBarData", @"_tfn_reloadViewControllerDataIfNeeded", @"reloadViewControllerData"]
+        : @[@"preloadContent"];
+    for (NSString *name in segmentedSelectors) {
         SEL sel = NSSelectorFromString(name);
         if (segmented && [segmented respondsToSelector:sel]) {
             ((void(*)(id, SEL))objc_msgSend)(segmented, sel);
@@ -2279,7 +2288,10 @@ static void nfb_requestColumnsPagingPreload(UIViewController *paging) {
         // off-screen columns can remain loaded but empty.
         ((void(*)(id, SEL, NSInteger))objc_msgSend)(paging, @selector(setPreloadPolicy:), 2);
     }
-    for (NSString *name in @[@"reloadInvisibleViewControllers", @"reloadVisibleViewControllers", @"reloadViewControllers"]) {
+    NSArray<NSString *> *pagingSelectors = aggressive
+        ? @[@"reloadInvisibleViewControllers", @"reloadVisibleViewControllers", @"reloadViewControllers"]
+        : @[@"reloadInvisibleViewControllers"];
+    for (NSString *name in pagingSelectors) {
         SEL sel = NSSelectorFromString(name);
         if ([paging respondsToSelector:sel]) {
             ((void(*)(id, SEL))objc_msgSend)(paging, sel);
@@ -2881,16 +2893,19 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
         dispatch_async(dispatch_get_main_queue(), ^{ NFBSetInlineColumnsEnabled(enabled); });
         return;
     }
-    if (gInlineColumnsEnabled != enabled) NFBLogEvent([NSString stringWithFormat:@"NFBSetInlineColumns -> %d", enabled]);
+    BOOL changed = gInlineColumnsEnabled != enabled;
+    if (changed) NFBLogEvent([NSString stringWithFormat:@"NFBSetInlineColumns -> %d", enabled]);
     gInlineColumnsEnabled = enabled;
     if (!enabled) {
+        gColumnsHiddenBarHeight = 0.0;
         nfb_updateColumnsEdgeMenuGesturesForOffset(0.0);
         nfb_restoreAllSavedColumnsChrome();
     }
     if (enabled) {
+        if (changed) gColumnsHiddenBarHeight = 0.0;
         UIViewController *paging = nfb_findAnyHomePagingController();
         if (paging) {
-            nfb_requestColumnsPagingPreload(paging);
+            if (changed) nfb_requestColumnsPagingPreload(paging, YES);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nfb_layoutActiveHomePaging();
             });

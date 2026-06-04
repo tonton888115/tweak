@@ -4990,6 +4990,15 @@ void BHTPresentColumnsMode(void) {
     }
     gBHTColumnsIntent = YES;
     NFBLogSnapshot(@"present.entry");
+    if (NFBInlineColumnsEnabled()) {
+        UIWindow *activeWindow = BHT_activeKeyWindow();
+        UIViewController *tabBarController = BHTFindControllerOfClass(activeWindow.rootViewController, NSClassFromString(@"T1TabBarViewController"), 0);
+        if (!tabBarController) tabBarController = BHTFindTabBarController();
+        UIViewController *selectionRoot = tabBarController ?: activeWindow.rootViewController;
+        if (selectionRoot) BHTUpdateColumnsTabSelection(selectionRoot, YES);
+        NFBLogEvent(@"present.alreadyInline");
+        return;
+    }
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (now - gBHTLastColumnsOpen < 0.20) {
         UIWindow *activeWindow = BHT_activeKeyWindow();
@@ -5038,7 +5047,7 @@ void BHTPresentColumnsMode(void) {
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gBHTColumnsIntent) { gBHTSelectingHomeForColumns = NO; NFBLogSnapshot(@"present+0.55(intent dropped)"); return; }
-        BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
+        if (!NFBInlineColumnsEnabled()) BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
         gBHTSelectingHomeForColumns = NO;
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
@@ -5046,6 +5055,10 @@ void BHTPresentColumnsMode(void) {
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.00 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gBHTColumnsIntent) return;
+        if (NFBInlineColumnsEnabled()) {
+            BHTUpdateColumnsTabSelection(hostController, YES);
+            return;
+        }
         BOOL oldSelectingHome = gBHTSelectingHomeForColumns;
         gBHTSelectingHomeForColumns = YES;
         BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
