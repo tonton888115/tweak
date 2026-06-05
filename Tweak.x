@@ -27,6 +27,21 @@
 #import <Preferences/PSSpecifier.h>
 #import "ModernSettingsViewController.h"
 
+// iOS 26: keep the legacy (flat) appearance and turn OFF Liquid Glass.
+// The repackaged IPA sets UIDesignRequiresCompatibility=YES in Info.plist, which is what
+// CoreFoundation reads on disk. This hook is a belt-and-suspenders net for any launch path
+// (e.g. some LiveContainer configurations) where UIKit consults the main bundle's
+// Info dictionary through NSBundle before it resolves the design mode. Returning YES here,
+// early in launch, keeps the search bar / buttons / nav bar from rendering as glass.
+%hook NSBundle
+- (id)objectForInfoDictionaryKey:(NSString *)key {
+    if (key && [key isEqualToString:@"UIDesignRequiresCompatibility"] && self == [NSBundle mainBundle]) {
+        return @YES;
+    }
+    return %orig;
+}
+%end
+
 extern void NFBSetInlineColumnsEnabled(BOOL enabled);
 extern BOOL NFBInlineColumnsEnabled(void);
 extern void NFBLogEvent(NSString *msg);       // operation-log recorder (no-op unless recording)
