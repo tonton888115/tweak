@@ -1540,6 +1540,7 @@ static char kNFBColumnsOriginalAlphaKey;
 static char kNFBColumnsEdgeGestureSavedKey;
 static char kNFBColumnsEdgeGestureEnabledKey;
 static char kNFBColumnsSnapScheduledKey;
+static char kNFBColumnsRefreshScheduledKey;
 static UIView *gColumnsOverlayView = nil;
 static UIScrollView *gColumnsOverlayScrollView = nil;
 static UIButton *gColumnsAllTopButton = nil;
@@ -2268,6 +2269,44 @@ static CGFloat nfb_columnsSnappedOffsetX(CGFloat offsetX, CGFloat columnWidth, C
     return MIN(MAX(snapped, 0.0), maxOffsetX);
 }
 
+static CGFloat nfb_columnsMaxOffsetXForScroll(UIScrollView *scrollView) {
+    if (!scrollView) return 0.0;
+    CGFloat contentWidth = scrollView.contentSize.width;
+    NSNumber *targetWidth = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsTargetContentWidthKey);
+    if (targetWidth.doubleValue > 1.0) contentWidth = targetWidth.doubleValue;
+    return MAX(0.0, contentWidth - scrollView.bounds.size.width);
+}
+
+static BOOL nfb_columnsHorizontalScrollIsMoving(UIScrollView *scrollView) {
+    return scrollView && (scrollView.isDragging || scrollView.isTracking || scrollView.isDecelerating);
+}
+
+static BOOL nfb_columnsScrollIsActivePaging(UIScrollView *scrollView) {
+    return gInlineColumnsEnabled && scrollView && objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey);
+}
+
+static CGFloat nfb_columnsTargetSnapOffsetX(UIScrollView *scrollView, CGFloat targetOffsetX, CGFloat velocityX) {
+    CGFloat columnWidth = nfb_columnsColumnWidth(scrollView.bounds.size.width);
+    CGFloat maxOffsetX = nfb_columnsMaxOffsetXForScroll(scrollView);
+    CGFloat snapped = nfb_columnsSnappedOffsetX(targetOffsetX, columnWidth, maxOffsetX);
+    if (fabs(velocityX) > 0.05 && columnWidth >= 1.0 && maxOffsetX > 0.0) {
+        CGFloat current = nfb_columnsSnappedOffsetX(scrollView.contentOffset.x, columnWidth, maxOffsetX);
+        CGFloat next = nfb_columnsSnappedOffsetX(current + (velocityX > 0.0 ? columnWidth : -columnWidth), columnWidth, maxOffsetX);
+        snapped = velocityX > 0.0 ? MAX(snapped, next) : MIN(snapped, next);
+    }
+    return MIN(MAX(snapped, 0.0), maxOffsetX);
+}
+
+static void nfb_columnsApplyTargetSnap(UIScrollView *scrollView, CGPoint velocity, CGPoint *targetContentOffset) {
+    if (!targetContentOffset || !nfb_columnsScrollIsActivePaging(scrollView)) return;
+    CGFloat snapped = nfb_columnsTargetSnapOffsetX(scrollView, targetContentOffset->x, velocity.x);
+    if (gNFBLogRecording && fabs(targetContentOffset->x - snapped) > 0.5) {
+        NFBLogEvent([NSString stringWithFormat:@"columnsTargetSnap from=%.1f to=%.1f vel=%.2f max=%.1f",
+            targetContentOffset->x, snapped, velocity.x, nfb_columnsMaxOffsetXForScroll(scrollView)]);
+    }
+    targetContentOffset->x = snapped;
+}
+
 static CGFloat nfb_columnsClampedOffsetX(CGFloat offsetX, CGFloat maxOffsetX) {
     if (maxOffsetX <= 0.0) return 0.0;
     return MIN(MAX(offsetX, 0.0), maxOffsetX);
@@ -2294,6 +2333,37 @@ static void nfb_scheduleColumnsSnapForScroll(UIScrollView *scrollView) {
         }
         nfb_layoutActiveHomePaging();
     });
+}
+
+static void nfb_scheduleColumnsRefreshAfterHorizontalScroll(UIScrollView *scrollView) {
+    if (!scrollView || objc_getAssociatedObject(scrollView, &kNFBColumnsRefreshScheduledKey)) return;
+    NSObject *token = [NSObject new];
+    objc_setAssociatedObject(scrollView, &kNFBColumnsRefreshScheduledKey, token, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UIScrollView *weakScroll = scrollView;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIScrollView *strongScroll = weakScroll;
+        if (!strongScroll) return;
+        if (objc_getAssociatedObject(strongScroll, &kNFBColumnsRefreshScheduledKey) != token) return;
+        if (!nfb_columnsScrollIsActivePaging(strongScroll)) {
+            objc_setAssociatedObject(strongScroll, &kNFBColumnsRefreshScheduledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return;
+        }
+        if (nfb_columnsHorizontalScrollIsMoving(strongScroll)) {
+            objc_setAssociatedObject(strongScroll, &kNFBColumnsRefreshScheduledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            nfb_scheduleColumnsRefreshAfterHorizontalScroll(strongScroll);
+            return;
+        }
+        objc_setAssociatedObject(strongScroll, &kNFBColumnsRefreshScheduledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        nfb_streamTriggerColumns();
+    });
+}
+
+static void nfb_columnsMaybeRunDeferredRefresh(UIScrollView *scrollView) {
+    if (!nfb_columnsScrollIsActivePaging(scrollView)) return;
+    if (!objc_getAssociatedObject(scrollView, &kNFBColumnsRefreshScheduledKey)) return;
+    if (nfb_columnsHorizontalScrollIsMoving(scrollView)) return;
+    objc_setAssociatedObject(scrollView, &kNFBColumnsRefreshScheduledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    nfb_scheduleColumnsRefreshAfterHorizontalScroll(scrollView);
 }
 
 static void nfb_rememberColumnOriginalViewState(UIView *view) {
@@ -2644,7 +2714,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     // change-key, so plain scrolling doesn't flood the log.
     if (gNFBLogRecording) {
         BOOL drag = nativeScrollView.isDragging || nativeScrollView.isTracking || nativeScrollView.isDecelerating;
-        CGFloat maxOffsetX = MAX(0.0, nativeScrollView.contentSize.width - nativeScrollView.bounds.size.width);
+        CGFloat maxOffsetX = nfb_columnsMaxOffsetXForScroll(nativeScrollView);
         CGFloat snapOffsetX = nfb_columnsSnappedOffsetX(nativeScrollView.contentOffset.x, columnWidth, maxOffsetX);
         NSMutableString *key = [NSMutableString stringWithFormat:@"pages=%lu w=%.0f top=%.0f drag=%d content=%.0f max=%.0f snap=%.0f hframe=(%.0f,%.0f,%.0f,%.0f)", (unsigned long)pages.count, columnWidth, topShift, drag ? 1 : 0, nativeScrollView.contentSize.width, maxOffsetX, snapOffsetX, nativeScrollView.frame.origin.x, nativeScrollView.frame.origin.y, nativeScrollView.frame.size.width, nativeScrollView.frame.size.height];
         NSUInteger ci = 0;
@@ -3050,6 +3120,15 @@ static void nfb_revealAllColumnTops(void) {
 }
 
 static BOOL nfb_streamTriggerColumns(void) {
+    UIViewController *paging = nfb_findVisibleHomePagingController();
+    UIScrollView *horizontalScroll = paging ? nfb_horizontalPagingScrollViewOf(paging) : nil;
+    if (nfb_columnsScrollIsActivePaging(horizontalScroll) && nfb_columnsHorizontalScrollIsMoving(horizontalScroll)) {
+        NFBLogEvent([NSString stringWithFormat:@"streamColumns deferHorizontal off=%.1f drag=%d decel=%d",
+            horizontalScroll.contentOffset.x, horizontalScroll.isDragging ? 1 : 0, horizontalScroll.isDecelerating ? 1 : 0]);
+        nfb_scheduleColumnsRefreshAfterHorizontalScroll(horizontalScroll);
+        nfb_updateStreamStateIconForVC(gActiveItemsVC);
+        return YES;
+    }
     nfb_layoutActiveHomePaging();
     NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
     NFBLogEvent([NSString stringWithFormat:@"streamColumns entry pages=%lu", (unsigned long)pages.count]);
@@ -3509,7 +3588,7 @@ void NFBLogSnapshot(NSString *reason) {
     UIScrollView *h = paging ? nfb_horizontalPagingScrollViewOf(paging) : nil;
     if (h) {
         CGFloat cw = nfb_columnsColumnWidth(h.bounds.size.width);
-        CGFloat maxX = MAX(0.0, h.contentSize.width - h.bounds.size.width);
+        CGFloat maxX = nfb_columnsMaxOffsetXForScroll(h);
         CGFloat snapX = nfb_columnsSnappedOffsetX(h.contentOffset.x, cw, maxX);
         [s appendFormat:@"h.off=%.0f c=%.0f b=%.0f cw=%.0f snap=%.0f max=%.0f pg=%d drag=%d edgeAllow=%d ",
             h.contentOffset.x, h.contentSize.width, h.bounds.size.width, cw, snapX, maxX,
@@ -3577,7 +3656,7 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
         gColumnsAllTopButton ? 1 : 0];
     if (h) {
         CGFloat columnWidth = nfb_columnsColumnWidth(h.bounds.size.width);
-        CGFloat maxOffsetX = MAX(0.0, h.contentSize.width - h.bounds.size.width);
+        CGFloat maxOffsetX = nfb_columnsMaxOffsetXForScroll(h);
         CGFloat snapOffsetX = nfb_columnsSnappedOffsetX(h.contentOffset.x, columnWidth, maxOffsetX);
         NSNumber *targetWidth = objc_getAssociatedObject(h, &kNFBInlineColumnsTargetContentWidthKey);
         [s appendFormat:@"nativeHScroll class=%@ frame=(%.1f,%.1f,%.1f,%.1f) offset=(%.1f,%.1f) content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f) paging=%d bounceH=%d columnWidth=%.1f snapOffset=%.1f maxOffset=%.1f targetContent=%.1f edgeAllow=%d topShift=%.1f\n",
@@ -3688,6 +3767,27 @@ static void nfb_scheduleLayoutActiveHomePaging(void) {
     });
 }
 
+static void nfb_reapplyColumnsSegmentedControlHidden(void) {
+    if (!gInlineColumnsEnabled) return;
+    UIViewController *paging = nfb_findVisibleHomePagingController();
+    if (!paging) paging = nfb_findAnyHomePagingController();
+    if (paging && [paging isViewLoaded]) nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
+    UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
+    if (segmented && [segmented isViewLoaded]) nfb_applyColumnsSegmentedControlHidden(segmented);
+}
+
+static void nfb_scheduleColumnsSegmentedControlHiddenReapply(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        nfb_reapplyColumnsSegmentedControlHidden();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        nfb_reapplyColumnsSegmentedControlHidden();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        nfb_reapplyColumnsSegmentedControlHidden();
+    });
+}
+
 BOOL NFBInlineColumnsEnabled(void) {
     return gInlineColumnsEnabled;
 }
@@ -3711,6 +3811,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
         if (changed) {
             gColumnsHiddenBarHeight = 0.0;
             gInlineColumnsNeedsInitialOffsetReset = YES;
+            nfb_scheduleColumnsSegmentedControlHiddenReapply();
         }
         gColumnsEdgeMenuStateKnown = NO;
         nfb_setColumnsEdgeMenuGesturesEnabled(NO);
@@ -3820,6 +3921,18 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     %orig;
     if (gInlineColumnsEnabled) nfb_applyInlineColumns(self);
     else nfb_restoreInlineColumns(self);
+}
+- (void)scrollViewWillEndDragging:(UIScrollView *)scrollView withVelocity:(CGPoint)velocity targetContentOffset:(CGPoint *)targetContentOffset {
+    %orig(scrollView, velocity, targetContentOffset);
+    nfb_columnsApplyTargetSnap(scrollView, velocity, targetContentOffset);
+}
+- (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
+    %orig(scrollView, decelerate);
+    if (!decelerate) nfb_columnsMaybeRunDeferredRefresh(scrollView);
+}
+- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
+    %orig(scrollView);
+    nfb_columnsMaybeRunDeferredRefresh(scrollView);
 }
 - (void)viewDidLayoutSubviews {
     %orig;
