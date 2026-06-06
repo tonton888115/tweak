@@ -1570,16 +1570,22 @@ static BOOL nfb_columnsShouldTreatGestureAsEdgeMenu(UIGestureRecognizer *gesture
     if (!gesture) return NO;
     NSString *cls = NSStringFromClass(gesture.class);
     NSString *delegateClass = gesture.delegate ? NSStringFromClass([gesture.delegate class]) : @"";
-    BOOL splitOrNavPan = [gesture isKindOfClass:UIPanGestureRecognizer.class] &&
-        ([delegateClass containsString:@"T1AppSplitViewController"] ||
-         [delegateClass containsString:@"NavigationControllerTransitionAnimator"] ||
-         [delegateClass containsString:@"UINavigationInteractiveTransition"]);
-    return [gesture isKindOfClass:UIScreenEdgePanGestureRecognizer.class] ||
-           [cls containsString:@"EdgePan"] ||
-           [cls containsString:@"ParallaxTransitionPan"] ||
+    // NEVER suppress the navigation interactive-pop (back-swipe) gestures: the user must be
+    // able to swipe back from a pushed detail view while columns are active. These are the
+    // parallax-transition pan and the screen-edge/pan driven by the nav transition. Suppressing
+    // them (the old behaviour) left back-swipe dead whenever the columns rested away from x=0.
+    if ([cls containsString:@"ParallaxTransitionPan"] ||
+        [delegateClass containsString:@"NavigationControllerTransitionAnimator"] ||
+        [delegateClass containsString:@"NavigationInteractiveTransition"]) {
+        return NO;
+    }
+    // Suppress ONLY the app-split / side-menu pan (it competes with starting a horizontal
+    // column drag from the left edge) and the cell flex-interaction swipe (accidental action
+    // menu mid horizontal scroll).
+    return [delegateClass containsString:@"T1AppSplitViewController"] ||
+           [delegateClass containsString:@"AppSplitViewController"] ||
            [cls containsString:@"FlexInteractionPan"] ||
-           [delegateClass containsString:@"FlexInteraction"] ||
-           splitOrNavPan;
+           [delegateClass containsString:@"FlexInteraction"];
 }
 
 static NSInteger nfb_setColumnsEdgeMenuGesturesInView(UIView *view, BOOL enabled, int depth) {
@@ -2398,6 +2404,13 @@ static CGFloat nfb_columnsTargetSnapOffsetX(UIScrollView *scrollView, CGFloat ta
     return MIN(MAX(snapped, 0.0), maxOffsetX);
 }
 
+// Desired resting column offset chosen at drag-end. Twitter's TFNPaging machinery can
+// re-center the horizontal scroll to a viewport-width "page" AFTER deceleration, which
+// overrode our column snap (the scroll rested at bounds.width instead of a 340/680 column
+// boundary, and a right-edge flick sprang back). We remember the intended offset and
+// re-assert it once motion settles so our snap is the last word.
+static char kNFBColumnsDesiredSnapOffsetKey;
+
 static void nfb_columnsApplyTargetSnap(UIScrollView *scrollView, CGPoint velocity, CGPoint *targetContentOffset) {
     if (!targetContentOffset || !nfb_columnsScrollIsActivePaging(scrollView)) return;
     CGFloat snapped = nfb_columnsTargetSnapOffsetX(scrollView, targetContentOffset->x, velocity.x);
@@ -2406,6 +2419,43 @@ static void nfb_columnsApplyTargetSnap(UIScrollView *scrollView, CGPoint velocit
             targetContentOffset->x, snapped, velocity.x, nfb_columnsMaxOffsetXForScroll(scrollView)]);
     }
     targetContentOffset->x = snapped;
+    objc_setAssociatedObject(scrollView, &kNFBColumnsDesiredSnapOffsetKey, @(snapped), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// Re-assert the column boundary chosen at drag-end (or the nearest boundary as a fallback)
+// so Twitter's post-deceleration page re-centering cannot leave the scroll between columns
+// or bounce a right-edge flick back. Never fights an active finger.
+static void nfb_columnsReassertDesiredOffset(UIScrollView *scrollView, BOOL animated) {
+    if (!nfb_columnsScrollIsActivePaging(scrollView)) return;
+    if (scrollView.isDragging || scrollView.isTracking) return;
+    CGFloat columnWidth = nfb_columnsColumnWidth(scrollView.bounds.size.width);
+    CGFloat maxOffsetX = nfb_columnsMaxOffsetXForScroll(scrollView);
+    if (columnWidth < 1.0 || maxOffsetX <= 0.0) return;
+    NSNumber *desired = objc_getAssociatedObject(scrollView, &kNFBColumnsDesiredSnapOffsetKey);
+    CGFloat target = desired ? desired.doubleValue
+                             : nfb_columnsSnappedOffsetX(scrollView.contentOffset.x, columnWidth, maxOffsetX);
+    target = MIN(MAX(target, 0.0), maxOffsetX);
+    if (fabs(scrollView.contentOffset.x - target) > 0.5) {
+        if (gNFBLogRecording) {
+            NFBLogEvent([NSString stringWithFormat:@"columnsReassert from=%.1f to=%.1f max=%.1f",
+                scrollView.contentOffset.x, target, maxOffsetX]);
+        }
+        [scrollView setContentOffset:CGPointMake(target, scrollView.contentOffset.y) animated:animated];
+    }
+}
+
+// Settle the columns scroll onto its boundary now and again after a short delay, to outlast
+// any asynchronous page re-center Twitter performs after deceleration ends.
+static void nfb_columnsScheduleSnapReassert(UIScrollView *scrollView) {
+    if (!nfb_columnsScrollIsActivePaging(scrollView)) return;
+    nfb_columnsReassertDesiredOffset(scrollView, YES);
+    __weak UIScrollView *weakScrollView = scrollView;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.07 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        nfb_columnsReassertDesiredOffset(weakScrollView, NO);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        nfb_columnsReassertDesiredOffset(weakScrollView, NO);
+    });
 }
 
 static CGFloat nfb_columnsClampedOffsetX(CGFloat offsetX, CGFloat maxOffsetX) {
@@ -3213,7 +3263,13 @@ static void nfb_revealAllColumnTops(void) {
         if (![page isViewLoaded] || page.view.window == nil) continue;
         page.view.hidden = NO;
         page.view.alpha = 1.0;
+        UIScrollView *sv = nfb_mainScrollViewOf(page);
+        // Don't fight a column the user is actively dragging.
+        if (sv && (sv.isDragging || sv.isTracking)) continue;
         nfb_scrollToTop(page, NO);
+        // Pull the latest tweets into EVERY column too, so "全カラム上へ" lands on fresh
+        // content (the old path only scrolled to the top of already-loaded items).
+        nfb_streamTriggerTarget(page);
     }
     gPendingNewTweetsVC = nil;
     nfb_hideNewTweetsPill();
@@ -3893,6 +3949,15 @@ static void nfb_scheduleColumnsSegmentedControlHiddenReapply(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         nfb_reapplyColumnsSegmentedControlHidden();
     });
+    // Late passes: a data-driven pager/segment reload (pinned lists loading at ~1-2s) can
+    // re-expand the segment height after the early passes, leaving the intermittent "余白".
+    // These idempotent re-asserts outlast that without touching any non-columns/non-home path.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.00 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        nfb_reapplyColumnsSegmentedControlHidden();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.00 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        nfb_reapplyColumnsSegmentedControlHidden();
+    });
 }
 
 BOOL NFBInlineColumnsEnabled(void) {
@@ -4035,10 +4100,14 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 }
 - (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
     %orig(scrollView, decelerate);
-    if (!decelerate) nfb_columnsMaybeRunDeferredRefresh(scrollView);
+    if (!decelerate) {
+        nfb_columnsScheduleSnapReassert(scrollView);
+        nfb_columnsMaybeRunDeferredRefresh(scrollView);
+    }
 }
 - (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
     %orig(scrollView);
+    nfb_columnsScheduleSnapReassert(scrollView);
     nfb_columnsMaybeRunDeferredRefresh(scrollView);
 }
 - (void)viewDidLayoutSubviews {
