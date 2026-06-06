@@ -2341,7 +2341,16 @@ static CGFloat nfb_columnsSnappedOffsetX(CGFloat offsetX, CGFloat columnWidth, C
 
 static CGFloat nfb_columnsMaxOffsetXForScroll(UIScrollView *scrollView) {
     if (!scrollView) return 0.0;
-    return MAX(0.0, scrollView.contentSize.width - scrollView.bounds.size.width);
+    // contentSize.width can be a stale one-frame value: during an active horizontal
+    // drag the contentSize write in nfb_layoutColumnsOverlayForPaging is intentionally
+    // skipped, so reading it raw yields a too-small maxOffset and the last column
+    // becomes unreachable (right-edge snap stops one column short). Floor the width at
+    // the cached target column content width so the right edge / right-edge snap
+    // candidate stay reachable regardless of when the contentSize write last landed.
+    CGFloat contentWidth = scrollView.contentSize.width;
+    NSNumber *targetWidth = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsTargetContentWidthKey);
+    if (targetWidth) contentWidth = MAX(contentWidth, targetWidth.doubleValue);
+    return MAX(0.0, contentWidth - scrollView.bounds.size.width);
 }
 
 static BOOL nfb_columnsHorizontalScrollIsMoving(UIScrollView *scrollView) {
@@ -2376,7 +2385,14 @@ static CGFloat nfb_columnsTargetSnapOffsetX(UIScrollView *scrollView, CGFloat ta
     CGFloat maxOffsetX = nfb_columnsMaxOffsetXForScroll(scrollView);
     CGFloat currentOffsetX = scrollView.contentOffset.x;
     CGFloat snapped = nfb_columnsSnappedOffsetX(currentOffsetX, columnWidth, maxOffsetX);
-    if (fabs(velocityX) > 0.05 && columnWidth >= 1.0 && maxOffsetX > 0.0) {
+    // Only treat the release as a directional flick when the velocity is clearly
+    // intentional. The old 0.05 threshold fired on almost every release, including the
+    // tiny reverse (leftward) velocity produced by the rubber-band bounce at the right
+    // edge -> that pulled the view back a whole column (the reported "right-edge
+    // bounce-back"). A ~0.3 pt/ms floor ignores that residual so an edge release falls
+    // through to the nearest-snap (which stays at the edge), while genuine flicks still
+    // advance one column in the drag direction from the current offset.
+    if (fabs(velocityX) >= 0.3 && columnWidth >= 1.0 && maxOffsetX > 0.0) {
         snapped = nfb_columnsDirectionalSnapOffsetX(currentOffsetX, columnWidth, maxOffsetX, velocityX > 0.0);
     }
     return MIN(MAX(snapped, 0.0), maxOffsetX);
