@@ -1683,6 +1683,10 @@ static BOOL nfb_isHomePagingController(UIViewController *vc) {
     return nfb_parentControllerNamed(vc, @"HomeTimelineContainer") != nil;
 }
 
+static BOOL nfb_inlineColumnsActiveForHomePaging(UIViewController *paging) {
+    return gInlineColumnsEnabled && nfb_isHomePagingController(paging);
+}
+
 static BOOL nfb_viewContainsDescendant(UIView *root, UIView *descendant) {
     if (!root || !descendant) return NO;
     if (root == descendant) return YES;
@@ -1714,7 +1718,7 @@ static NSArray<NSLayoutConstraint *> *nfb_chromeHeightConstraintsForView(UIView 
 }
 
 static void nfb_collapseColumnsChromeView(UIView *view) {
-    if (!view) return;
+    if (!view || !gInlineColumnsEnabled) return;
     if (objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey)) {
         NSArray<NSDictionary *> *savedConstraints = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeConstraintsKey);
         for (NSDictionary *entry in savedConstraints) {
@@ -1741,6 +1745,7 @@ static void nfb_collapseColumnsChromeView(UIView *view) {
     if (!shortChrome && !heightConstraints.count) return;
 
     objc_setAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    nfb_trackSavedColumnsChromeView(view);
     objc_setAssociatedObject(view, &kNFBInlineColumnsChromeFrameKey, [NSValue valueWithCGRect:frame], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBInlineColumnsChromeBoundsKey, [NSValue valueWithCGRect:bounds], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBInlineColumnsChromeClipsKey, @(view.clipsToBounds), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1787,6 +1792,7 @@ static void nfb_restoreCollapsedColumnsChromeView(UIView *view) {
 static void nfb_setColumnsChromeViewHidden(UIView *view, BOOL hidden) {
     if (!view) return;
     if (hidden) {
+        if (!gInlineColumnsEnabled) return;
         if (!objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey)) {
             objc_setAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             nfb_trackSavedColumnsChromeView(view);
@@ -1810,8 +1816,11 @@ static void nfb_setColumnsChromeViewHidden(UIView *view, BOOL hidden) {
         nfb_collapseColumnsChromeView(view);
         return;
     }
-    if (!objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey)) return;
+    BOOL saved = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeSavedKey) != nil;
+    BOOL collapsed = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey) != nil;
+    if (!saved && !collapsed) return;
     nfb_restoreCollapsedColumnsChromeView(view);
+    if (!saved) return;
     NSNumber *wasHidden = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeHiddenKey);
     NSNumber *alpha = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeAlphaKey);
     NSNumber *interactive = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeInteractionKey);
@@ -1868,6 +1877,7 @@ static BOOL nfb_columnsPagingSurface(UIView *view) {
 
 static void nfb_setColumnsChromeDescendantsHidden(UIView *view, BOOL hidden, int depth) {
     if (!view || depth > 24) return;
+    if (hidden && !gInlineColumnsEnabled) return;
     for (UIView *subview in view.subviews) {
         if (nfb_columnsProtectedView(subview) || nfb_columnsPagingSurface(subview)) continue;
         nfb_setColumnsChromeViewHidden(subview, hidden);
@@ -1936,7 +1946,7 @@ static BOOL nfb_columnsChromeAncestorRowCandidate(UIView *view, UIView *child, U
 }
 
 static void nfb_collapseColumnsChromeAncestorsForView(UIView *view, UIView *root) {
-    if (!view || !root) return;
+    if (!view || !root || !gInlineColumnsEnabled) return;
     UIView *child = view;
     UIView *current = view.superview;
     for (NSInteger depth = 0; current && depth < 4; depth++, child = current, current = current.superview) {
@@ -1957,6 +1967,7 @@ static void nfb_collapseColumnsChromeAncestorsForView(UIView *view, UIView *root
 
 static BOOL nfb_hideColumnsChromeInView(UIView *view, UIView *pagingView, UIView *root, int depth) {
     if (!view || !root || depth > 24) return NO;
+    if (!gInlineColumnsEnabled) return NO;
     if (nfb_columnsProtectedView(view)) return NO;
     BOOL containsPaging = nfb_viewContainsDescendant(view, pagingView);
     BOOL pagingSurface = nfb_columnsPagingSurface(view);
@@ -2088,6 +2099,7 @@ static BOOL nfb_globalTopColumnsChromeCandidate(UIView *view, UIView *root) {
 
 static NSInteger nfb_setColumnsGlobalTopChromeHiddenInView(UIView *view, UIView *root, BOOL hidden, int depth) {
     if (!view || !root || depth > 24) return 0;
+    if (hidden && !gInlineColumnsEnabled) return 0;
     if (hidden && nfb_columnsPagingSurface(view)) return 0;
     NSInteger count = 0;
     if (hidden && nfb_globalTopColumnsChromeCandidate(view, root)) {
@@ -2126,8 +2138,13 @@ static void nfb_setColumnsGlobalTopChromeHidden(BOOL hidden) {
         nfb_restoreAllSavedColumnsChrome();
         return;
     }
+    if (!gInlineColumnsEnabled) {
+        nfb_restoreAllSavedColumnsChrome();
+        return;
+    }
     UIViewController *paging = nfb_findVisibleHomePagingController();
     if (!paging) paging = nfb_findAnyHomePagingController();
+    if (!nfb_isHomePagingController(paging)) return;
     UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
     UIViewController *container = paging ? nfb_parentControllerNamed(paging, @"HomeTimelineContainer") : nil;
     if (segmented && [segmented isViewLoaded]) {
@@ -2139,9 +2156,10 @@ static void nfb_setColumnsGlobalTopChromeHidden(BOOL hidden) {
 }
 
 static void nfb_setColumnsSegmentedHiddenForPaging(UIViewController *paging, BOOL hidden) {
+    if (!paging || ![paging isViewLoaded] || !nfb_isHomePagingController(paging)) return;
+    if (hidden && !gInlineColumnsEnabled) return;
     UIViewController *segmented = nfb_parentControllerNamed(paging, @"Segmented");
     UIViewController *container = nfb_parentControllerNamed(paging, @"HomeTimelineContainer");
-    if (![paging isViewLoaded]) return;
     if (hidden) {
         if (segmented && [segmented isViewLoaded]) nfb_hideColumnsChromeInView(segmented.view, paging.view, segmented.view, 0);
         if (container && [container isViewLoaded]) nfb_hideColumnsChromeInView(container.view, paging.view, container.view, 0);
@@ -2205,6 +2223,12 @@ static BOOL nfb_viewTreeContainsHomeSegmentBar(UIView *view, UIView *root, int d
     return NO;
 }
 
+static BOOL nfb_segmentedControllerIsHomeTimeline(UIViewController *segmentedVC) {
+    if (!segmentedVC || ![segmentedVC isViewLoaded]) return NO;
+    return nfb_parentControllerNamed(segmentedVC, @"HomeTimelineContainer") != nil ||
+        nfb_viewTreeContainsHomeSegmentBar(segmentedVC.view, segmentedVC.view, 0);
+}
+
 // Hide the Home segment bar (おすすめ / フォロー中 / pinned-list tabs) while columns mode is on by
 // targeting TFNScrollingSegmentedViewController's own scrolling control directly, instead of the
 // frame/text heuristics that were latching onto the wrong full-screen view. Runs from the
@@ -2212,16 +2236,11 @@ static BOOL nfb_viewTreeContainsHomeSegmentBar(UIView *view, UIView *root, int d
 // finish yet. Gated to the Home instance and reuses the save/restore used by the rest of chrome.
 static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC) {
     if (!segmentedVC || ![segmentedVC isViewLoaded]) return;
-    BOOL homeSegmented = nfb_parentControllerNamed(segmentedVC, @"HomeTimelineContainer") != nil ||
-        nfb_viewTreeContainsHomeSegmentBar(segmentedVC.view, segmentedVC.view, 0);
-    if (!homeSegmented) {
-        nfb_restoreColumnsChromeInView(segmentedVC.view, 0);
-        return; // Home only; search/explore segmented/search bars must never stay hidden here.
-    }
     if (!gInlineColumnsEnabled) {
         nfb_restoreColumnsChromeInView(segmentedVC.view, 0);
         return;
     }
+    if (!nfb_segmentedControllerIsHomeTimeline(segmentedVC)) return;
     NSMutableArray<UIView *> *bars = [NSMutableArray array];
     NSHashTable<UIView *> *seen = [NSHashTable weakObjectsHashTable];
     UIView *root = segmentedVC.view;
@@ -2240,6 +2259,34 @@ static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC
         nfb_setColumnsChromeViewHidden(bar, YES);
         nfb_setColumnsChromeDescendantsHidden(bar, YES, 0);
         nfb_collapseColumnsChromeAncestorsForView(bar, root);
+    }
+}
+
+static void nfb_forceColumnsSegmentedControlHeightCollapsed(UIViewController *segmentedVC) {
+    if (!gInlineColumnsEnabled || !segmentedVC || ![segmentedVC isViewLoaded]) return;
+    if (!nfb_segmentedControllerIsHomeTimeline(segmentedVC)) return;
+    NSMutableArray<UIView *> *bars = [NSMutableArray array];
+    NSHashTable<UIView *> *seen = [NSHashTable weakObjectsHashTable];
+    UIView *root = segmentedVC.view;
+    for (NSString *key in @[@"_segmentedControl", @"segmentedControl", @"_scrollingSegmentedControl",
+                            @"scrollingSegmentedControl", @"_labelBar", @"labelBar", @"_labelBarView",
+                            @"labelBarView", @"_tabBar", @"tabBar", @"_tabsView", @"tabsView",
+                            @"_headerView", @"headerView", @"_topBar", @"topBar", @"_titleBar",
+                            @"titleBar", @"_titlesView", @"titlesView"]) {
+        @try {
+            id value = [segmentedVC valueForKey:key];
+            nfb_collectSegmentedChromeViewsFromObject(value, bars, seen, root, 0);
+        } @catch (NSException *e) {}
+    }
+    nfb_collectSegmentedChromeViewsInViewTree(root, bars, seen, root, 0);
+    for (UIView *bar in bars) {
+        nfb_collapseColumnsChromeView(bar);
+        UIView *child = bar;
+        UIView *current = bar.superview;
+        for (NSInteger depth = 0; current && depth < 4; depth++, child = current, current = current.superview) {
+            if (!nfb_columnsChromeAncestorRowCandidate(current, child, root)) break;
+            nfb_collapseColumnsChromeView(current);
+        }
     }
 }
 
@@ -2262,19 +2309,39 @@ static CGFloat nfb_columnsContentWidth(CGFloat columnWidth, NSUInteger pageCount
     return MAX(base + trailing, viewportWidth + 1.0);
 }
 
+static NSArray<NSNumber *> *nfb_columnsSnapCandidates(CGFloat columnWidth, CGFloat maxOffsetX) {
+    if (columnWidth < 1.0 || maxOffsetX <= 0.0) return @[@0.0];
+    NSMutableArray<NSNumber *> *candidates = [NSMutableArray array];
+    for (CGFloat candidate = 0.0; candidate < maxOffsetX; candidate += columnWidth) {
+        [candidates addObject:@(candidate)];
+    }
+    NSNumber *last = candidates.lastObject;
+    if (!last || last.doubleValue < maxOffsetX) {
+        [candidates addObject:@(maxOffsetX)];
+    }
+    return candidates;
+}
+
 static CGFloat nfb_columnsSnappedOffsetX(CGFloat offsetX, CGFloat columnWidth, CGFloat maxOffsetX) {
     if (columnWidth < 1.0 || maxOffsetX <= 0.0) return 0.0;
     CGFloat clamped = MIN(MAX(offsetX, 0.0), maxOffsetX);
-    CGFloat snapped = round(clamped / columnWidth) * columnWidth;
+    NSArray<NSNumber *> *candidates = nfb_columnsSnapCandidates(columnWidth, maxOffsetX);
+    CGFloat snapped = 0.0;
+    CGFloat bestDistance = maxOffsetX + columnWidth + 1.0;
+    for (NSNumber *candidateNumber in candidates) {
+        CGFloat candidate = candidateNumber.doubleValue;
+        CGFloat distance = fabs(clamped - candidate);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            snapped = candidate;
+        }
+    }
     return MIN(MAX(snapped, 0.0), maxOffsetX);
 }
 
 static CGFloat nfb_columnsMaxOffsetXForScroll(UIScrollView *scrollView) {
     if (!scrollView) return 0.0;
-    CGFloat contentWidth = scrollView.contentSize.width;
-    NSNumber *targetWidth = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsTargetContentWidthKey);
-    if (targetWidth.doubleValue > 1.0) contentWidth = targetWidth.doubleValue;
-    return MAX(0.0, contentWidth - scrollView.bounds.size.width);
+    return MAX(0.0, scrollView.contentSize.width - scrollView.bounds.size.width);
 }
 
 static BOOL nfb_columnsHorizontalScrollIsMoving(UIScrollView *scrollView) {
@@ -2285,14 +2352,32 @@ static BOOL nfb_columnsScrollIsActivePaging(UIScrollView *scrollView) {
     return gInlineColumnsEnabled && scrollView && objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey);
 }
 
+static CGFloat nfb_columnsDirectionalSnapOffsetX(CGFloat offsetX, CGFloat columnWidth, CGFloat maxOffsetX, BOOL rightward) {
+    if (columnWidth < 1.0 || maxOffsetX <= 0.0) return 0.0;
+    CGFloat clamped = MIN(MAX(offsetX, 0.0), maxOffsetX);
+    NSArray<NSNumber *> *candidates = nfb_columnsSnapCandidates(columnWidth, maxOffsetX);
+    if (rightward) {
+        for (NSNumber *candidateNumber in candidates) {
+            CGFloat candidate = candidateNumber.doubleValue;
+            if (candidate > clamped) return MIN(MAX(candidate, 0.0), maxOffsetX);
+        }
+        return maxOffsetX;
+    }
+    for (NSNumber *candidateNumber in [candidates reverseObjectEnumerator]) {
+        CGFloat candidate = candidateNumber.doubleValue;
+        if (candidate < clamped) return MIN(MAX(candidate, 0.0), maxOffsetX);
+    }
+    return 0.0;
+}
+
 static CGFloat nfb_columnsTargetSnapOffsetX(UIScrollView *scrollView, CGFloat targetOffsetX, CGFloat velocityX) {
+    (void)targetOffsetX;
     CGFloat columnWidth = nfb_columnsColumnWidth(scrollView.bounds.size.width);
     CGFloat maxOffsetX = nfb_columnsMaxOffsetXForScroll(scrollView);
-    CGFloat snapped = nfb_columnsSnappedOffsetX(targetOffsetX, columnWidth, maxOffsetX);
+    CGFloat currentOffsetX = scrollView.contentOffset.x;
+    CGFloat snapped = nfb_columnsSnappedOffsetX(currentOffsetX, columnWidth, maxOffsetX);
     if (fabs(velocityX) > 0.05 && columnWidth >= 1.0 && maxOffsetX > 0.0) {
-        CGFloat current = nfb_columnsSnappedOffsetX(scrollView.contentOffset.x, columnWidth, maxOffsetX);
-        CGFloat next = nfb_columnsSnappedOffsetX(current + (velocityX > 0.0 ? columnWidth : -columnWidth), columnWidth, maxOffsetX);
-        snapped = velocityX > 0.0 ? MAX(snapped, next) : MIN(snapped, next);
+        snapped = nfb_columnsDirectionalSnapOffsetX(currentOffsetX, columnWidth, maxOffsetX, velocityX > 0.0);
     }
     return MIN(MAX(snapped, 0.0), maxOffsetX);
 }
@@ -2576,7 +2661,7 @@ static void nfb_kickEmptyColumnLoad(UIViewController *page) {
 }
 
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
-    if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    if (!nfb_inlineColumnsActiveForHomePaging(paging) || ![paging isViewLoaded]) return;
     // Twitter's own paging layout runs in %orig (before us) on every pass and snaps the pages back
     // to full-width paging positions. We must ALWAYS re-apply the column frames so that snap can't
     // win mid-drag (that was the "catch and bounce back"). Only the contentSize/contentOffset
@@ -2643,7 +2728,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         nativeScrollView.contentSize = CGSizeMake(targetContentWidth, height);
     }
     if (!columnsScrollDragging) {
-        CGFloat maxOffsetX = MAX(0.0, targetContentWidth - bounds.size.width);
+        CGFloat maxOffsetX = nfb_columnsMaxOffsetXForScroll(nativeScrollView);
         BOOL resetToFirstColumn = firstColumnsApply || gInlineColumnsNeedsInitialOffsetReset;
         CGFloat targetOffsetX = resetToFirstColumn ? 0.0 : nfb_columnsClampedOffsetX(nativeScrollView.contentOffset.x, maxOffsetX);
         if (fabs(nativeScrollView.contentOffset.x - targetOffsetX) > 1.0) {
@@ -3029,7 +3114,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
 }
 
 static void nfb_applyInlineColumns(UIViewController *paging) {
-    if (!gInlineColumnsEnabled || !nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    if (!nfb_inlineColumnsActiveForHomePaging(paging) || ![paging isViewLoaded]) return;
     if (!nfb_homePagingControllerIsVisible(paging)) return;
     nfb_layoutColumnsOverlayForPaging(paging);
 }
@@ -3773,7 +3858,10 @@ static void nfb_reapplyColumnsSegmentedControlHidden(void) {
     if (!paging) paging = nfb_findAnyHomePagingController();
     if (paging && [paging isViewLoaded]) nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
     UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
-    if (segmented && [segmented isViewLoaded]) nfb_applyColumnsSegmentedControlHidden(segmented);
+    if (segmented && [segmented isViewLoaded]) {
+        nfb_applyColumnsSegmentedControlHidden(segmented);
+        nfb_forceColumnsSegmentedControlHeightCollapsed(segmented);
+    }
 }
 
 static void nfb_scheduleColumnsSegmentedControlHiddenReapply(void) {
@@ -3781,6 +3869,9 @@ static void nfb_scheduleColumnsSegmentedControlHiddenReapply(void) {
         nfb_reapplyColumnsSegmentedControlHidden();
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        nfb_reapplyColumnsSegmentedControlHidden();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         nfb_reapplyColumnsSegmentedControlHidden();
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -3956,11 +4047,14 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 %hook TFNScrollingSegmentedViewController
 - (void)viewWillAppear:(BOOL)animated {
     %orig(animated);
-    nfb_applyColumnsSegmentedControlHidden(self);
+    if (gInlineColumnsEnabled) nfb_applyColumnsSegmentedControlHidden(self);
 }
 - (void)viewDidLayoutSubviews {
     %orig;
-    nfb_applyColumnsSegmentedControlHidden(self);
+    if (gInlineColumnsEnabled) {
+        nfb_applyColumnsSegmentedControlHidden(self);
+        nfb_forceColumnsSegmentedControlHeightCollapsed(self);
+    }
 }
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
     %orig(size, coordinator);
