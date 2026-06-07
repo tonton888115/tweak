@@ -1726,11 +1726,27 @@ static NSArray<NSLayoutConstraint *> *nfb_chromeHeightConstraintsForView(UIView 
 static void nfb_collapseColumnsChromeView(UIView *view) {
     if (!view || !gInlineColumnsEnabled) return;
     if (objc_getAssociatedObject(view, &kNFBInlineColumnsChromeCollapsedKey)) {
-        NSArray<NSDictionary *> *savedConstraints = objc_getAssociatedObject(view, &kNFBInlineColumnsChromeConstraintsKey);
+        // Re-zero the originally-saved constraints AND any NEW height constraint Twitter
+        // re-added on a data-driven reload (a fresh NSLayoutConstraint object not in our
+        // saved set). Only re-zeroing the saved ones let that new 44pt constraint reassert
+        // the height -> the intermittent "余白" band that survived earlier passes.
+        NSMutableArray<NSDictionary *> *savedConstraints =
+            [objc_getAssociatedObject(view, &kNFBInlineColumnsChromeConstraintsKey) mutableCopy] ?: [NSMutableArray array];
         for (NSDictionary *entry in savedConstraints) {
             NSLayoutConstraint *constraint = entry[@"constraint"];
             if (constraint) constraint.constant = 0.0;
         }
+        for (NSLayoutConstraint *constraint in nfb_chromeHeightConstraintsForView(view)) {
+            BOOL known = NO;
+            for (NSDictionary *entry in savedConstraints) {
+                if (entry[@"constraint"] == constraint) { known = YES; break; }
+            }
+            if (!known) {
+                [savedConstraints addObject:@{@"constraint": constraint, @"constant": @(constraint.constant)}];
+            }
+            constraint.constant = 0.0;
+        }
+        objc_setAssociatedObject(view, &kNFBInlineColumnsChromeConstraintsKey, savedConstraints, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         CGRect frame = view.frame;
         CGRect bounds = view.bounds;
         if (frame.size.height > 0.5 && frame.size.height <= 300.0) {
