@@ -1537,6 +1537,7 @@ static char kNFBColumnsOriginalFrameKey;
 static char kNFBColumnsOriginalAutoresizingKey;
 static char kNFBColumnsOriginalHiddenKey;
 static char kNFBColumnsOriginalAlphaKey;
+static char kNFBColumnsOriginalClipsKey;
 static char kNFBColumnsEdgeGestureSavedKey;
 static char kNFBColumnsEdgeGestureEnabledKey;
 static char kNFBColumnsSnapScheduledKey;
@@ -1556,6 +1557,8 @@ static __weak UIView *gNFBColumnsSearchColumnView = nil;
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
 // panel. Captured from the search view's ancestor chain before transplant; un-hidden on restore.
 static __weak UIView *gNFBColumnsSecondaryHostView = nil;
+static __weak UIView *gNFBColumnsPrimaryHostView = nil;
+static NSArray<UIView *> *gNFBColumnsSuppressedSplitViews = nil;
 static BOOL gColumnsEdgeMenuStateKnown = NO;
 static BOOL gColumnsEdgeMenuLastEnabled = YES;
 static char kNFBColumnLoadKickedKey;
@@ -2562,6 +2565,7 @@ static void nfb_rememberColumnOriginalViewState(UIView *view) {
     objc_setAssociatedObject(view, &kNFBColumnsOriginalAutoresizingKey, @(view.autoresizingMask), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBColumnsOriginalHiddenKey, @(view.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBColumnsOriginalAlphaKey, @(view.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalClipsKey, @(view.clipsToBounds), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void nfb_restoreColumnOriginalViewState(UIView *view) {
@@ -2571,16 +2575,19 @@ static void nfb_restoreColumnOriginalViewState(UIView *view) {
     NSNumber *autoresizing = objc_getAssociatedObject(view, &kNFBColumnsOriginalAutoresizingKey);
     NSNumber *hidden = objc_getAssociatedObject(view, &kNFBColumnsOriginalHiddenKey);
     NSNumber *alpha = objc_getAssociatedObject(view, &kNFBColumnsOriginalAlphaKey);
+    NSNumber *clips = objc_getAssociatedObject(view, &kNFBColumnsOriginalClipsKey);
     if (superview && view.superview != superview) [superview addSubview:view];
     if (frame) view.frame = frame.CGRectValue;
     if (autoresizing) view.autoresizingMask = autoresizing.unsignedIntegerValue;
     view.hidden = hidden ? hidden.boolValue : NO;
     view.alpha = alpha ? alpha.doubleValue : 1.0;
+    if (clips) view.clipsToBounds = clips.boolValue;
     objc_setAssociatedObject(view, &kNFBColumnsOriginalSuperviewKey, nil, OBJC_ASSOCIATION_ASSIGN);
     objc_setAssociatedObject(view, &kNFBColumnsOriginalFrameKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBColumnsOriginalAutoresizingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBColumnsOriginalHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBColumnsOriginalAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kNFBColumnsOriginalClipsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void nfb_restoreColumnScrollAdjustmentForPage(UIViewController *page) {
@@ -2803,6 +2810,99 @@ static UIView *nfb_enclosingAppSplitHostView(UIView *view) {
     return nil;
 }
 
+static void nfb_collectSplitResidueViews(UIView *view, NSMutableArray<UIView *> *out, int depth) {
+    if (!view || depth > 10) return;
+    NSString *cls = NSStringFromClass(view.class);
+    if ([cls containsString:@"AppSplitOverlayView"] || [cls containsString:@"LiveResizingOverlayView"]) {
+        [out addObject:view];
+    }
+    for (UIView *subview in view.subviews) {
+        nfb_collectSplitResidueViews(subview, out, depth + 1);
+    }
+}
+
+static void nfb_suppressSplitResidueViews(UIView *root) {
+    if (!root) return;
+    NSMutableArray<UIView *> *views = [NSMutableArray array];
+    nfb_collectSplitResidueViews(root, views, 0);
+    if (!views.count) return;
+    for (UIView *view in views) {
+        nfb_rememberColumnOriginalViewState(view);
+        view.hidden = YES;
+        view.alpha = 0.0;
+    }
+    gNFBColumnsSuppressedSplitViews = [views copy];
+}
+
+static void nfb_prepareSplitForSearchColumn(UIViewController *paging, UIScrollView *nativeScrollView, UIView *searchView) {
+    UIView *secondaryHost = (searchView.superview != nativeScrollView) ? nfb_enclosingAppSplitHostView(searchView) : gNFBColumnsSecondaryHostView;
+    UIView *primarySource = nativeScrollView ? (UIView *)nativeScrollView : paging.view;
+    UIView *primaryHost = nfb_enclosingAppSplitHostView(primarySource);
+    if (!secondaryHost || !primaryHost || secondaryHost == primaryHost) return;
+
+    nfb_rememberColumnOriginalViewState(secondaryHost);
+    nfb_rememberColumnOriginalViewState(primaryHost);
+    gNFBColumnsSecondaryHostView = secondaryHost;
+    gNFBColumnsPrimaryHostView = primaryHost;
+
+    CGRect primaryFrame = primaryHost.frame;
+    CGFloat expandedMaxX = MAX(CGRectGetMaxX(primaryFrame), CGRectGetMaxX(secondaryHost.frame));
+    if (expandedMaxX > CGRectGetMaxX(primaryFrame) + 1.0) {
+        primaryFrame.size.width = expandedMaxX - primaryFrame.origin.x;
+        primaryHost.frame = primaryFrame;
+        primaryHost.autoresizingMask |= UIViewAutoresizingFlexibleWidth;
+    }
+    primaryHost.hidden = NO;
+    primaryHost.alpha = 1.0;
+
+    secondaryHost.hidden = YES;
+    secondaryHost.alpha = 0.0;
+    UIView *splitRoot = primaryHost.superview ? primaryHost.superview : primaryHost;
+    nfb_suppressSplitResidueViews(splitRoot);
+    [primaryHost.superview setNeedsLayout];
+    [primaryHost setNeedsLayout];
+    [primaryHost layoutIfNeeded];
+}
+
+static void nfb_fitSearchColumnSubviewTree(UIView *view, CGFloat width, CGFloat height, int depth) {
+    if (!view || depth > 8 || width < 100.0 || height < 100.0) return;
+    for (UIView *subview in view.subviews) {
+        CGRect f = subview.frame;
+        NSString *cls = NSStringFromClass(subview.class);
+        BOOL overwide = (f.size.width > width + 1.0) || (f.origin.x < -1.0);
+        BOOL topChrome = (CGRectGetMinY(f) < 150.0) ||
+            [cls containsString:@"NavigationBar"] ||
+            [cls containsString:@"SearchBar"] ||
+            [cls containsString:@"BarBackground"] ||
+            [cls containsString:@"NavigationBarContent"] ||
+            [cls containsString:@"TextField"];
+        BOOL largePane = (f.size.height > height * 0.45) ||
+            [subview isKindOfClass:UIScrollView.class] ||
+            [cls containsString:@"TableView"] ||
+            [cls containsString:@"CollectionView"] ||
+            [cls containsString:@"ScrollView"];
+        BOOL shallowContainer = depth <= 1 &&
+            ([cls containsString:@"UILayoutContainerView"] ||
+             [cls containsString:@"Transition"] ||
+             [cls isEqualToString:@"UIView"]);
+        if (overwide && (topChrome || largePane || shallowContainer)) {
+            nfb_rememberColumnOriginalViewState(subview);
+            CGFloat inset = ([cls containsString:@"SearchBar"] || [cls containsString:@"TextField"]) ? 12.0 : 0.0;
+            f.origin.x = inset;
+            f.size.width = MAX(1.0, width - inset * 2.0);
+            if (f.size.height > height || (shallowContainer && f.size.height > height * 0.70)) {
+                f.origin.y = 0.0;
+                f.size.height = height;
+            }
+            subview.frame = f;
+            subview.autoresizingMask |= UIViewAutoresizingFlexibleWidth;
+            if (largePane || shallowContainer) subview.autoresizingMask |= UIViewAutoresizingFlexibleHeight;
+            [subview setNeedsLayout];
+        }
+        nfb_fitSearchColumnSubviewTree(subview, width, height, depth + 1);
+    }
+}
+
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!nfb_inlineColumnsActiveForHomePaging(paging) || ![paging isViewLoaded]) return;
     // Twitter's own paging layout runs in %orig (before us) on every pass and snaps the pages back
@@ -2844,8 +2944,11 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     UIScrollView *nativeScrollView = nfb_horizontalPagingScrollViewOf(paging);
     if (!nativeScrollView) return;
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
+    UIViewController *searchColumnVC = nfb_iPadColumnsSearchSidebarVC(paging);
+    if (searchColumnVC && [searchColumnVC isViewLoaded] && searchColumnVC.view) {
+        nfb_prepareSplitForSearchColumn(paging, nativeScrollView, searchColumnVC.view);
+    }
 
-    UIView *host = nfb_columnsHostViewForPaging(paging);
     CGRect bounds = nativeScrollView.bounds;
     if (bounds.size.width < 120.0 || bounds.size.height < 240.0) return;
     CGFloat columnWidth = nfb_columnsColumnWidth(bounds.size.width);
@@ -2865,7 +2968,6 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nfb_updateColumnsEdgeMenuGesturesForScroll(nativeScrollView);
     // Always pin OUR column contentSize. Store the target before setting it because the
     // TFNPagingScrollView hook also sees this assignment.
-    UIViewController *searchColumnVC = nfb_iPadColumnsSearchSidebarVC(paging);
     NSUInteger columnCount = pages.count + (searchColumnVC ? 1 : 0);
     CGFloat targetContentWidth = nfb_columnsContentWidth(columnWidth, columnCount, bounds.size.width);
     objc_setAssociatedObject(nativeScrollView, &kNFBInlineColumnsTargetContentWidthKey, @(targetContentWidth), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -2950,7 +3052,10 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         searchView.hidden = NO;
         searchView.alpha = 1.0;
         searchView.frame = CGRectMake(columnWidth * pages.count, 0.0, columnWidth, height);
+        searchView.bounds = CGRectMake(0.0, 0.0, columnWidth, height);
+        searchView.clipsToBounds = YES;
         searchView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
+        nfb_fitSearchColumnSubviewTree(searchView, columnWidth, height, 0);
         [searchView setNeedsLayout];
         if (!columnsScrollDragging) [searchView layoutIfNeeded];
         if (gNFBLogRecording) {
@@ -3218,6 +3323,16 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
         nfb_restoreColumnOriginalViewState(secondaryHostView);
         gNFBColumnsSecondaryHostView = nil;
     }
+    UIView *primaryHostView = gNFBColumnsPrimaryHostView;
+    if (primaryHostView) {
+        nfb_restoreColumnOriginalViewState(primaryHostView);
+        gNFBColumnsPrimaryHostView = nil;
+    }
+    NSArray<UIView *> *splitViews = gNFBColumnsSuppressedSplitViews;
+    for (UIView *view in splitViews) {
+        nfb_restoreColumnOriginalViewState(view);
+    }
+    gNFBColumnsSuppressedSplitViews = nil;
 
     NSNumber *pagingEnabled = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey);
     NSNumber *bounceH = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsBounceHKey);
