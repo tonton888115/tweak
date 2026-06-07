@@ -2949,6 +2949,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         nfb_prepareSplitForSearchColumn(paging, nativeScrollView, searchColumnVC.view);
     }
 
+    UIView *host = nfb_columnsHostViewForPaging(paging);
     CGRect bounds = nativeScrollView.bounds;
     if (bounds.size.width < 120.0 || bounds.size.height < 240.0) return;
     CGFloat columnWidth = nfb_columnsColumnWidth(bounds.size.width);
