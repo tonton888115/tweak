@@ -3250,6 +3250,15 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         // guide to front. So the user never sees an empty guide, and a guide that never loads silently
         // stays on the trends fallback.
         UIViewController *guideHost = nfb_columnsBorrowGuideHost(paging);
+        // Emit the borrow outcome EARLY (every layout pass while recording, throttled) so it lands near
+        // the top of the log and survives even if the user then taps a trend and the app crashes before
+        // the FINAL DIAG. (The borrow itself runs once on first columns-open, often before recording.)
+        if (gNFBLogRecording) {
+            static NSString *lastBorrowStateKey = nil;
+            NSString *bk = [NSString stringWithFormat:@"guideBorrowState failed=%d host=%d attempts=%d reason=%@",
+                gNFBColumnsGuideBorrowFailed ? 1 : 0, guideHost ? 1 : 0, gNFBGuideBorrowAttempts, gNFBGuideBorrowReason ?: @"-"];
+            if (![bk isEqualToString:lastBorrowStateKey]) { lastBorrowStateKey = [bk copy]; NFBLogEvent(bk); }
+        }
         if (guideHost && [guideHost isViewLoaded] && guideHost.view) {
             UIView *guideView = guideHost.view;
             if (guideHost.parentViewController == nil) {
