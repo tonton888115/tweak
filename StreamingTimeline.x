@@ -1571,6 +1571,7 @@ static UIViewController *gNFBColumnsGuideHost = nil;             // fresh DI'd g
 static __weak UIViewController *gNFBColumnsGuideContentVC = nil; // the GuideContainerViewController inside it
 static BOOL gNFBColumnsGuideBorrowFailed = NO;
 static BOOL gNFBColumnsGuideContentReady = NO;  // latched once the borrowed guide loads content (Codex guard: only surface it after content-load success; until then the trends fallback stays on top)
+static NSString *gNFBGuideBorrowReason = @"(not attempted)";  // last borrow outcome — surfaced in FINAL DIAG so it's visible even when the (one-time) borrow ran before recording started
 // User chose "remove the right pane + move search into a column": we also hide the app-split
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
 // panel. Captured from the search view's ancestor chain before transplant; un-hidden on restore.
@@ -2876,9 +2877,10 @@ static UIViewController *nfb_columnsBorrowGuideHost(UIViewController *paging) {
         // Transient (hierarchy not fully wired on this pass) → retry a bounded number of passes rather
         // than latching the feature off; then give up to the trends fallback.
         gNFBGuideBorrowAttempts++;
+        gNFBGuideBorrowReason = [NSString stringWithFormat:@"not ready (tabbed=%d ds=%d) attempt=%d", tabbed ? 1 : 0, dataSource ? 1 : 0, gNFBGuideBorrowAttempts];
         if (gNFBLogRecording && gNFBGuideBorrowAttempts <= 3)
-            NFBLogEvent([NSString stringWithFormat:@"guideBorrow: not ready (tabbed=%d ds=%d) attempt=%d", tabbed ? 1 : 0, dataSource ? 1 : 0, gNFBGuideBorrowAttempts]);
-        if (gNFBGuideBorrowAttempts > 30) { gNFBColumnsGuideBorrowFailed = YES; if (gNFBLogRecording) NFBLogEvent(@"guideBorrow: give up (never ready)"); }
+            NFBLogEvent([@"guideBorrow: " stringByAppendingString:gNFBGuideBorrowReason]);
+        if (gNFBGuideBorrowAttempts > 30) { gNFBColumnsGuideBorrowFailed = YES; gNFBGuideBorrowReason = @"give up (never ready)"; if (gNFBLogRecording) NFBLogEvent(@"guideBorrow: give up (never ready)"); }
         return nil;
     }
 
@@ -2888,13 +2890,15 @@ static UIViewController *nfb_columnsBorrowGuideHost(UIViewController *paging) {
     NSInteger kBorrowBuild = 22;
     if ([defs integerForKey:@"NFBColumnsGuideBorrowCrashedBuild"] == kBorrowBuild) {
         gNFBColumnsGuideBorrowFailed = YES;
-        if (gNFBLogRecording) NFBLogEvent(@"guideBorrow: skip (this build crashed borrowing before)");
+        gNFBGuideBorrowReason = @"skip (this build crashed borrowing before)";
+        if (gNFBLogRecording) NFBLogEvent([@"guideBorrow: " stringByAppendingString:gNFBGuideBorrowReason]);
         return nil;
     }
     if ([defs integerForKey:@"NFBColumnsGuideBorrowInFlightBuild"] == kBorrowBuild) {
         [defs setInteger:kBorrowBuild forKey:@"NFBColumnsGuideBorrowCrashedBuild"]; [defs synchronize];
         gNFBColumnsGuideBorrowFailed = YES;
-        if (gNFBLogRecording) NFBLogEvent(@"guideBorrow: prior attempt crashed; disabling for this build");
+        gNFBGuideBorrowReason = @"prior attempt crashed; disabled for this build";
+        if (gNFBLogRecording) NFBLogEvent([@"guideBorrow: " stringByAppendingString:gNFBGuideBorrowReason]);
         return nil;
     }
     [defs setInteger:kBorrowBuild forKey:@"NFBColumnsGuideBorrowInFlightBuild"]; [defs synchronize];
@@ -2912,15 +2916,17 @@ static UIViewController *nfb_columnsBorrowGuideHost(UIViewController *paging) {
             UIViewController *g = nfb_guideWithin(fresh, 0);
             BOOL usable = (fresh && g && fresh.parentViewController == nil && fresh != containerVC);
             if (usable) { host = fresh; guide = g; }
-            else if (gNFBLogRecording) {
-                NFBLogEvent([NSString stringWithFormat:@"guideBorrow: unusable fresh=%@ parent=%d sameAsContainer=%d g=%d",
-                    fresh ? NSStringFromClass(fresh.class) : @"nil", fresh.parentViewController ? 1 : 0,
-                    (fresh == containerVC) ? 1 : 0, g ? 1 : 0]);
+            else {
+                gNFBGuideBorrowReason = [NSString stringWithFormat:@"unusable idx=%ld fresh=%@ parent=%d sameAsContainer=%d g=%d",
+                    (long)guideIdx, fresh ? NSStringFromClass(fresh.class) : @"nil", fresh.parentViewController ? 1 : 0,
+                    (fresh == containerVC) ? 1 : 0, g ? 1 : 0];
+                if (gNFBLogRecording) NFBLogEvent([@"guideBorrow: " stringByAppendingString:gNFBGuideBorrowReason]);
             }
-        } else if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"guideBorrow: guide tab not found (count=%lu)", (unsigned long)count]);
+        } else {
+            gNFBGuideBorrowReason = [NSString stringWithFormat:@"guide tab not found (count=%lu)", (unsigned long)count];
+            if (gNFBLogRecording) NFBLogEvent([@"guideBorrow: " stringByAppendingString:gNFBGuideBorrowReason]);
         }
-    } @catch (NSException *e) { host = nil; }
+    } @catch (NSException *e) { host = nil; gNFBGuideBorrowReason = [NSString stringWithFormat:@"exception %@", e.reason ?: @"?"]; }
 
     [defs removeObjectForKey:@"NFBColumnsGuideBorrowInFlightBuild"]; [defs synchronize];
 
@@ -2928,7 +2934,8 @@ static UIViewController *nfb_columnsBorrowGuideHost(UIViewController *paging) {
     [host loadViewIfNeeded];
     gNFBColumnsGuideHost = host;
     gNFBColumnsGuideContentVC = guide;
-    if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"guideBorrow: OK host=%@ guide=%@", NSStringFromClass(host.class), NSStringFromClass(guide.class)]);
+    gNFBGuideBorrowReason = [NSString stringWithFormat:@"OK host=%@ guide=%@", NSStringFromClass(host.class), NSStringFromClass(guide.class)];
+    if (gNFBLogRecording) NFBLogEvent([@"guideBorrow: " stringByAppendingString:gNFBGuideBorrowReason]);
     return host;
 }
 
@@ -4541,6 +4548,19 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
         }
         [s appendString:@"\n"];
         idx++;
+    }
+    // Always surface the borrow outcome (the borrow runs once, often before recording starts, so its
+    // one-time logs may be missing — this latched state shows what happened regardless).
+    {
+        UIViewController *gh = gNFBColumnsGuideHost;
+        UIScrollView *gsv = gh ? nfb_mainScrollViewOf(gh) : nil;
+        [s appendFormat:@"guideBorrowDiag failed=%d host=%@ parent=%@ ready=%d attempts=%d content=%.0fx%.0f reason=%@\n",
+            gNFBColumnsGuideBorrowFailed ? 1 : 0,
+            gh ? NSStringFromClass(gh.class) : @"nil",
+            (gh && gh.parentViewController) ? NSStringFromClass(gh.parentViewController.class) : @"-",
+            gNFBColumnsGuideContentReady ? 1 : 0, gNFBGuideBorrowAttempts,
+            gsv ? gsv.contentSize.width : 0.0, gsv ? gsv.contentSize.height : 0.0,
+            gNFBGuideBorrowReason ?: @"-"];
     }
     UIViewController *searchVC = gNFBColumnsSearchColumnController;
     if (searchVC && [searchVC isViewLoaded]) {
