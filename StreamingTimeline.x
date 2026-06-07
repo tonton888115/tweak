@@ -2402,20 +2402,27 @@ static CGFloat nfb_columnsDirectionalSnapOffsetX(CGFloat offsetX, CGFloat column
 }
 
 static CGFloat nfb_columnsTargetSnapOffsetX(UIScrollView *scrollView, CGFloat targetOffsetX, CGFloat velocityX) {
-    (void)targetOffsetX;
     CGFloat columnWidth = nfb_columnsColumnWidth(scrollView.bounds.size.width);
     CGFloat maxOffsetX = nfb_columnsMaxOffsetXForScroll(scrollView);
+    if (columnWidth < 1.0 || maxOffsetX <= 0.0) return 0.0;
     CGFloat currentOffsetX = scrollView.contentOffset.x;
-    CGFloat snapped = nfb_columnsSnappedOffsetX(currentOffsetX, columnWidth, maxOffsetX);
-    // Only treat the release as a directional flick when the velocity is clearly
-    // intentional. The old 0.05 threshold fired on almost every release, including the
-    // tiny reverse (leftward) velocity produced by the rubber-band bounce at the right
-    // edge -> that pulled the view back a whole column (the reported "right-edge
-    // bounce-back"). A ~0.3 pt/ms floor ignores that residual so an edge release falls
-    // through to the nearest-snap (which stays at the edge), while genuine flicks still
-    // advance one column in the drag direction from the current offset.
-    if (fabs(velocityX) >= 0.3 && columnWidth >= 1.0 && maxOffsetX > 0.0) {
-        snapped = nfb_columnsDirectionalSnapOffsetX(currentOffsetX, columnWidth, maxOffsetX, velocityX > 0.0);
+    // Snap the PROJECTED deceleration landing point (where UIScrollView's own momentum
+    // would settle), NOT the lift-moment offset. The previous version ignored
+    // targetOffsetX and snapped relative to currentOffsetX, which caused two bugs: a fast
+    // flick whose finger barely moved only ever advanced one column, and a near-complete
+    // drag released with low velocity snapped to the *nearest* boundary behind it -> the
+    // column "stopped partway and sprang back". Using the projected target lets momentum
+    // carry to the column it actually points at, and a slow drag settle where it rests.
+    CGFloat projected = MIN(MAX(targetOffsetX, 0.0), maxOffsetX);
+    CGFloat snapped = nfb_columnsSnappedOffsetX(projected, columnWidth, maxOffsetX);
+    // For a clearly intentional flick, guarantee at least a one-column step in the flick
+    // direction (the projected target can still round back to the current column on a
+    // short flick). The 0.3 pt/ms floor keeps ignoring the tiny reverse velocity from a
+    // right-edge rubber-band, so an edge release stays pinned at the edge (projected ==
+    // maxOffset) instead of springing back a column.
+    if (fabs(velocityX) >= 0.3) {
+        CGFloat directional = nfb_columnsDirectionalSnapOffsetX(currentOffsetX, columnWidth, maxOffsetX, velocityX > 0.0);
+        snapped = (velocityX > 0.0) ? MAX(snapped, directional) : MIN(snapped, directional);
     }
     return MIN(MAX(snapped, 0.0), maxOffsetX);
 }
