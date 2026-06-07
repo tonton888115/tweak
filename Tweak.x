@@ -5322,6 +5322,9 @@ void BHTPresentColumnsMode(void) {
     gBHTSelectingHomeForColumns = YES;
     __block BOOL selectedHome = BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
     NFBLogEvent([NSString stringWithFormat:@"present.selectHome=%d", selectedHome ? 1 : 0]);
+    NFBSetInlineColumnsEnabled(YES);
+    BHTUpdateColumnsTabSelection(hostController, YES);
+    NFBLogSnapshot(@"present.immediateInline");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gBHTColumnsIntent) return;
         if (!selectedHome) selectedHome = BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
@@ -5453,6 +5456,10 @@ static void BHTPresentColumnsViewController(void) {
     if (tabBar) gBHTLastTabBarController = tabBar;
     NFBLogEvent([NSString stringWithFormat:@"bh_homeTapped intent=%d tabBar=%@ chain=%@",
         gBHTColumnsIntent, tabBar ? NSStringFromClass(tabBar.class) : @"nil", BHTResponderChainSummary(self)]);
+    if (gBHTSelectingHomeForColumns) {
+        NFBLogEvent(@"bh_homeTapped ignored while selecting home for columns");
+        return;
+    }
     if (gBHTColumnsIntent) BHTDismissColumnsMode();
     UIWindow *window = BHT_activeKeyWindow();
     UIViewController *target = tabBar ?: window.rootViewController;
@@ -5510,6 +5517,11 @@ static void BHTPresentColumnsViewController(void) {
     BOOL isColumns = BHTIsColumnsTabView((T1TabView *)self);
     BOOL isHome = BHTIsHomeTabView((T1TabView *)self);
     NFBLogEvent([NSString stringWithFormat:@"tabView.touchesEnded page=%@ isHome=%d isCol=%d intent=%d", BHTPageOfTabView((T1TabView *)self), isHome, isColumns, gBHTColumnsIntent]);
+    if (isHome && gBHTSelectingHomeForColumns) {
+        NFBLogEvent(@"tabView.homeTouches ignored while selecting home for columns");
+        %orig(touches, event);
+        return;
+    }
     if (isColumns) {
         BHTPresentColumnsViewController();
         return;
