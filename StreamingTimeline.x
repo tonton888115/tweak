@@ -39,6 +39,7 @@ static void nfb_appendTopChromeDiag(NSMutableString *s);
 static void nfb_appendCoveringViewsDiag(NSMutableString *s);
 static void nfb_appendGestureDiag(NSMutableString *s);
 static void nfb_appendSpacesCandidatesDiag(NSMutableString *s);
+static void nfb_appendExploreDiscoveryDiag(NSMutableString *s);
 static void nfb_appendSearchChromeDiag(NSMutableString *s);
 static void nfb_appendSavedColumnsChromeDiag(NSMutableString *s);
 static NSString *nfb_diagShortString(NSString *value, NSUInteger maxLen);
@@ -4014,6 +4015,80 @@ static void nfb_appendSpacesCandidatesDiag(NSMutableString *s) {
     }
 }
 
+// Explore-tab discovery (iPad): the current search column transplants the condensed app-split
+// trends/search sidebar (T1ExtendedContentNavigationController), which by design shows only a
+// search field + a few trends (content ~340x301). To match the iPhone Explore tab (search bar +
+// おすすめ/トレンド/ニュース/スポーツ segmented categories + long list) we need the *real*
+// explore/search content VC instead. It has no clean accessor, so this read-only diag walks the
+// full view-controller hierarchy of every window and flags explore/search/trends/guide candidates
+// with their reachable path (depth/parent), load state, and main-scroll content size, so the next
+// build can transplant the right VC. Capped to stay readable; only computes scroll for candidates.
+static BOOL nfb_vcClassLooksExplore(NSString *cls) {
+    return [cls containsString:@"Explore"] || [cls containsString:@"Guide"] ||
+        [cls containsString:@"Discover"] || [cls containsString:@"Search"] ||
+        [cls containsString:@"Trend"] || [cls containsString:@"Moment"] ||
+        [cls containsString:@"ExtendedContent"];
+}
+
+static void nfb_appendVCTreeDiag(NSMutableString *s, UIViewController *vc, int depth, NSInteger *count) {
+    if (!vc || depth > 14 || *count >= 200) return;
+    (*count)++;
+    NSString *cls = NSStringFromClass(vc.class);
+    BOOL candidate = nfb_vcClassLooksExplore(cls);
+    BOOL loaded = [vc isViewLoaded];
+    UIView *v = loaded ? vc.view : nil;
+    BOOL inWindow = (v && v.window) ? YES : NO;
+    NSString *parent = vc.parentViewController ? NSStringFromClass(vc.parentViewController.class) : @"-";
+    NSString *title = vc.title.length ? vc.title : @"";
+    UINavigationController *navParent = vc.navigationController;
+    // Only pay for the deep scroll search on candidates (cheap for the rest of the 200-cap tree).
+    UIScrollView *sv = (candidate && loaded) ? nfb_mainScrollViewOf(vc) : nil;
+    [s appendFormat:@"vc%@ d=%d %@ loaded=%d win=%d hidden=%d kids=%lu parent=%@ nav=%@ scroll=%@ content=%.0fx%.0f title=%@\n",
+        candidate ? @"*" : @" ", depth, cls,
+        loaded ? 1 : 0, inWindow ? 1 : 0, (v && v.hidden) ? 1 : 0,
+        (unsigned long)vc.childViewControllers.count, parent,
+        navParent ? NSStringFromClass(navParent.class) : @"-",
+        sv ? NSStringFromClass(sv.class) : @"-",
+        sv ? sv.contentSize.width : 0.0, sv ? sv.contentSize.height : 0.0,
+        title];
+    for (UIViewController *child in vc.childViewControllers) {
+        nfb_appendVCTreeDiag(s, child, depth + 1, count);
+    }
+    if (vc.presentedViewController && vc.presentedViewController.presentingViewController == vc) {
+        nfb_appendVCTreeDiag(s, vc.presentedViewController, depth + 1, count);
+    }
+}
+
+static void nfb_appendExploreDiscoveryDiag(NSMutableString *s) {
+    [s appendString:@"--- vcTree (explore discovery) ---\n"];
+    NSInteger count = 0;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (!w.rootViewController) continue;
+        [s appendFormat:@"vcWindow key=%d hidden=%d root=%@\n",
+            w.isKeyWindow ? 1 : 0, w.hidden ? 1 : 0, NSStringFromClass(w.rootViewController.class)];
+        nfb_appendVCTreeDiag(s, w.rootViewController, 0, &count);
+    }
+    // Focused dump of the currently-transplanted search nav so we can confirm what it actually hosts.
+    UIViewController *searchVC = gNFBColumnsSearchColumnController;
+    if ([searchVC isKindOfClass:UINavigationController.class]) {
+        UINavigationController *nav = (UINavigationController *)searchVC;
+        UIViewController *top = nav.topViewController;
+        UIViewController *vis = nav.visibleViewController;
+        [s appendFormat:@"searchNav stack=%lu top=%@ visible=%@\n",
+            (unsigned long)nav.viewControllers.count,
+            top ? NSStringFromClass(top.class) : @"-",
+            vis ? NSStringFromClass(vis.class) : @"-"];
+        for (UIViewController *child in nav.viewControllers) {
+            UIScrollView *sv = [child isViewLoaded] ? nfb_mainScrollViewOf(child) : nil;
+            [s appendFormat:@"searchNavVC %@ loaded=%d kids=%lu scroll=%@ content=%.0fx%.0f\n",
+                NSStringFromClass(child.class), [child isViewLoaded] ? 1 : 0,
+                (unsigned long)child.childViewControllers.count,
+                sv ? NSStringFromClass(sv.class) : @"-",
+                sv ? sv.contentSize.width : 0.0, sv ? sv.contentSize.height : 0.0];
+        }
+    }
+}
+
 static NSInteger nfb_countVisibleTopHomeChromeInView(UIView *view, UIView *root, int depth) {
     if (!view || !root || depth > 12 || view.hidden || view.alpha < 0.01) return 0;
     CGRect frame = view.superview ? [view.superview convertRect:view.frame toView:root] : view.frame;
@@ -4230,6 +4305,7 @@ static NSString *nfb_buildDiagnosticReport(void) {
     nfb_appendCoveringViewsDiag(s);
     nfb_appendGestureDiag(s);
     nfb_appendSpacesCandidatesDiag(s);
+    nfb_appendExploreDiscoveryDiag(s);
     nfb_dumpTree(nfb_homeRoot(active), 0, s);
     return s;
 }
