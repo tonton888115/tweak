@@ -1552,6 +1552,10 @@ static BOOL gInlineColumnsNeedsInitialOffsetReset = NO;
 // with the split (a nav controller pushes internally regardless of where its view lives), so we
 // only move the view and restore it when columns mode turns off. Weak: the split owns it.
 static __weak UIView *gNFBColumnsSearchColumnView = nil;
+// User chose "remove the right pane + move search into a column": we also hide the app-split
+// secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
+// panel. Captured from the search view's ancestor chain before transplant; un-hidden on restore.
+static __weak UIView *gNFBColumnsSecondaryHostView = nil;
 static BOOL gColumnsEdgeMenuStateKnown = NO;
 static BOOL gColumnsEdgeMenuLastEnabled = YES;
 static char kNFBColumnLoadKickedKey;
@@ -2788,6 +2792,17 @@ static UIViewController *nfb_iPadColumnsSearchSidebarVC(UIViewController *paging
     return nav;
 }
 
+// Walk up from the (still-secondary-pane-resident) search view to its enclosing app-split host
+// (T1AppSplitHostView), so we can hide that 587pt panel while its content lives in the column.
+static UIView *nfb_enclosingAppSplitHostView(UIView *view) {
+    UIView *v = view.superview;
+    for (int i = 0; i < 14 && v; i++) {
+        if ([NSStringFromClass(v.class) containsString:@"AppSplitHostView"]) return v;
+        v = v.superview;
+    }
+    return nil;
+}
+
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!nfb_inlineColumnsActiveForHomePaging(paging) || ![paging isViewLoaded]) return;
     // Twitter's own paging layout runs in %orig (before us) on every pass and snaps the pages back
@@ -2919,9 +2934,19 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     // cannot reclaim it; fully restored when columns mode turns off. Containment is untouched.
     if (searchColumnVC && [searchColumnVC isViewLoaded] && searchColumnVC.view) {
         UIView *searchView = searchColumnVC.view;
+        UIView *secondaryHost = (searchView.superview != nativeScrollView) ? nfb_enclosingAppSplitHostView(searchView) : nil;
         nfb_rememberColumnOriginalViewState(searchView);
         gNFBColumnsSearchColumnView = searchView;
         if (searchView.superview != nativeScrollView) [nativeScrollView addSubview:searchView];
+        if (secondaryHost) {
+            nfb_rememberColumnOriginalViewState(secondaryHost);
+            gNFBColumnsSecondaryHostView = secondaryHost;
+        }
+        UIView *hiddenHost = gNFBColumnsSecondaryHostView;
+        if (hiddenHost) {
+            hiddenHost.hidden = YES;
+            hiddenHost.alpha = 0.0;
+        }
         searchView.hidden = NO;
         searchView.alpha = 1.0;
         searchView.frame = CGRectMake(columnWidth * pages.count, 0.0, columnWidth, height);
@@ -3187,6 +3212,11 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     if (searchColumnView) {
         nfb_restoreColumnOriginalViewState(searchColumnView);
         gNFBColumnsSearchColumnView = nil;
+    }
+    UIView *secondaryHostView = gNFBColumnsSecondaryHostView;
+    if (secondaryHostView) {
+        nfb_restoreColumnOriginalViewState(secondaryHostView);
+        gNFBColumnsSecondaryHostView = nil;
     }
 
     NSNumber *pagingEnabled = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey);
