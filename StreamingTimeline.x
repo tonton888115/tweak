@@ -1557,11 +1557,11 @@ static __weak UIView *gNFBColumnsSearchColumnView = nil;
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
 // panel. Captured from the search view's ancestor chain before transplant; un-hidden on restore.
 static __weak UIView *gNFBColumnsSecondaryHostView = nil;
-static __weak UIView *gNFBColumnsPrimaryHostView = nil;
 static NSArray<UIView *> *gNFBColumnsSuppressedSplitViews = nil;
 static BOOL gColumnsEdgeMenuStateKnown = NO;
 static BOOL gColumnsEdgeMenuLastEnabled = YES;
 static char kNFBColumnLoadKickedKey;
+static char kNFBColumnsEmptyReloadCountKey;
 static char kNFBColumnScrollAdjustedKey;
 static char kNFBColumnScrollFrameKey;
 static char kNFBColumnScrollAutoresizingKey;
@@ -2810,6 +2810,23 @@ static UIView *nfb_enclosingAppSplitHostView(UIView *view) {
     return nil;
 }
 
+static BOOL nfb_searchColumnVCUsableForCurrentSplit(UIViewController *paging, UIScrollView *nativeScrollView, UIView *searchView) {
+    if (!paging || !nativeScrollView || !searchView) return NO;
+    if (searchView.superview == nativeScrollView) return YES;   // already transplanted; do not chase a resizing split.
+    UIView *secondaryHost = nfb_enclosingAppSplitHostView(searchView);
+    UIView *primarySource = nativeScrollView ? (UIView *)nativeScrollView : paging.view;
+    UIView *primaryHost = nfb_enclosingAppSplitHostView(primarySource);
+    if (!secondaryHost || !primaryHost || secondaryHost == primaryHost) return NO;
+    if (!secondaryHost.window || secondaryHost.window != nativeScrollView.window) return NO;
+    if (secondaryHost.hidden || secondaryHost.alpha < 0.01) return NO;
+    CGSize hostSize = secondaryHost.bounds.size;
+    // The iPad secondary search pane is removed/rebuilt at narrower widths and during live
+    // resizing. Transplant only from a real, stable secondary pane; otherwise the split view and
+    // our column layout fight over the same navigation view and can freeze the app.
+    if (hostSize.width < 320.0 || hostSize.height < 240.0) return NO;
+    return YES;
+}
+
 static void nfb_collectSplitResidueViews(UIView *view, NSMutableArray<UIView *> *out, int depth) {
     if (!view || depth > 10) return;
     NSString *cls = NSStringFromClass(view.class);
@@ -2835,33 +2852,22 @@ static void nfb_suppressSplitResidueViews(UIView *root) {
 }
 
 static void nfb_prepareSplitForSearchColumn(UIViewController *paging, UIScrollView *nativeScrollView, UIView *searchView) {
+    if (!nfb_searchColumnVCUsableForCurrentSplit(paging, nativeScrollView, searchView)) return;
+    if (searchView.superview == nativeScrollView) return;
     UIView *secondaryHost = (searchView.superview != nativeScrollView) ? nfb_enclosingAppSplitHostView(searchView) : gNFBColumnsSecondaryHostView;
     UIView *primarySource = nativeScrollView ? (UIView *)nativeScrollView : paging.view;
     UIView *primaryHost = nfb_enclosingAppSplitHostView(primarySource);
     if (!secondaryHost || !primaryHost || secondaryHost == primaryHost) return;
 
     nfb_rememberColumnOriginalViewState(secondaryHost);
-    nfb_rememberColumnOriginalViewState(primaryHost);
     gNFBColumnsSecondaryHostView = secondaryHost;
-    gNFBColumnsPrimaryHostView = primaryHost;
-
-    CGRect primaryFrame = primaryHost.frame;
-    CGFloat expandedMaxX = MAX(CGRectGetMaxX(primaryFrame), CGRectGetMaxX(secondaryHost.frame));
-    if (expandedMaxX > CGRectGetMaxX(primaryFrame) + 1.0) {
-        primaryFrame.size.width = expandedMaxX - primaryFrame.origin.x;
-        primaryHost.frame = primaryFrame;
-        primaryHost.autoresizingMask |= UIViewAutoresizingFlexibleWidth;
-    }
-    primaryHost.hidden = NO;
-    primaryHost.alpha = 1.0;
 
     secondaryHost.hidden = YES;
     secondaryHost.alpha = 0.0;
     UIView *splitRoot = primaryHost.superview ? primaryHost.superview : primaryHost;
     nfb_suppressSplitResidueViews(splitRoot);
-    [primaryHost.superview setNeedsLayout];
+    [splitRoot setNeedsLayout];
     [primaryHost setNeedsLayout];
-    [primaryHost layoutIfNeeded];
 }
 
 static void nfb_fitSearchColumnSubviewTree(UIView *view, CGFloat width, CGFloat height, int depth) {
@@ -2946,7 +2952,11 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
     UIViewController *searchColumnVC = nfb_iPadColumnsSearchSidebarVC(paging);
     if (searchColumnVC && [searchColumnVC isViewLoaded] && searchColumnVC.view) {
-        nfb_prepareSplitForSearchColumn(paging, nativeScrollView, searchColumnVC.view);
+        if (nfb_searchColumnVCUsableForCurrentSplit(paging, nativeScrollView, searchColumnVC.view)) {
+            nfb_prepareSplitForSearchColumn(paging, nativeScrollView, searchColumnVC.view);
+        } else {
+            searchColumnVC = nil;
+        }
     }
 
     UIView *host = nfb_columnsHostViewForPaging(paging);
@@ -2959,6 +2969,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     gColumnsOverlayPages = [pages copy];
     BOOL firstColumnsApply = objc_getAssociatedObject(nativeScrollView, &kNFBInlineColumnsAppliedKey) == nil;
     nfb_rememberInlineColumnsOriginals(nativeScrollView);
+    if (firstColumnsApply) objc_setAssociatedObject(nativeScrollView, &kNFBColumnsEmptyReloadCountKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     nativeScrollView.pagingEnabled = NO;
     nativeScrollView.alwaysBounceHorizontal = YES;
     // The horizontal indicator floated mid-screen (big bottom inset) and looked like a stray bar; the
@@ -3078,7 +3089,15 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         if (anyEmpty) {
             static NSTimeInterval lastEmptyReload = 0.0;
             NSTimeInterval now = CACurrentMediaTime();
-            if (!columnsScrollDragging && now - lastEmptyReload > 1.0) { lastEmptyReload = now; nfb_requestColumnsPagingPreload(paging, NO); }
+            NSNumber *reloadCountNumber = objc_getAssociatedObject(nativeScrollView, &kNFBColumnsEmptyReloadCountKey);
+            NSInteger reloadCount = reloadCountNumber ? reloadCountNumber.integerValue : 0;
+            if (!columnsScrollDragging && reloadCount < 3 && now - lastEmptyReload > 1.0) {
+                lastEmptyReload = now;
+                objc_setAssociatedObject(nativeScrollView, &kNFBColumnsEmptyReloadCountKey, @(reloadCount + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                nfb_requestColumnsPagingPreload(paging, NO);
+            }
+        } else {
+            objc_setAssociatedObject(nativeScrollView, &kNFBColumnsEmptyReloadCountKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
     // Record the columns layout state (only when it CHANGES) so UI breakage / scroll catching is
@@ -3324,11 +3343,6 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
         nfb_restoreColumnOriginalViewState(secondaryHostView);
         gNFBColumnsSecondaryHostView = nil;
     }
-    UIView *primaryHostView = gNFBColumnsPrimaryHostView;
-    if (primaryHostView) {
-        nfb_restoreColumnOriginalViewState(primaryHostView);
-        gNFBColumnsPrimaryHostView = nil;
-    }
     NSArray<UIView *> *splitViews = gNFBColumnsSuppressedSplitViews;
     for (UIView *view in splitViews) {
         nfb_restoreColumnOriginalViewState(view);
@@ -3420,6 +3434,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsDirectionalLockKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsContentSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(scrollView, &kNFBInlineColumnsTargetContentWidthKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(scrollView, &kNFBColumnsEmptyReloadCountKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     if (needsNativeRestore) {
         for (NSString *name in @[@"reloadVisibleViewControllers", @"reloadVisibleViewControllersForceUnload:", @"reloadViewControllers"]) {
