@@ -2851,26 +2851,41 @@ static UIViewController *nfb_guideWithin(UIViewController *vc, int depth) {
 // use it if it is (a) non-nil, (b) parentless, and (c) NOT the same object as the container's cached
 // guide — so we never reparent/corrupt the live tab. Build-stamped crash guard around the factory
 // calls. Cached once obtained. iPad only; returns nil (→ trends fallback) on any doubt.
+static int gNFBGuideBorrowAttempts = 0;
 static UIViewController *nfb_columnsBorrowGuideHost(UIViewController *paging) {
     if (gNFBColumnsGuideHost) return gNFBColumnsGuideHost;
     if (gNFBColumnsGuideBorrowFailed) return nil;
     if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return nil;
-    UIWindow *kw = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows) { if (w.isKeyWindow) { kw = w; break; } }
-    UIViewController *tabbed = nfb_findVCByClassSubstring(kw.rootViewController, @"TFNTabbedViewController", 0);
-    if (!tabbed) { gNFBColumnsGuideBorrowFailed = YES; return nil; }
+    // Find TFNTabbedViewController by walking UP from paging (a stable ancestor of the home paging
+    // controller) — avoids the key-window/timing dependency that made the first columns layout pass
+    // fail to find it and (previously) latch the borrow off for the whole session.
+    UIViewController *tabbed = paging;
+    for (int i = 0; i < 12 && tabbed; i++) {
+        if ([NSStringFromClass(tabbed.class) isEqualToString:@"TFNTabbedViewController"]) break;
+        tabbed = tabbed.parentViewController;
+    }
+    if (tabbed && ![NSStringFromClass(tabbed.class) isEqualToString:@"TFNTabbedViewController"]) tabbed = nil;
     SEL numSel = @selector(numberOfViewControllers);
     SEL atIdxSel = @selector(viewControllerAtIndex:);
     SEL dsSel = @selector(tabbedViewController:viewControllerAtIndex:);
-    if (![tabbed respondsToSelector:numSel] || ![tabbed respondsToSelector:atIdxSel]) { gNFBColumnsGuideBorrowFailed = YES; return nil; }
     id dataSource = nil;
-    @try { dataSource = [tabbed valueForKey:@"dataSource"]; } @catch (NSException *e) { dataSource = nil; }
-    if (!dataSource || ![dataSource respondsToSelector:dsSel]) { gNFBColumnsGuideBorrowFailed = YES; return nil; }
+    if (tabbed) { @try { dataSource = [tabbed valueForKey:@"dataSource"]; } @catch (NSException *e) { dataSource = nil; } }
+    BOOL ready = tabbed && [tabbed respondsToSelector:numSel] && [tabbed respondsToSelector:atIdxSel]
+                 && dataSource && [dataSource respondsToSelector:dsSel];
+    if (!ready) {
+        // Transient (hierarchy not fully wired on this pass) → retry a bounded number of passes rather
+        // than latching the feature off; then give up to the trends fallback.
+        gNFBGuideBorrowAttempts++;
+        if (gNFBLogRecording && gNFBGuideBorrowAttempts <= 3)
+            NFBLogEvent([NSString stringWithFormat:@"guideBorrow: not ready (tabbed=%d ds=%d) attempt=%d", tabbed ? 1 : 0, dataSource ? 1 : 0, gNFBGuideBorrowAttempts]);
+        if (gNFBGuideBorrowAttempts > 30) { gNFBColumnsGuideBorrowFailed = YES; if (gNFBLogRecording) NFBLogEvent(@"guideBorrow: give up (never ready)"); }
+        return nil;
+    }
 
     // Build-stamped crash guard: a hard crash in the factory calls leaves the in-flight stamp; the next
     // launch promotes it to a crashed stamp and stops trying for this build (trends fallback stays).
     NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
-    NSInteger kBorrowBuild = 21;
+    NSInteger kBorrowBuild = 22;
     if ([defs integerForKey:@"NFBColumnsGuideBorrowCrashedBuild"] == kBorrowBuild) {
         gNFBColumnsGuideBorrowFailed = YES;
         if (gNFBLogRecording) NFBLogEvent(@"guideBorrow: skip (this build crashed borrowing before)");
