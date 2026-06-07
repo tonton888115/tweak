@@ -1546,6 +1546,12 @@ static UIScrollView *gColumnsOverlayScrollView = nil;
 static UIButton *gColumnsAllTopButton = nil;
 static NSArray<UIViewController *> *gColumnsOverlayPages = nil;
 static BOOL gInlineColumnsNeedsInitialOffsetReset = NO;
+// iPad only: the trends/search sidebar (T1ExtendedContentNavigationController) lives in the
+// app-split secondary pane and only appears at full width. We transplant ITS view into the
+// horizontal column scroll as a far-right "search column" (same 340pt width). Containment stays
+// with the split (a nav controller pushes internally regardless of where its view lives), so we
+// only move the view and restore it when columns mode turns off. Weak: the split owns it.
+static __weak UIView *gNFBColumnsSearchColumnView = nil;
 static BOOL gColumnsEdgeMenuStateKnown = NO;
 static BOOL gColumnsEdgeMenuLastEnabled = YES;
 static char kNFBColumnLoadKickedKey;
@@ -2754,6 +2760,34 @@ static void nfb_kickEmptyColumnLoad(UIViewController *page) {
     nfb_streamTriggerTarget(page);
 }
 
+// Find the iPad app-split secondary search/trends navigation controller
+// (T1ExtendedContentNavigationController, confirmed via the secondary pane's gesture
+// delegates). Returns nil on iPhone, when there is no app-split, or when the secondary
+// pane is absent (narrow widths) -> no search column is added (safe no-op).
+static UIViewController *nfb_findExtendedContentNavInVC(UIViewController *vc, int depth) {
+    if (!vc || depth > 5) return nil;
+    if ([NSStringFromClass(vc.class) containsString:@"ExtendedContentNavigation"]) return vc;
+    for (UIViewController *child in vc.childViewControllers) {
+        UIViewController *found = nfb_findExtendedContentNavInVC(child, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static UIViewController *nfb_iPadColumnsSearchSidebarVC(UIViewController *paging) {
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return nil;
+    UIViewController *split = nil;
+    UIViewController *r = paging;
+    for (int i = 0; i < 12 && r; i++) {
+        if ([NSStringFromClass(r.class) containsString:@"AppSplitViewController"]) { split = r; break; }
+        r = r.parentViewController;
+    }
+    if (!split) return nil;
+    UIViewController *nav = nfb_findExtendedContentNavInVC(split, 0);
+    if (!nav || ![nav isViewLoaded] || !nav.view) return nil;
+    return nav;
+}
+
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!nfb_inlineColumnsActiveForHomePaging(paging) || ![paging isViewLoaded]) return;
     // Twitter's own paging layout runs in %orig (before us) on every pass and snaps the pages back
@@ -2816,7 +2850,9 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nfb_updateColumnsEdgeMenuGesturesForScroll(nativeScrollView);
     // Always pin OUR column contentSize. Store the target before setting it because the
     // TFNPagingScrollView hook also sees this assignment.
-    CGFloat targetContentWidth = nfb_columnsContentWidth(columnWidth, pages.count, bounds.size.width);
+    UIViewController *searchColumnVC = nfb_iPadColumnsSearchSidebarVC(paging);
+    NSUInteger columnCount = pages.count + (searchColumnVC ? 1 : 0);
+    CGFloat targetContentWidth = nfb_columnsContentWidth(columnWidth, columnCount, bounds.size.width);
     objc_setAssociatedObject(nativeScrollView, &kNFBInlineColumnsTargetContentWidthKey, @(targetContentWidth), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (!columnsScrollDragging || fabs(nativeScrollView.contentSize.width - targetContentWidth) > 1.0 || fabs(nativeScrollView.contentSize.height - height) > 1.0) {
         nativeScrollView.contentSize = CGSizeMake(targetContentWidth, height);
@@ -2876,6 +2912,28 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         nfb_adjustColumnScrollForPage(page, pageView);
         if (!columnsScrollDragging) nfb_kickEmptyColumnLoad(page);
         idx++;
+    }
+
+    // Far-right search column (iPad): transplant the app-split trends/search sidebar's view into
+    // the horizontal scroll at columnWidth*pages.count. Re-applied every layout pass so the split
+    // cannot reclaim it; fully restored when columns mode turns off. Containment is untouched.
+    if (searchColumnVC && [searchColumnVC isViewLoaded] && searchColumnVC.view) {
+        UIView *searchView = searchColumnVC.view;
+        nfb_rememberColumnOriginalViewState(searchView);
+        gNFBColumnsSearchColumnView = searchView;
+        if (searchView.superview != nativeScrollView) [nativeScrollView addSubview:searchView];
+        searchView.hidden = NO;
+        searchView.alpha = 1.0;
+        searchView.frame = CGRectMake(columnWidth * pages.count, 0.0, columnWidth, height);
+        searchView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
+        [searchView setNeedsLayout];
+        if (!columnsScrollDragging) [searchView layoutIfNeeded];
+        if (gNFBLogRecording) {
+            static NSString *lastSearchColKey = nil;
+            NSString *k = [NSString stringWithFormat:@"searchColumn vc=%@ x=%.0f w=%.0f h=%.0f",
+                NSStringFromClass(searchColumnVC.class), columnWidth * pages.count, columnWidth, height];
+            if (![k isEqualToString:lastSearchColKey]) { lastSearchColKey = [k copy]; NFBLogEvent(k); }
+        }
     }
     // On iPad the pager only loads the current page, so the off-screen pinned-list columns stay
     // empty (contentSize.height==0 → blank columns = "only 1 column"). Keep nudging the pager to
@@ -3123,6 +3181,13 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
 
     BOOL wasApplied = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) != nil;
     if (!wasApplied) return;
+
+    // Return the transplanted iPad search column to its app-split secondary pane.
+    UIView *searchColumnView = gNFBColumnsSearchColumnView;
+    if (searchColumnView) {
+        nfb_restoreColumnOriginalViewState(searchColumnView);
+        gNFBColumnsSearchColumnView = nil;
+    }
 
     NSNumber *pagingEnabled = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey);
     NSNumber *bounceH = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsBounceHKey);
