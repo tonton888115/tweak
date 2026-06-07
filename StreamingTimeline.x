@@ -2434,6 +2434,11 @@ static CGFloat nfb_columnsTargetSnapOffsetX(UIScrollView *scrollView, CGFloat ta
 // re-assert it once motion settles so our snap is the last word.
 static char kNFBColumnsDesiredSnapOffsetKey;
 
+// Pinned-list columns are vended by the pager data source without being adopted as child
+// view controllers, so their -navigationController is nil -> a tweet tap's detail push is
+// dropped. Adopt orphan column pages and flag them so restore can detach them again.
+static char kNFBColumnsAddedAsChildKey;
+
 static void nfb_columnsApplyTargetSnap(UIScrollView *scrollView, CGPoint velocity, CGPoint *targetContentOffset) {
     if (!targetContentOffset || !nfb_columnsScrollIsActivePaging(scrollView)) return;
     CGFloat snapped = nfb_columnsTargetSnapOffsetX(scrollView, targetContentOffset->x, velocity.x);
@@ -2855,6 +2860,11 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         UIView *pageView = page.view;
         nfb_rememberColumnOriginalViewState(pageView);
         if (pageView.superview != nativeScrollView) [nativeScrollView addSubview:pageView];
+        if (page.parentViewController == nil) {
+            [paging addChildViewController:page];
+            [page didMoveToParentViewController:paging];
+            objc_setAssociatedObject(page, &kNFBColumnsAddedAsChildKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
         pageView.hidden = NO;
         pageView.alpha = 1.0;
         pageView.frame = CGRectMake(columnWidth * idx, -topShift, columnWidth, height + topShift);
@@ -3180,6 +3190,14 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
                 child.view.hidden = NO;
                 child.view.alpha = 1.0;
             }
+        }
+    }
+
+    for (UIViewController *child in [paging.childViewControllers copy]) {
+        if (objc_getAssociatedObject(child, &kNFBColumnsAddedAsChildKey)) {
+            [child willMoveToParentViewController:nil];
+            [child removeFromParentViewController];
+            objc_setAssociatedObject(child, &kNFBColumnsAddedAsChildKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
 
