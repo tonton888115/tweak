@@ -42,10 +42,12 @@ static void nfb_appendSpacesCandidatesDiag(NSMutableString *s);
 static void nfb_appendSearchChromeDiag(NSMutableString *s);
 static void nfb_appendSavedColumnsChromeDiag(NSMutableString *s);
 static NSString *nfb_diagShortString(NSString *value, NSUInteger maxLen);
+static NSString *nfb_diagTextForView(UIView *view, NSUInteger maxLen);
 static NSString *nfb_buildDiagnosticReport(void);
 void NFBLogSnapshot(NSString *reason);             // compact 1-line state snapshot (records only while recording)
 extern NSString *BHTColumnsLogFlags(void);          // columns flags + tab selectedIndex, from Tweak.x
 static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void);
+static NSArray<UIViewController *> *nfb_currentColumnRefreshControllers(void);
 static NSArray<UIViewController *> *nfb_allHomePagingTimelinePages(UIViewController *paging);
 static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc);
 static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging);
@@ -1185,7 +1187,7 @@ static BOOL nfb_streamCanRunForTarget(UIViewController *target) {
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return NO;
     if (!nfb_homeTabSelectedOrUnknown()) return NO;
     if (gInlineColumnsEnabled) {
-        for (UIViewController *page in nfb_currentColumnTimelinePages()) {
+        for (UIViewController *page in nfb_currentColumnRefreshControllers()) {
             if (![page isViewLoaded] || page.view.window == nil) continue;
             UIScrollView *sv = nfb_mainScrollViewOf(page);
             if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) continue;
@@ -1553,6 +1555,7 @@ static BOOL gInlineColumnsNeedsInitialOffsetReset = NO;
 // with the split (a nav controller pushes internally regardless of where its view lives), so we
 // only move the view and restore it when columns mode turns off. Weak: the split owns it.
 static __weak UIView *gNFBColumnsSearchColumnView = nil;
+static __weak UIViewController *gNFBColumnsSearchColumnController = nil;
 // User chose "remove the right pane + move search into a column": we also hide the app-split
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
 // panel. Captured from the search view's ancestor chain before transplant; un-hidden on restore.
@@ -2870,11 +2873,40 @@ static void nfb_prepareSplitForSearchColumn(UIViewController *paging, UIScrollVi
     [primaryHost setNeedsLayout];
 }
 
+static BOOL nfb_viewLooksLikeSearchInput(UIView *view) {
+    if (!view) return NO;
+    NSString *cls = NSStringFromClass(view.class);
+    NSString *lower = cls.lowercaseString;
+    if ([lower containsString:@"searchbar"] ||
+        [lower containsString:@"searchfield"] ||
+        [lower containsString:@"searchcontainer"] ||
+        [lower containsString:@"textfield"] ||
+        [cls containsString:@"TFNNavigationBarSearchView"] ||
+        [cls containsString:@"UISearchBarTextField"]) return YES;
+    NSString *text = nfb_diagTextForView(view, 80) ?: @"";
+    return [text containsString:@"検索"] || [text.lowercaseString containsString:@"search"];
+}
+
 static void nfb_fitSearchColumnSubviewTree(UIView *view, CGFloat width, CGFloat height, int depth) {
     if (!view || depth > 8 || width < 100.0 || height < 100.0) return;
     for (UIView *subview in view.subviews) {
         CGRect f = subview.frame;
         NSString *cls = NSStringFromClass(subview.class);
+        BOOL searchInput = nfb_viewLooksLikeSearchInput(subview);
+        if (searchInput) {
+            nfb_rememberColumnOriginalViewState(subview);
+            subview.hidden = NO;
+            subview.alpha = 1.0;
+            subview.userInteractionEnabled = YES;
+            if ([cls containsString:@"SearchBar"] || [cls containsString:@"NavigationBarSearchView"]) {
+                f.origin.x = 12.0;
+                if (f.origin.y < 0.0 || f.origin.y > 96.0) f.origin.y = 12.0;
+                f.size.width = MAX(1.0, width - 24.0);
+                if (f.size.height < 36.0 || f.size.height > 64.0) f.size.height = 44.0;
+                subview.frame = f;
+                subview.autoresizingMask |= UIViewAutoresizingFlexibleWidth;
+            }
+        }
         BOOL overwide = (f.size.width > width + 1.0) || (f.origin.x < -1.0);
         BOOL topChrome = (CGRectGetMinY(f) < 150.0) ||
             [cls containsString:@"NavigationBar"] ||
@@ -3051,6 +3083,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         UIView *secondaryHost = (searchView.superview != nativeScrollView) ? nfb_enclosingAppSplitHostView(searchView) : nil;
         nfb_rememberColumnOriginalViewState(searchView);
         gNFBColumnsSearchColumnView = searchView;
+        gNFBColumnsSearchColumnController = searchColumnVC;
         if (searchView.superview != nativeScrollView) [nativeScrollView addSubview:searchView];
         if (secondaryHost) {
             nfb_rememberColumnOriginalViewState(secondaryHost);
@@ -3072,8 +3105,14 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         if (!columnsScrollDragging) [searchView layoutIfNeeded];
         if (gNFBLogRecording) {
             static NSString *lastSearchColKey = nil;
-            NSString *k = [NSString stringWithFormat:@"searchColumn vc=%@ x=%.0f w=%.0f h=%.0f",
-                NSStringFromClass(searchColumnVC.class), columnWidth * pages.count, columnWidth, height];
+            UIScrollView *searchScroll = nfb_mainScrollViewOf(searchColumnVC);
+            NSString *text = nfb_diagTextForView(searchView, 72);
+            NSString *k = [NSString stringWithFormat:@"searchColumn vc=%@ x=%.0f w=%.0f h=%.0f scroll=%@ content=%.0fx%.0f text=%@",
+                NSStringFromClass(searchColumnVC.class), columnWidth * pages.count, columnWidth, height,
+                searchScroll ? NSStringFromClass(searchScroll.class) : @"nil",
+                searchScroll ? searchScroll.contentSize.width : 0.0,
+                searchScroll ? searchScroll.contentSize.height : 0.0,
+                text ?: @"-"];
             if (![k isEqualToString:lastSearchColKey]) { lastSearchColKey = [k copy]; NFBLogEvent(k); }
         }
     }
@@ -3338,6 +3377,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
         nfb_restoreColumnOriginalViewState(searchColumnView);
         gNFBColumnsSearchColumnView = nil;
     }
+    gNFBColumnsSearchColumnController = nil;
     UIView *secondaryHostView = gNFBColumnsSecondaryHostView;
     if (secondaryHostView) {
         nfb_restoreColumnOriginalViewState(secondaryHostView);
@@ -3487,6 +3527,15 @@ static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void) {
     return pages;
 }
 
+static NSArray<UIViewController *> *nfb_currentColumnRefreshControllers(void) {
+    NSMutableArray<UIViewController *> *controllers = [NSMutableArray arrayWithArray:nfb_currentColumnTimelinePages()];
+    UIViewController *search = gNFBColumnsSearchColumnController;
+    if (search && [search isViewLoaded] && search.view.window && ![controllers containsObject:search]) {
+        [controllers addObject:search];
+    }
+    return controllers;
+}
+
 static NSString *nfb_columnsPageSummary(UIViewController *paging) {
     if (!paging) return @"-";
     NSArray<UIViewController *> *all = nfb_allHomePagingTimelinePages(paging);
@@ -3510,7 +3559,7 @@ static NSString *nfb_columnsPageSummary(UIViewController *paging) {
 }
 
 static UIViewController *nfb_firstColumnTimelineAwayFromTopExcept(UIViewController *allowedRevealing) {
-    for (UIViewController *page in nfb_currentColumnTimelinePages()) {
+    for (UIViewController *page in nfb_currentColumnRefreshControllers()) {
         if (![page isViewLoaded] || page.view.window == nil) continue;
         if (allowedRevealing && page == allowedRevealing && nfb_canRevealRefreshStartedAtTop(page)) continue;
         UIScrollView *sv = nfb_mainScrollViewOf(page);
@@ -3526,7 +3575,7 @@ static UIViewController *nfb_firstColumnTimelineAwayFromTop(void) {
 
 static void nfb_revealAllColumnTops(void) {
     nfb_layoutActiveHomePaging();
-    for (UIViewController *page in nfb_currentColumnTimelinePages()) {
+    for (UIViewController *page in nfb_currentColumnRefreshControllers()) {
         if (![page isViewLoaded] || page.view.window == nil) continue;
         page.view.hidden = NO;
         page.view.alpha = 1.0;
@@ -3554,7 +3603,7 @@ static BOOL nfb_streamTriggerColumns(void) {
         return YES;
     }
     nfb_layoutActiveHomePaging();
-    NSArray<UIViewController *> *pages = nfb_currentColumnTimelinePages();
+    NSArray<UIViewController *> *pages = nfb_currentColumnRefreshControllers();
     NFBLogEvent([NSString stringWithFormat:@"streamColumns entry pages=%lu", (unsigned long)pages.count]);
     if (!pages.count) return NO;
 
@@ -4135,6 +4184,28 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
         }
         [s appendString:@"\n"];
         idx++;
+    }
+    UIViewController *searchVC = gNFBColumnsSearchColumnController;
+    if (searchVC && [searchVC isViewLoaded]) {
+        UIView *searchView = searchVC.view;
+        UIScrollView *searchScroll = nfb_mainScrollViewOf(searchVC);
+        CGRect searchFrame = searchView.frame;
+        [s appendFormat:@"searchColumnDiag vc=%@ loaded=1 window=%d hidden=%d frame=(%.1f,%.1f,%.1f,%.1f) scroll=%@ atTop=%d text=%@\n",
+            NSStringFromClass(searchVC.class),
+            searchView.window ? 1 : 0,
+            searchView.hidden ? 1 : 0,
+            searchFrame.origin.x, searchFrame.origin.y, searchFrame.size.width, searchFrame.size.height,
+            searchScroll ? NSStringFromClass(searchScroll.class) : @"nil",
+            nfb_isTimelineAtTop(searchVC) ? 1 : 0,
+            nfb_diagTextForView(searchView, 160) ?: @"-"];
+        if (searchScroll) {
+            [s appendFormat:@"searchColumnScroll offset=(%.1f,%.1f) content=(%.1f,%.1f) bounds=(%.1f,%.1f) inset=(%.1f,%.1f,%.1f,%.1f) adjusted=(%.1f,%.1f,%.1f,%.1f)\n",
+                searchScroll.contentOffset.x, searchScroll.contentOffset.y,
+                searchScroll.contentSize.width, searchScroll.contentSize.height,
+                searchScroll.bounds.size.width, searchScroll.bounds.size.height,
+                searchScroll.contentInset.top, searchScroll.contentInset.left, searchScroll.contentInset.bottom, searchScroll.contentInset.right,
+                searchScroll.adjustedContentInset.top, searchScroll.adjustedContentInset.left, searchScroll.adjustedContentInset.bottom, searchScroll.adjustedContentInset.right];
+        }
     }
     if (segmented && [segmented isViewLoaded] && paging && [paging isViewLoaded]) {
         nfb_appendColumnsChromeDiag(s, segmented.view, paging.view, segmented.view, 0);
