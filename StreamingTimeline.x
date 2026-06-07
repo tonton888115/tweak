@@ -41,6 +41,7 @@ static void nfb_appendGestureDiag(NSMutableString *s);
 static void nfb_appendSpacesCandidatesDiag(NSMutableString *s);
 static void nfb_appendExploreDiscoveryDiag(NSMutableString *s);
 static void nfb_appendGuideClassDiag(NSMutableString *s);
+static void nfb_appendTabFactoryDiag(NSMutableString *s);
 static void nfb_appendSearchChromeDiag(NSMutableString *s);
 static void nfb_appendSavedColumnsChromeDiag(NSMutableString *s);
 static NSString *nfb_diagShortString(NSString *value, NSUInteger maxLen);
@@ -4101,6 +4102,67 @@ static void nfb_appendGuideClassDiag(NSMutableString *s) {
     }
 }
 
+// Find the factory that builds the Explore/Guide tab VC WITH proper dependency injection. Fresh
+// alloc/init of GuideContainerViewController crashes (confirmed on device); the only safe way to get
+// one is to call Twitter's own creation path. This read-only diag locates the tab-content controllers
+// + their data sources/delegates and dumps method selectors that look like VC factories (so the next
+// build can call the right one and host the result in the column, with the trends column as fallback).
+static UIViewController *nfb_findVCByClassSubstring(UIViewController *root, NSString *sub, int depth) {
+    if (!root || depth > 14) return nil;
+    if ([NSStringFromClass(root.class) containsString:sub]) return root;
+    for (UIViewController *child in root.childViewControllers) {
+        UIViewController *found = nfb_findVCByClassSubstring(child, sub, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void nfb_dumpFactoryMethods(NSMutableString *s, id obj, NSString *label) {
+    if (!obj) { [s appendFormat:@"tabFactory %@ = nil\n", label]; return; }
+    Class c = [obj class];
+    [s appendFormat:@"tabFactory %@ = %@\n", label, NSStringFromClass(c)];
+    NSArray<NSString *> *needles = @[ @"viewcontroller", @"panel", @"guide", @"moment", @"create",
+                                      @"explore", @"controllerfor", @"tabat", @"index", @"page" ];
+    Class cur = c;
+    for (int lvl = 0; lvl < 4 && cur && cur != [UIViewController class] && cur != [UIResponder class] && cur != [NSObject class]; lvl++) {
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(cur, &n);
+        NSMutableArray<NSString *> *hits = [NSMutableArray array];
+        for (unsigned int i = 0; i < n; i++) {
+            NSString *sel = NSStringFromSelector(method_getName(ms[i]));
+            NSString *low = sel.lowercaseString;
+            for (NSString *nd in needles) { if ([low containsString:nd]) { [hits addObject:sel]; break; } }
+        }
+        if (ms) free(ms);
+        if (hits.count) [s appendFormat:@"  [%@] %@\n", NSStringFromClass(cur), [hits componentsJoinedByString:@" "]];
+        cur = class_getSuperclass(cur);
+    }
+}
+
+static void nfb_appendTabFactoryDiag(NSMutableString *s) {
+    [s appendString:@"--- tabFactoryDiag ---\n"];
+    UIViewController *root = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (w.isKeyWindow && w.rootViewController) { root = w.rootViewController; break; }
+    }
+    if (!root) { [s appendString:@"tabFactory: no key root\n"]; return; }
+    NSArray<NSString *> *targets = @[ @"TFNTabbedViewController", @"T1TabbedContainerViewController",
+                                      @"T1AppSplitViewController", @"T1TabBarViewController",
+                                      @"T1TabbedAppNavigationViewController" ];
+    for (NSString *t in targets) {
+        UIViewController *vc = nfb_findVCByClassSubstring(root, t, 0);
+        nfb_dumpFactoryMethods(s, vc, t);
+        if (!vc) continue;
+        for (NSString *key in @[ @"dataSource", @"delegate", @"_dataSource", @"_delegate", @"tabBarController" ]) {
+            id v = nil;
+            @try { v = [vc valueForKey:key]; } @catch (NSException *e) { v = nil; }
+            if (v && v != vc && [v isKindOfClass:NSObject.class]) {
+                nfb_dumpFactoryMethods(s, v, [NSString stringWithFormat:@"%@.%@", t, key]);
+            }
+        }
+    }
+}
+
 static void nfb_appendExploreDiscoveryDiag(NSMutableString *s) {
     [s appendString:@"--- vcTree (explore discovery) ---\n"];
     NSInteger count = 0;
@@ -4349,6 +4411,7 @@ static NSString *nfb_buildDiagnosticReport(void) {
     nfb_appendSpacesCandidatesDiag(s);
     nfb_appendExploreDiscoveryDiag(s);
     nfb_appendGuideClassDiag(s);
+    nfb_appendTabFactoryDiag(s);
     nfb_dumpTree(nfb_homeRoot(active), 0, s);
     return s;
 }
