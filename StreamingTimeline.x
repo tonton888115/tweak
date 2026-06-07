@@ -1558,6 +1558,15 @@ static BOOL gInlineColumnsNeedsInitialOffsetReset = NO;
 // only move the view and restore it when columns mode turns off. Weak: the split owns it.
 static __weak UIView *gNFBColumnsSearchColumnView = nil;
 static __weak UIViewController *gNFBColumnsSearchColumnController = nil;
+// iPad search column = a fresh Explore/Guide VC (T1TwitterSwift.GuideContainerViewController, the
+// 詳細を調べる tab with おすすめ/トレンド/ニュース/スポーツ segments). We OWN this instance (strong),
+// wrap it in a nav controller (so its search bar shows + internal pushes work), adopt it as a child
+// of the home paging controller for a real appearance lifecycle, and place its view as the far-right
+// column. Constructed lazily once; cached across columns toggles. The condensed trends sidebar pane
+// is still hidden so the column is not duplicated. See [[neofreebird-liquidglass-and-open-bugs]].
+static UIViewController *gNFBColumnsGuideVC = nil;
+static UINavigationController *gNFBColumnsGuideNav = nil;
+static BOOL gNFBColumnsGuideConstructFailed = NO;
 // User chose "remove the right pane + move search into a column": we also hide the app-split
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
 // panel. Captured from the search view's ancestor chain before transplant; un-hidden on restore.
@@ -2815,6 +2824,69 @@ static UIView *nfb_enclosingAppSplitHostView(UIView *view) {
     return nil;
 }
 
+// Lazily build (and cache) the fresh Explore/Guide VC for the search column, wrapped in a nav
+// controller. diag (Build 17) showed GuideContainerViewController's only initializers are
+// initWithCoder:/initWithNibName:bundle: (no dependency-injecting designated init) → it is a
+// self-configuring VC creatable via -init. Because a Swift fatalError in -init or -viewDidLoad is
+// uncatchable, we guard with a persisted in-flight flag: if the previous launch crashed mid-build,
+// the flag is still set and we skip construction (app self-recovers; column simply absent). iPad only.
+static UIViewController *nfb_columnsGuideController(void) {
+    if (gNFBColumnsGuideNav) return gNFBColumnsGuideNav;
+    if (gNFBColumnsGuideConstructFailed) return nil;
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return nil;
+    Class cls = NSClassFromString(@"T1TwitterSwift.GuideContainerViewController");
+    if (!cls) cls = NSClassFromString(@"T1TwitterSwift_GuideContainerViewController");
+    if (!cls) { gNFBColumnsGuideConstructFailed = YES; return nil; }
+    // Build-stamped crash guard: if a hard crash happened while building the guide on THIS build, the
+    // in-flight stamp survives the crash; on the next launch we promote it to a crashed stamp and stop
+    // trying for this build (columns just lack the search column, app stays usable). A future build
+    // (different kGuideBuild) clears the lockout automatically and retries the fix.
+    NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
+    static NSInteger const kGuideBuild = 18;   // bump whenever guide construction code changes
+    static NSString *const kCrashedKey = @"NFBColumnsGuideCrashedBuild";
+    static NSString *const kInFlightKey = @"NFBColumnsGuideInFlightBuild";
+    if ([defs integerForKey:kCrashedKey] == kGuideBuild) {
+        gNFBColumnsGuideConstructFailed = YES;
+        if (gNFBLogRecording) NFBLogEvent(@"guideColumn: skip (this build crashed building guide before)");
+        return nil;
+    }
+    if ([defs integerForKey:kInFlightKey] == kGuideBuild) {
+        [defs setInteger:kGuideBuild forKey:kCrashedKey];
+        [defs synchronize];
+        gNFBColumnsGuideConstructFailed = YES;
+        if (gNFBLogRecording) NFBLogEvent(@"guideColumn: prior attempt crashed; disabling for this build");
+        return nil;
+    }
+    [defs setInteger:kGuideBuild forKey:kInFlightKey];
+    [defs synchronize];
+    if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"guideColumn: constructing %@", NSStringFromClass(cls)]);
+    UIViewController *guide = nil;
+    @try {
+        guide = [[cls alloc] init];
+        [guide loadViewIfNeeded];   // force viewDidLoad now, while the in-flight stamp still guards a crash
+    } @catch (NSException *e) {
+        guide = nil;
+    }
+    [defs removeObjectForKey:kInFlightKey];   // completed without a hard crash
+    [defs synchronize];
+    if (!guide || ![guide isViewLoaded]) {
+        gNFBColumnsGuideConstructFailed = YES;
+        if (gNFBLogRecording) NFBLogEvent(@"guideColumn: construct failed (nil/no view)");
+        return nil;
+    }
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:guide];
+    [nav loadViewIfNeeded];
+    gNFBColumnsGuideVC = guide;
+    gNFBColumnsGuideNav = nav;
+    if (gNFBLogRecording) {
+        UIScrollView *sv = nfb_mainScrollViewOf(guide);
+        NFBLogEvent([NSString stringWithFormat:@"guideColumn: OK %@ kids=%lu scroll=%@ content=%.0fx%.0f",
+            NSStringFromClass(guide.class), (unsigned long)guide.childViewControllers.count,
+            sv ? NSStringFromClass(sv.class) : @"-", sv ? sv.contentSize.width : 0.0, sv ? sv.contentSize.height : 0.0]);
+    }
+    return nav;
+}
+
 static BOOL nfb_searchColumnVCUsableForCurrentSplit(UIViewController *paging, UIScrollView *nativeScrollView, UIView *searchView) {
     if (!paging || !nativeScrollView || !searchView) return NO;
     if (searchView.superview == nativeScrollView) return YES;   // already transplanted; do not chase a resizing split.
@@ -2984,14 +3056,16 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     UIScrollView *nativeScrollView = nfb_horizontalPagingScrollViewOf(paging);
     if (!nativeScrollView) return;
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
-    UIViewController *searchColumnVC = nfb_iPadColumnsSearchSidebarVC(paging);
-    if (searchColumnVC && [searchColumnVC isViewLoaded] && searchColumnVC.view) {
-        if (nfb_searchColumnVCUsableForCurrentSplit(paging, nativeScrollView, searchColumnVC.view)) {
-            nfb_prepareSplitForSearchColumn(paging, nativeScrollView, searchColumnVC.view);
-        } else {
-            searchColumnVC = nil;
-        }
+    // Hide the iPad condensed trends/search secondary pane while columns are active (so it is not a
+    // duplicate of our guide column). We locate it via the trends sidebar VC but no longer use its
+    // view as the column — the column content is a fresh Explore/Guide VC we own (below).
+    UIViewController *trendsSidebarVC = nfb_iPadColumnsSearchSidebarVC(paging);
+    if (trendsSidebarVC && [trendsSidebarVC isViewLoaded] && trendsSidebarVC.view &&
+        nfb_searchColumnVCUsableForCurrentSplit(paging, nativeScrollView, trendsSidebarVC.view)) {
+        nfb_prepareSplitForSearchColumn(paging, nativeScrollView, trendsSidebarVC.view);
     }
+    UIViewController *searchColumnVC = nfb_columnsGuideController();
+    BOOL searchColumnOwned = (searchColumnVC != nil);   // we constructed it → needs containment + no subview-refit
 
     UIView *host = nfb_columnsHostViewForPaging(paging);
     CGRect bounds = nativeScrollView.bounds;
@@ -3077,20 +3151,25 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         idx++;
     }
 
-    // Far-right search column (iPad): transplant the app-split trends/search sidebar's view into
-    // the horizontal scroll at columnWidth*pages.count. Re-applied every layout pass so the split
-    // cannot reclaim it; fully restored when columns mode turns off. Containment is untouched.
+    // Far-right search column (iPad): place our owned Explore/Guide nav's view into the horizontal
+    // scroll at columnWidth*pages.count. Re-applied every layout pass; adopted as a child of paging
+    // for a real appearance lifecycle; detached + view removed when columns mode turns off.
     if (searchColumnVC && [searchColumnVC isViewLoaded] && searchColumnVC.view) {
         UIView *searchView = searchColumnVC.view;
-        UIView *secondaryHost = (searchView.superview != nativeScrollView) ? nfb_enclosingAppSplitHostView(searchView) : nil;
-        nfb_rememberColumnOriginalViewState(searchView);
+        // The owned guide view is fully managed by us (frame set every pass, removed on restore) so we
+        // do NOT remember/restore its state — its first-seen superview is nil, which would defeat the
+        // remember guard and later re-add it to the scroll on restore. Only the borrowed trends view
+        // (real original superview) uses the remember/restore round-trip.
+        if (!searchColumnOwned) nfb_rememberColumnOriginalViewState(searchView);
         gNFBColumnsSearchColumnView = searchView;
         gNFBColumnsSearchColumnController = searchColumnVC;
-        if (searchView.superview != nativeScrollView) [nativeScrollView addSubview:searchView];
-        if (secondaryHost) {
-            nfb_rememberColumnOriginalViewState(secondaryHost);
-            gNFBColumnsSecondaryHostView = secondaryHost;
+        // We own the guide nav → adopt it as a child so it gets a real appearance lifecycle and loads
+        // its content (segmented Explore). (The old borrowed trends sidebar left containment with the split.)
+        if (searchColumnOwned && searchColumnVC.parentViewController == nil) {
+            [paging addChildViewController:searchColumnVC];
+            [searchColumnVC didMoveToParentViewController:paging];
         }
+        if (searchView.superview != nativeScrollView) [nativeScrollView addSubview:searchView];
         UIView *hiddenHost = gNFBColumnsSecondaryHostView;
         if (hiddenHost) {
             hiddenHost.hidden = YES;
@@ -3099,10 +3178,14 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         searchView.hidden = NO;
         searchView.alpha = 1.0;
         searchView.frame = CGRectMake(columnWidth * pages.count, 0.0, columnWidth, height);
-        searchView.bounds = CGRectMake(0.0, 0.0, columnWidth, height);
-        searchView.clipsToBounds = YES;
-        searchView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
-        nfb_fitSearchColumnSubviewTree(searchView, columnWidth, height, 0);
+        searchView.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleWidth;
+        // The owned guide nav lays out its own 340pt content; only the borrowed trends sidebar (wide
+        // secondary-pane layout) needed manual refitting/clipping.
+        if (!searchColumnOwned) {
+            searchView.bounds = CGRectMake(0.0, 0.0, columnWidth, height);
+            searchView.clipsToBounds = YES;
+            nfb_fitSearchColumnSubviewTree(searchView, columnWidth, height, 0);
+        }
         [searchView setNeedsLayout];
         if (!columnsScrollDragging) [searchView layoutIfNeeded];
         if (gNFBLogRecording) {
@@ -3373,7 +3456,17 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     BOOL wasApplied = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) != nil;
     if (!wasApplied) return;
 
-    // Return the transplanted iPad search column to its app-split secondary pane.
+    // Detach the owned guide nav from the paging controller and remove its view; keep the cached
+    // instance for reuse on the next columns-open (avoids reconstructing + re-running the crash-guarded
+    // init). The condensed secondary pane it replaced is un-hidden below.
+    UINavigationController *guideNav = gNFBColumnsGuideNav;
+    if (guideNav) {
+        if (guideNav.parentViewController) {
+            [guideNav willMoveToParentViewController:nil];
+            [guideNav removeFromParentViewController];
+        }
+        [guideNav.view removeFromSuperview];
+    }
     UIView *searchColumnView = gNFBColumnsSearchColumnView;
     if (searchColumnView) {
         nfb_restoreColumnOriginalViewState(searchColumnView);
