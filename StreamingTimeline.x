@@ -40,6 +40,7 @@ static void nfb_appendCoveringViewsDiag(NSMutableString *s);
 static void nfb_appendGestureDiag(NSMutableString *s);
 static void nfb_appendSpacesCandidatesDiag(NSMutableString *s);
 static void nfb_appendExploreDiscoveryDiag(NSMutableString *s);
+static void nfb_appendGuideClassDiag(NSMutableString *s);
 static void nfb_appendSearchChromeDiag(NSMutableString *s);
 static void nfb_appendSavedColumnsChromeDiag(NSMutableString *s);
 static NSString *nfb_diagShortString(NSString *value, NSUInteger maxLen);
@@ -4059,6 +4060,47 @@ static void nfb_appendVCTreeDiag(NSMutableString *s, UIViewController *vc, int d
     }
 }
 
+// Dump the initializer + class(factory) methods + superclass chain of a class, so we can decide how
+// to SAFELY construct a fresh Explore/Guide VC for the search column. A Swift VC has a designated
+// initializer; calling the wrong one (e.g. bare alloc/init when it requires a view model) is a hard
+// fatalError crash that @try cannot catch — so we must read the real init/factory before building it.
+static void nfb_appendInitAndClassMethods(NSMutableString *s, Class c) {
+    if (!c) return;
+    NSMutableString *chain = [NSMutableString string];
+    Class sup = c;
+    for (int i = 0; i < 8 && sup; i++) { [chain appendFormat:@" %@", NSStringFromClass(sup)]; sup = class_getSuperclass(sup); }
+    [s appendFormat:@"  super:%@\n", chain];
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(c, &n);
+    NSMutableArray<NSString *> *inits = [NSMutableArray array];
+    for (unsigned int i = 0; i < n; i++) {
+        NSString *sel = NSStringFromSelector(method_getName(ms[i]));
+        if ([sel hasPrefix:@"init"]) [inits addObject:sel];
+    }
+    if (ms) free(ms);
+    [s appendFormat:@"  init(inst): %@\n", inits.count ? [inits componentsJoinedByString:@" "] : @"(none-on-this-class)"];
+    unsigned int cn = 0;
+    Method *cms = class_copyMethodList(object_getClass(c), &cn);
+    NSMutableArray<NSString *> *factories = [NSMutableArray array];
+    for (unsigned int i = 0; i < cn; i++) [factories addObject:NSStringFromSelector(method_getName(cms[i]))];
+    if (cms) free(cms);
+    [s appendFormat:@"  class(factory): %@\n", factories.count ? [factories componentsJoinedByString:@" "] : @"(none)"];
+}
+
+static void nfb_appendGuideClassDiag(NSMutableString *s) {
+    [s appendString:@"--- guideClassDiag ---\n"];
+    NSArray<NSString *> *names = @[ @"T1TwitterSwift.GuideContainerViewController",
+                                    @"T1TwitterSwift_GuideContainerViewController",
+                                    @"T1TwitterSwift.TrendsSidebarViewController",
+                                    @"T1TwitterSwift_TrendsSidebarViewController",
+                                    @"T1ExtendedContentNavigationController" ];
+    for (NSString *name in names) {
+        Class c = NSClassFromString(name);
+        [s appendFormat:@"guideClass %@ = %@\n", name, c ? @"FOUND" : @"nil"];
+        if (c) nfb_appendInitAndClassMethods(s, c);
+    }
+}
+
 static void nfb_appendExploreDiscoveryDiag(NSMutableString *s) {
     [s appendString:@"--- vcTree (explore discovery) ---\n"];
     NSInteger count = 0;
@@ -4306,6 +4348,7 @@ static NSString *nfb_buildDiagnosticReport(void) {
     nfb_appendGestureDiag(s);
     nfb_appendSpacesCandidatesDiag(s);
     nfb_appendExploreDiscoveryDiag(s);
+    nfb_appendGuideClassDiag(s);
     nfb_dumpTree(nfb_homeRoot(active), 0, s);
     return s;
 }
