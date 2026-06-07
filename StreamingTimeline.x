@@ -42,6 +42,7 @@ static void nfb_appendSpacesCandidatesDiag(NSMutableString *s);
 static void nfb_appendExploreDiscoveryDiag(NSMutableString *s);
 static void nfb_appendGuideClassDiag(NSMutableString *s);
 static void nfb_appendTabFactoryDiag(NSMutableString *s);
+static UIViewController *nfb_findVCByClassSubstring(UIViewController *root, NSString *sub, int depth);
 static void nfb_appendSearchChromeDiag(NSMutableString *s);
 static void nfb_appendSavedColumnsChromeDiag(NSMutableString *s);
 static NSString *nfb_diagShortString(NSString *value, NSUInteger maxLen);
@@ -1559,6 +1560,17 @@ static BOOL gInlineColumnsNeedsInitialOffsetReset = NO;
 // only move the view and restore it when columns mode turns off. Weak: the split owns it.
 static __weak UIView *gNFBColumnsSearchColumnView = nil;
 static __weak UIViewController *gNFBColumnsSearchColumnController = nil;
+// iPad search column preferred content = the segmented Explore tab
+// (T1TwitterSwift.GuideContainerViewController: キーワード検索 + おすすめ/トレンド/ニュース/スポーツ).
+// Fresh alloc/init crashes (needs DI), so we BORROW it from Twitter's own tab factory
+// (TFNTabbedViewController.dataSource -tabbedViewController:viewControllerAtIndex:), which builds a
+// fully DI'd instance. We layer it over the trends column (which already empties+hides the iPad
+// secondary pane and is the automatic fallback if the borrow is unavailable). Strong: we own the
+// fresh instance. See [[neofreebird-liquidglass-and-open-bugs]].
+static UIViewController *gNFBColumnsGuideHost = nil;             // fresh DI'd guide nav we own
+static __weak UIViewController *gNFBColumnsGuideContentVC = nil; // the GuideContainerViewController inside it
+static BOOL gNFBColumnsGuideBorrowFailed = NO;
+static BOOL gNFBColumnsGuideContentReady = NO;  // latched once the borrowed guide loads content (Codex guard: only surface it after content-load success; until then the trends fallback stays on top)
 // User chose "remove the right pane + move search into a column": we also hide the app-split
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
 // panel. Captured from the search view's ancestor chain before transplant; un-hidden on restore.
@@ -2816,6 +2828,95 @@ static UIView *nfb_enclosingAppSplitHostView(UIView *view) {
     return nil;
 }
 
+// Is vc, or something it contains (nav stack / child VCs, shallow), a GuideContainerViewController?
+static UIViewController *nfb_guideWithin(UIViewController *vc, int depth) {
+    if (!vc || depth > 4) return nil;
+    if ([NSStringFromClass(vc.class) containsString:@"GuideContainerViewController"]) return vc;
+    if ([vc isKindOfClass:UINavigationController.class]) {
+        for (UIViewController *c in [(UINavigationController *)vc viewControllers]) {
+            UIViewController *g = nfb_guideWithin(c, depth + 1);
+            if (g) return g;
+        }
+    }
+    for (UIViewController *c in vc.childViewControllers) {
+        UIViewController *g = nfb_guideWithin(c, depth + 1);
+        if (g) return g;
+    }
+    return nil;
+}
+
+// Borrow a fully dependency-injected Explore/Guide VC from Twitter's tab factory. We find the guide
+// tab index via the container's -viewControllerAtIndex:, then ask the dataSource
+// -tabbedViewController:viewControllerAtIndex: for a SEPARATE instance and (per Codex's guards) only
+// use it if it is (a) non-nil, (b) parentless, and (c) NOT the same object as the container's cached
+// guide — so we never reparent/corrupt the live tab. Build-stamped crash guard around the factory
+// calls. Cached once obtained. iPad only; returns nil (→ trends fallback) on any doubt.
+static UIViewController *nfb_columnsBorrowGuideHost(UIViewController *paging) {
+    if (gNFBColumnsGuideHost) return gNFBColumnsGuideHost;
+    if (gNFBColumnsGuideBorrowFailed) return nil;
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return nil;
+    UIWindow *kw = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) { if (w.isKeyWindow) { kw = w; break; } }
+    UIViewController *tabbed = nfb_findVCByClassSubstring(kw.rootViewController, @"TFNTabbedViewController", 0);
+    if (!tabbed) { gNFBColumnsGuideBorrowFailed = YES; return nil; }
+    SEL numSel = @selector(numberOfViewControllers);
+    SEL atIdxSel = @selector(viewControllerAtIndex:);
+    SEL dsSel = @selector(tabbedViewController:viewControllerAtIndex:);
+    if (![tabbed respondsToSelector:numSel] || ![tabbed respondsToSelector:atIdxSel]) { gNFBColumnsGuideBorrowFailed = YES; return nil; }
+    id dataSource = nil;
+    @try { dataSource = [tabbed valueForKey:@"dataSource"]; } @catch (NSException *e) { dataSource = nil; }
+    if (!dataSource || ![dataSource respondsToSelector:dsSel]) { gNFBColumnsGuideBorrowFailed = YES; return nil; }
+
+    // Build-stamped crash guard: a hard crash in the factory calls leaves the in-flight stamp; the next
+    // launch promotes it to a crashed stamp and stops trying for this build (trends fallback stays).
+    NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
+    NSInteger kBorrowBuild = 21;
+    if ([defs integerForKey:@"NFBColumnsGuideBorrowCrashedBuild"] == kBorrowBuild) {
+        gNFBColumnsGuideBorrowFailed = YES;
+        if (gNFBLogRecording) NFBLogEvent(@"guideBorrow: skip (this build crashed borrowing before)");
+        return nil;
+    }
+    if ([defs integerForKey:@"NFBColumnsGuideBorrowInFlightBuild"] == kBorrowBuild) {
+        [defs setInteger:kBorrowBuild forKey:@"NFBColumnsGuideBorrowCrashedBuild"]; [defs synchronize];
+        gNFBColumnsGuideBorrowFailed = YES;
+        if (gNFBLogRecording) NFBLogEvent(@"guideBorrow: prior attempt crashed; disabling for this build");
+        return nil;
+    }
+    [defs setInteger:kBorrowBuild forKey:@"NFBColumnsGuideBorrowInFlightBuild"]; [defs synchronize];
+
+    UIViewController *host = nil; UIViewController *guide = nil;
+    @try {
+        NSUInteger count = ((NSUInteger (*)(id, SEL))objc_msgSend)((id)tabbed, numSel);
+        NSInteger guideIdx = -1; UIViewController *containerVC = nil;
+        for (NSUInteger i = 0; i < count && i < 12; i++) {
+            UIViewController *vc = ((id (*)(id, SEL, NSUInteger))objc_msgSend)((id)tabbed, atIdxSel, i);
+            if (nfb_guideWithin(vc, 0)) { guideIdx = (NSInteger)i; containerVC = vc; break; }
+        }
+        if (guideIdx >= 0) {
+            UIViewController *fresh = ((id (*)(id, SEL, id, NSUInteger))objc_msgSend)(dataSource, dsSel, (id)tabbed, (NSUInteger)guideIdx);
+            UIViewController *g = nfb_guideWithin(fresh, 0);
+            BOOL usable = (fresh && g && fresh.parentViewController == nil && fresh != containerVC);
+            if (usable) { host = fresh; guide = g; }
+            else if (gNFBLogRecording) {
+                NFBLogEvent([NSString stringWithFormat:@"guideBorrow: unusable fresh=%@ parent=%d sameAsContainer=%d g=%d",
+                    fresh ? NSStringFromClass(fresh.class) : @"nil", fresh.parentViewController ? 1 : 0,
+                    (fresh == containerVC) ? 1 : 0, g ? 1 : 0]);
+            }
+        } else if (gNFBLogRecording) {
+            NFBLogEvent([NSString stringWithFormat:@"guideBorrow: guide tab not found (count=%lu)", (unsigned long)count]);
+        }
+    } @catch (NSException *e) { host = nil; }
+
+    [defs removeObjectForKey:@"NFBColumnsGuideBorrowInFlightBuild"]; [defs synchronize];
+
+    if (!host) { gNFBColumnsGuideBorrowFailed = YES; return nil; }
+    [host loadViewIfNeeded];
+    gNFBColumnsGuideHost = host;
+    gNFBColumnsGuideContentVC = guide;
+    if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"guideBorrow: OK host=%@ guide=%@", NSStringFromClass(host.class), NSStringFromClass(guide.class)]);
+    return host;
+}
+
 static BOOL nfb_searchColumnVCUsableForCurrentSplit(UIViewController *paging, UIScrollView *nativeScrollView, UIView *searchView) {
     if (!paging || !nativeScrollView || !searchView) return NO;
     if (searchView.superview == nativeScrollView) return YES;   // already transplanted; do not chase a resizing split.
@@ -3118,6 +3219,56 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
                 text ?: @"-"];
             if (![k isEqualToString:lastSearchColKey]) { lastSearchColKey = [k copy]; NFBLogEvent(k); }
         }
+
+        // Preferred content: layer the borrowed segmented Explore (Guide) over the trends column slot.
+        // The trends transplant above already emptied + hid the iPad secondary pane and reserved the
+        // column; the trends view stays as the proven fallback. We adopt the freshly DI'd guide as a
+        // child of paging for a real appearance lifecycle, place its view in the same slot, and (Codex
+        // guard) keep the trends view ON TOP until the guide actually loads content — then bring the
+        // guide to front. So the user never sees an empty guide, and a guide that never loads silently
+        // stays on the trends fallback.
+        UIViewController *guideHost = nfb_columnsBorrowGuideHost(paging);
+        if (guideHost && [guideHost isViewLoaded] && guideHost.view) {
+            UIView *guideView = guideHost.view;
+            if (guideHost.parentViewController == nil) {
+                [paging addChildViewController:guideHost];
+                [guideHost didMoveToParentViewController:paging];
+            }
+            // Codex guard: if the guide ever gets reparented elsewhere, abandon it (stay on trends).
+            if (guideHost.parentViewController && guideHost.parentViewController != paging) {
+                [guideView removeFromSuperview];
+                gNFBColumnsGuideBorrowFailed = YES;
+                gNFBColumnsSearchColumnView.hidden = NO;
+                if (gNFBLogRecording) NFBLogEvent(@"guideColumn: abandoned (reparented elsewhere)");
+            } else {
+                if (guideView.superview != nativeScrollView) [nativeScrollView addSubview:guideView];
+                guideView.hidden = NO;
+                guideView.alpha = 1.0;
+                guideView.frame = CGRectMake(columnWidth * pages.count, 0.0, columnWidth, height);
+                guideView.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleWidth;
+                UIScrollView *gs = nfb_mainScrollViewOf(guideHost);
+                if (gs && gs.contentSize.height > 60.0) gNFBColumnsGuideContentReady = YES;
+                UIView *trendsView = gNFBColumnsSearchColumnView;
+                if (gNFBColumnsGuideContentReady) {
+                    if (trendsView) trendsView.hidden = YES;
+                    [nativeScrollView bringSubviewToFront:guideView];
+                } else {
+                    // guide still loading → keep it visible (so it DOES load) but behind the trends view
+                    if (trendsView) { trendsView.hidden = NO; [nativeScrollView bringSubviewToFront:trendsView]; }
+                }
+                [guideView setNeedsLayout];
+                if (!columnsScrollDragging) [guideView layoutIfNeeded];
+                if (gNFBLogRecording) {
+                    static NSString *lastGuideColKey = nil;
+                    NSString *k = [NSString stringWithFormat:@"guideColumn host=%@ ready=%d x=%.0f w=%.0f content=%.0fx%.0f text=%@",
+                        NSStringFromClass(guideHost.class), gNFBColumnsGuideContentReady ? 1 : 0,
+                        columnWidth * pages.count, columnWidth,
+                        gs ? gs.contentSize.width : 0.0, gs ? gs.contentSize.height : 0.0,
+                        nfb_diagTextForView(guideView, 64) ?: @"-"];
+                    if (![k isEqualToString:lastGuideColKey]) { lastGuideColKey = [k copy]; NFBLogEvent(k); }
+                }
+            }
+        }
     }
     // On iPad the pager only loads the current page, so the off-screen pinned-list columns stay
     // empty (contentSize.height==0 → blank columns = "only 1 column"). Keep nudging the pager to
@@ -3374,6 +3525,18 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     BOOL wasApplied = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) != nil;
     if (!wasApplied) return;
 
+    // Detach the borrowed guide (we own it) from the paging controller + remove its view; keep the
+    // cached instance for reuse on the next columns-open. Reset the content-ready latch so it re-proves
+    // itself (the view tree is torn down on detach).
+    UIViewController *guideHost = gNFBColumnsGuideHost;
+    if (guideHost) {
+        if (guideHost.parentViewController) {
+            [guideHost willMoveToParentViewController:nil];
+            [guideHost removeFromParentViewController];
+        }
+        [guideHost.view removeFromSuperview];
+    }
+    gNFBColumnsGuideContentReady = NO;
     // Return the transplanted iPad search column to its app-split secondary pane.
     UIView *searchColumnView = gNFBColumnsSearchColumnView;
     if (searchColumnView) {
