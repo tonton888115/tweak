@@ -1580,6 +1580,7 @@ static BOOL gNFBExtendedContentRemoved = NO;        // we've decided about remov
 static BOOL gNFBExtendedContentActuallyRemoved = NO; // private_removeExtendedContentViewController actually ran → ONLY then may we call add (Codex: avoid unbalanced add)
 static UIViewController *gNFBExtRemovedSplit = nil;  // strong: the split we removed the rail from, kept alive until restore so the rail is never abandoned (Codex). Cleared (released) on restore. The app-split is long-lived so this is plain ownership, not a cycle.
 static BOOL gNFBExtRemoveScheduled = NO;   // a one-shot deferred remove is queued (Codex: don't remove during the layout pass)
+static NSArray<UIView *> *gNFBColumnsExpandedWidthViews = nil; // content ancestors widened after rail removal; restored on columns-off
 // User chose "remove the right pane + move search into a column": we also hide the app-split
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
 // panel. Captured from the search view's ancestor chain before transplant; un-hidden on restore.
@@ -2617,6 +2618,51 @@ static void nfb_restoreColumnOriginalViewState(UIView *view) {
     objc_setAssociatedObject(view, &kNFBColumnsOriginalClipsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static void nfb_expandColumnsPrimaryWidthIfNeeded(UIScrollView *nativeScrollView) {
+    if (!nativeScrollView || UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return;
+    if (!gNFBExtendedContentRemoved) return;
+
+    CGFloat currentWidth = nativeScrollView.bounds.size.width;
+    CGFloat targetWidth = currentWidth;
+    NSMutableArray<UIView *> *chain = [NSMutableArray array];
+    for (UIView *view = nativeScrollView; view && ![view isKindOfClass:UIWindow.class] && chain.count < 10; view = view.superview) {
+        [chain addObject:view];
+        CGFloat w = view.bounds.size.width;
+        if (isfinite(w) && w > targetWidth && w < 2400.0) targetWidth = w;
+    }
+    if (targetWidth < currentWidth + 120.0) return;
+
+    NSMutableArray<UIView *> *expanded = [NSMutableArray array];
+    CGFloat scrollHeight = nativeScrollView.bounds.size.height;
+    for (UIView *view in chain) {
+        if (!view.superview) continue;
+        NSString *cls = NSStringFromClass(view.class);
+        if ([cls containsString:@"NavigationBar"] || [cls containsString:@"TabBar"]) continue;
+        CGRect f = view.frame;
+        BOOL fullHeight = f.size.height >= scrollHeight - 8.0 || view.bounds.size.height >= scrollHeight - 8.0;
+        BOOL startsAtContentLeft = fabs(f.origin.x) <= 1.0 || view == nativeScrollView;
+        if (!fullHeight || !startsAtContentLeft) continue;
+        if (f.size.width < targetWidth - 1.0) {
+            nfb_rememberColumnOriginalViewState(view);
+            f.size.width = targetWidth;
+            view.frame = f;
+            CGRect b = view.bounds;
+            b.size.width = targetWidth;
+            view.bounds = b;
+            view.autoresizingMask |= UIViewAutoresizingFlexibleWidth;
+            [view setNeedsLayout];
+            [expanded addObject:view];
+        }
+    }
+    if (expanded.count) {
+        gNFBColumnsExpandedWidthViews = [expanded copy];
+        if (gNFBLogRecording) {
+            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b27] from=%.1f to=%.1f views=%lu",
+                currentWidth, targetWidth, (unsigned long)expanded.count]);
+        }
+    }
+}
+
 static void nfb_restoreColumnScrollAdjustmentForPage(UIViewController *page) {
     if (!page || ![page isViewLoaded]) return;
     UIScrollView *sv = nfb_mainScrollViewOf(page);
@@ -2963,25 +3009,25 @@ static UIViewController *nfb_columnsAppSplitForPaging(UIViewController *paging) 
 // this build, so the app self-recovers). Idempotent via gNFBExtendedContentRemoved.
 static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL removed) {
     NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
-    static NSInteger const kExtBuild = 26;
+    static NSInteger const kExtBuild = 27;
     if (removed) {
         if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) {
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: skip notPad"); return;
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b27]: skip notPad"); return;
         }
-        if (gNFBExtendedContentRemoved) { if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: alreadyRemoved"); return; }
+        if (gNFBExtendedContentRemoved) { if (gNFBLogRecording) NFBLogEvent(@"extContent[b27]: alreadyRemoved"); return; }
         UIViewController *split = nfb_columnsAppSplitForPaging(paging);
-        if (!split) { if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: splitNil paging=%@", paging ? NSStringFromClass(paging.class) : @"nil"]); return; }
+        if (!split) { if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b27]: splitNil paging=%@", paging ? NSStringFromClass(paging.class) : @"nil"]); return; }
         // Decision paths below set gNFBExtendedContentRemoved (so we stop trying / stop showing trends)
         // but NOT gNFBExtendedContentActuallyRemoved — the latter is set ONLY when the private remove
         // really runs, so restore never calls add on a rail we never removed (Codex).
-        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: noSidebar (nothing to remove)"); return; }
+        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b27]: noSidebar (nothing to remove)"); return; }
         SEL sel = @selector(private_removeExtendedContentViewController);
-        if (![split respondsToSelector:sel]) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: noSelector on %@", NSStringFromClass(split.class)]); return; }
-        if ([defs integerForKey:@"NFBExtContentCrashedBuild"] == kExtBuild) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: skip (crashed before this build)"); return; }
+        if (![split respondsToSelector:sel]) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b27]: noSelector on %@", NSStringFromClass(split.class)]); return; }
+        if ([defs integerForKey:@"NFBExtContentCrashedBuild"] == kExtBuild) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b27]: skip (crashed before this build)"); return; }
         if ([defs integerForKey:@"NFBExtContentInFlightBuild"] == kExtBuild) {
             [defs setInteger:kExtBuild forKey:@"NFBExtContentCrashedBuild"]; [defs synchronize];
             gNFBExtendedContentRemoved = YES;
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: prior remove crashed; disabled this build");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b27]: prior remove crashed; disabled this build");
             return;
         }
         [defs setInteger:kExtBuild forKey:@"NFBExtContentInFlightBuild"]; [defs synchronize];
@@ -2993,16 +3039,16 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
             gNFBExtendedContentActuallyRemoved = YES;   // ONLY on a throw-free remove — guards the add on restore
             gNFBExtRemovedSplit = split;                 // remember the exact split for a paging-independent restore
             [split.viewIfLoaded setNeedsLayout];   // re-flow the split on its own (nil-safe; no forced load, no layoutIfNeeded)
-            if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
+            if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b27]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
         } else {
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: remove threw (not marked removed)");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b27]: remove threw (not marked removed)");
         }
     } else {
         // Restore. Only re-add if we actually removed; use the stored split so this works even when
         // paging is unavailable (e.g., disabled via a path that can't resolve the home pager).
         if (!gNFBExtendedContentActuallyRemoved) {
             gNFBExtendedContentRemoved = NO; gNFBExtRemoveScheduled = NO; gNFBExtRemovedSplit = nil;
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: restoreSkipped (never actually removed)");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b27]: restoreSkipped (never actually removed)");
             return;
         }
         // Stale-split guard (Codex re-audit#3/#4): the app-split can be torn down and rebuilt
@@ -3023,9 +3069,9 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
         if (split && [split respondsToSelector:sel]) {
             @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
             [split.viewIfLoaded setNeedsLayout];
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: restored");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b27]: restored");
         } else if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: restore noop (stale/rebuilt split stored=%@ live=%@)",
+            NFBLogEvent([NSString stringWithFormat:@"extContent[b27]: restore noop (stale/rebuilt split stored=%@ live=%@)",
                          stored ? @"y" : @"n", liveSplit ? @"y" : @"n"]);
         }
         gNFBExtendedContentActuallyRemoved = NO;
@@ -3220,7 +3266,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
             gNFBExtRemoveScheduled = NO;
         });
     }
-    // Build 26 scope: confirm deployment (layout[b26] marker) + the width fix (rail removal) ONLY.
+    // Build 27 scope: confirm deployment (layout[b27] marker) + the width fix (rail removal) ONLY.
     // No search column this build — the trends transplant crashed on trend-tap, and hosting the borrowed
     // guide is deferred until width + deployment are confirmed (and Codex flagged hosting risks). On
     // iPad we always schedule the rail removal, so the trends branch below never runs there (gated on
@@ -3240,6 +3286,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     }
 
     UIView *host = nfb_columnsHostViewForPaging(paging);
+    nfb_expandColumnsPrimaryWidthIfNeeded(nativeScrollView);
     CGRect bounds = nativeScrollView.bounds;
     if (bounds.size.width < 120.0 || bounds.size.height < 240.0) return;
     CGFloat columnWidth = nfb_columnsColumnWidth(bounds.size.width);
@@ -3463,7 +3510,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b26] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b27] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -3713,6 +3760,11 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
         nfb_restoreColumnOriginalViewState(view);
     }
     gNFBColumnsSuppressedSplitViews = nil;
+    NSArray<UIView *> *expandedViews = gNFBColumnsExpandedWidthViews;
+    for (UIView *view in expandedViews) {
+        nfb_restoreColumnOriginalViewState(view);
+    }
+    gNFBColumnsExpandedWidthViews = nil;
 
     NSNumber *pagingEnabled = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey);
     NSNumber *bounceH = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsBounceHKey);
