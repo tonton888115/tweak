@@ -2992,7 +2992,7 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
         if (removeOK) {
             gNFBExtendedContentActuallyRemoved = YES;   // ONLY on a throw-free remove — guards the add on restore
             gNFBExtRemovedSplit = split;                 // remember the exact split for a paging-independent restore
-            [split setNeedsLayout];   // Codex: let the split re-flow on its own; do NOT force layout here
+            [split.viewIfLoaded setNeedsLayout];   // re-flow the split on its own (nil-safe; no forced load, no layoutIfNeeded)
             if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
         } else {
             if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: remove threw (not marked removed)");
@@ -3022,7 +3022,7 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
         SEL sel = @selector(private_addExtendedContentViewController);
         if (split && [split respondsToSelector:sel]) {
             @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
-            [split setNeedsLayout];
+            [split.viewIfLoaded setNeedsLayout];
             if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: restored");
         } else if (gNFBLogRecording) {
             NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: restore noop (stale/rebuilt split stored=%@ live=%@)",
