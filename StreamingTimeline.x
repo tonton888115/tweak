@@ -3005,17 +3005,30 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
             if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: restoreSkipped (never actually removed)");
             return;
         }
-        UIViewController *split = gNFBExtRemovedSplit ?: nfb_columnsAppSplitForPaging(paging);
+        // Stale-split identity guard (Codex re-audit#3): the app-split can be torn down and rebuilt
+        // (rotation, multitasking, scene changes). After a rebuild the stored reference is stale —
+        // it points at a detached split, while the freshly rebuilt live split already owns its own
+        // rail. Re-add ONLY to the exact split we removed from, and only while it is still live
+        // (attached to a window). Otherwise drop the stale reference and clear flags (no double-add,
+        // no add on a dead split); state self-heals on the next columns on/off cycle.
+        UIViewController *stored = gNFBExtRemovedSplit;
+        UIViewController *liveSplit = nfb_columnsAppSplitForPaging(paging);
+        BOOL storedIsLive = stored && stored.viewIfLoaded.window != nil &&
+                            (liveSplit == nil || liveSplit == stored);
+        UIViewController *split = storedIsLive ? stored : nil;
         SEL sel = @selector(private_addExtendedContentViewController);
         if (split && [split respondsToSelector:sel]) {
             @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
             [split setNeedsLayout];
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: restored");
+        } else if (gNFBLogRecording) {
+            NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: restore noop (stale/rebuilt split stored=%@ live=%@)",
+                         stored ? @"y" : @"n", liveSplit ? @"y" : @"n"]);
         }
         gNFBExtendedContentActuallyRemoved = NO;
         gNFBExtendedContentRemoved = NO;
         gNFBExtRemoveScheduled = NO;
         gNFBExtRemovedSplit = nil;
-        if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: restored");
     }
 }
 
