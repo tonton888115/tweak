@@ -53,6 +53,17 @@ extern NSString *BHTColumnsLogFlags(void);          // columns flags + tab selec
 static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void);
 static NSArray<UIViewController *> *nfb_currentColumnRefreshControllers(void);
 static NSArray<UIViewController *> *nfb_allHomePagingTimelinePages(UIViewController *paging);
+// Column management (reorder / show-hide / persist) — implemented near nfb_currentColumnTimelinePages.
+static NSArray<UIViewController *> *nfb_eligibleColumnPagesAll(void);
+static NSString *nfb_columnDisplayName(UIViewController *page);
+static NSString *nfb_columnTimelineIdentity(UIViewController *vc);
+static NSSet<NSString *> *nfb_columnsHiddenSet(void);
+static void nfb_columnsSetHidden(NSString *identity, BOOL hidden);
+static void nfb_columnsMove(NSString *identity, NSInteger delta, NSArray<NSString *> *currentOrderIdentities);
+static void nfb_layoutActiveHomePaging(void);
+// Issue C: hide the iPad home logo/nav bar while columns are at root. Pref-gated, restored on detail push / exit.
+static void nfb_applyColumnsLogoBarHidden(UIViewController *paging);
+static void nfb_restoreColumnsLogoBar(void);
 static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc);
 static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging);
 static void nfb_requestColumnsPagingPreload(UIViewController *paging, BOOL aggressive);
@@ -1099,6 +1110,14 @@ NSString *NFBLogSavedFileContents(void) {
     [ac addAction:[UIAlertAction actionWithTitle:@"🔄 今すぐ更新" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamTrigger(vc); }]];
     if (gInlineColumnsEnabled) {
         [ac addAction:[UIAlertAction actionWithTitle:@"⬆︎ 全カラムを上へ移動" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_revealAllColumnTops(); }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"📐 カラム管理（並び替え・表示）…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showColumnsManage]; }]];
+        BOOL logoHidden = ([NSUserDefaults.standardUserDefaults objectForKey:@"NFBHideColumnsLogoBar"] == nil) ? YES : [NSUserDefaults.standardUserDefaults boolForKey:@"NFBHideColumnsLogoBar"];
+        [ac addAction:[UIAlertAction actionWithTitle:(logoHidden ? @"上部ロゴバーを表示する" : @"上部ロゴバーを隠す") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+            [NSUserDefaults.standardUserDefaults setBool:!logoHidden forKey:@"NFBHideColumnsLogoBar"];
+            [NSUserDefaults.standardUserDefaults synchronize];
+            if (logoHidden) nfb_restoreColumnsLogoBar();   // was hiding → user turned it OFF → show again now
+            nfb_layoutActiveHomePaging();
+        }]];
     }
     [ac addAction:[UIAlertAction actionWithTitle:(on ? @"自動更新を OFF にする" : @"自動更新を ON にする") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_setStreamEnabled(!on); UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamStart(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:(gInlineColumnsEnabled ? @"カラムモードを OFF にする" : @"カラムモードを ON にする") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
@@ -1138,6 +1157,46 @@ NSString *NFBLogSavedFileContents(void) {
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"診断情報" message:s preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"コピー" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIPasteboard.generalPasteboard.string = s; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:ac];
+}
+- (void)showColumnsManage {
+    NSArray<UIViewController *> *pages = nfb_eligibleColumnPagesAll();
+    NSSet<NSString *> *hidden = nfb_columnsHiddenSet();
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"カラム管理" message:@"カラムを選ぶと 移動／表示切替 できます。" preferredStyle:UIAlertControllerStyleActionSheet];
+    NSUInteger i = 0;
+    for (UIViewController *p in pages) {
+        NSString *ident = nfb_columnTimelineIdentity(p);
+        NSString *name = nfb_columnDisplayName(p);
+        BOOL isHidden = [hidden containsObject:ident];
+        NSString *title = [NSString stringWithFormat:@"%lu. %@%@", (unsigned long)(i + 1), name, isHidden ? @"（非表示）" : @""];
+        [ac addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showColumnActionsForIdentity:ident name:name]; }]];
+        i++;
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"並び順・表示をリセット" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"NFBColumnsOrderV1"];
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"NFBColumnsHiddenV1"];
+        [NSUserDefaults.standardUserDefaults synchronize];
+        nfb_layoutActiveHomePaging();
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:ac];
+}
+- (void)showColumnActionsForIdentity:(NSString *)ident name:(NSString *)name {
+    NSArray<UIViewController *> *pages = nfb_eligibleColumnPagesAll();
+    NSMutableArray<NSString *> *order = [NSMutableArray array];
+    for (UIViewController *p in pages) [order addObject:nfb_columnTimelineIdentity(p)];
+    NSSet<NSString *> *hidden = nfb_columnsHiddenSet();
+    BOOL isHidden = [hidden containsObject:ident];
+    NSUInteger visibleCount = (pages.count > hidden.count) ? (pages.count - hidden.count) : pages.count;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:name message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"⬅︎ 左へ移動" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_columnsMove(ident, -1, order); nfb_layoutActiveHomePaging(); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"➡︎ 右へ移動" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_columnsMove(ident, +1, order); nfb_layoutActiveHomePaging(); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:(isHidden ? @"このカラムを表示する" : @"このカラムを非表示にする") style:(isHidden ? UIAlertActionStyleDefault : UIAlertActionStyleDestructive) handler:^(UIAlertAction *a){
+        if (!isHidden && visibleCount <= 1) { [self toast:@"最後の1カラムは非表示にできません。"]; return; }
+        nfb_columnsSetHidden(ident, !isHidden);
+        nfb_layoutActiveHomePaging();
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
 - (void)showInterval {
@@ -2682,7 +2741,7 @@ static void nfb_expandColumnsPrimaryWidthIfNeeded(UIScrollView *nativeScrollView
         static BOOL logged = NO;
         if (!logged) {
             logged = YES;
-            NFBLogEvent(@"columnsExpand[b33] disabled (prevent split layout crash)");
+            NFBLogEvent(@"columnsExpand[b34] disabled (prevent split layout crash)");
         }
     }
     return;
@@ -2722,7 +2781,7 @@ static void nfb_expandColumnsPrimaryWidthIfNeeded(UIScrollView *nativeScrollView
         gNFBColumnsExpandLatchFrom = currentWidth;
         gNFBColumnsExpandLatchTo = targetWidth;
         if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b33] latch (stuck gap=%.1f, %.1f->%.1f)",
+            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b34] latch (stuck gap=%.1f, %.1f->%.1f)",
                 gap, currentWidth, targetWidth]);
         }
         return;
@@ -2761,12 +2820,12 @@ static void nfb_expandColumnsPrimaryWidthIfNeeded(UIScrollView *nativeScrollView
         }
         gNFBColumnsExpandedWidthViews = [all copy];
         if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b33] from=%.1f to=%.1f views=%lu",
+            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b34] from=%.1f to=%.1f views=%lu",
                 currentWidth, targetWidth, (unsigned long)expanded.count]);
         }
     } else if (gNFBLogRecording) {
         static NSString *lastColumnsExpandMiss = nil;
-        NSString *miss = [NSString stringWithFormat:@"columnsExpand[b33] miss from=%.1f to=%.1f chain=%lu",
+        NSString *miss = [NSString stringWithFormat:@"columnsExpand[b34] miss from=%.1f to=%.1f chain=%lu",
             currentWidth, targetWidth, (unsigned long)chain.count];
         if (![miss isEqualToString:lastColumnsExpandMiss]) {
             lastColumnsExpandMiss = [miss copy];
@@ -3053,7 +3112,7 @@ static UIViewController *nfb_columnsBorrowGuideHost(UIViewController *paging) {
     // Build-stamped crash guard: a hard crash in the factory calls leaves the in-flight stamp; the next
     // launch promotes it to a crashed stamp and stops trying for this build (trends fallback stays).
     NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
-    NSInteger kBorrowBuild = 33;
+    NSInteger kBorrowBuild = 34;
     if ([defs integerForKey:@"NFBColumnsGuideBorrowCrashedBuild"] == kBorrowBuild) {
         gNFBColumnsGuideBorrowFailed = YES;
         gNFBGuideBorrowReason = @"skip (this build crashed borrowing before)";
@@ -3122,7 +3181,7 @@ static void nfb_kickGuideColumnLoadIfNeeded(UIViewController *guideHost) {
     if (!kicked) kicked = nfb_streamTriggerTarget(guideHost);
     if (gNFBLogRecording) {
         static NSString *lastGuideKickKey = nil;
-        NSString *key = [NSString stringWithFormat:@"guideKick[b33] kicked=%d content=%.0fx%.0f target=%@",
+        NSString *key = [NSString stringWithFormat:@"guideKick[b34] kicked=%d content=%.0fx%.0f target=%@",
             kicked ? 1 : 0,
             sv ? sv.contentSize.width : 0.0, sv ? sv.contentSize.height : 0.0,
             content ? NSStringFromClass(content.class) : NSStringFromClass(guideHost.class)];
@@ -3152,25 +3211,25 @@ static UIViewController *nfb_columnsAppSplitForPaging(UIViewController *paging) 
 // this build, so the app self-recovers). Idempotent via gNFBExtendedContentRemoved.
 static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL removed) {
     NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
-    static NSInteger const kExtBuild = 33;
+    static NSInteger const kExtBuild = 34;
     if (removed) {
         if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) {
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b33]: skip notPad"); return;
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b34]: skip notPad"); return;
         }
-        if (gNFBExtendedContentRemoved) { if (gNFBLogRecording) NFBLogEvent(@"extContent[b33]: alreadyRemoved"); return; }
+        if (gNFBExtendedContentRemoved) { if (gNFBLogRecording) NFBLogEvent(@"extContent[b34]: alreadyRemoved"); return; }
         UIViewController *split = nfb_columnsAppSplitForPaging(paging);
-        if (!split) { if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b33]: splitNil paging=%@", paging ? NSStringFromClass(paging.class) : @"nil"]); return; }
+        if (!split) { if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b34]: splitNil paging=%@", paging ? NSStringFromClass(paging.class) : @"nil"]); return; }
         // Decision paths below set gNFBExtendedContentRemoved (so we stop trying / stop showing trends)
         // but NOT gNFBExtendedContentActuallyRemoved — the latter is set ONLY when the private remove
         // really runs, so restore never calls add on a rail we never removed (Codex).
-        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b33]: noSidebar (nothing to remove)"); return; }
+        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b34]: noSidebar (nothing to remove)"); return; }
         SEL sel = @selector(private_removeExtendedContentViewController);
-        if (![split respondsToSelector:sel]) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b33]: noSelector on %@", NSStringFromClass(split.class)]); return; }
-        if ([defs integerForKey:@"NFBExtContentCrashedBuild"] == kExtBuild) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b33]: skip (crashed before this build)"); return; }
+        if (![split respondsToSelector:sel]) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b34]: noSelector on %@", NSStringFromClass(split.class)]); return; }
+        if ([defs integerForKey:@"NFBExtContentCrashedBuild"] == kExtBuild) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b34]: skip (crashed before this build)"); return; }
         if ([defs integerForKey:@"NFBExtContentInFlightBuild"] == kExtBuild) {
             [defs setInteger:kExtBuild forKey:@"NFBExtContentCrashedBuild"]; [defs synchronize];
             gNFBExtendedContentRemoved = YES;
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b33]: prior remove crashed; disabled this build");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b34]: prior remove crashed; disabled this build");
             return;
         }
         [defs setInteger:kExtBuild forKey:@"NFBExtContentInFlightBuild"]; [defs synchronize];
@@ -3182,16 +3241,16 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
             gNFBExtendedContentActuallyRemoved = YES;   // ONLY on a throw-free remove — guards the add on restore
             gNFBExtRemovedSplit = split;                 // remember the exact split for a paging-independent restore
             [split.viewIfLoaded setNeedsLayout];   // re-flow the split on its own (nil-safe; no forced load, no layoutIfNeeded)
-            if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b33]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
+            if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b34]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
         } else {
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b33]: remove threw (not marked removed)");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b34]: remove threw (not marked removed)");
         }
     } else {
         // Restore. Only re-add if we actually removed; use the stored split so this works even when
         // paging is unavailable (e.g., disabled via a path that can't resolve the home pager).
         if (!gNFBExtendedContentActuallyRemoved) {
             gNFBExtendedContentRemoved = NO; gNFBExtRemoveScheduled = NO; gNFBExtRemovedSplit = nil;
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b33]: restoreSkipped (never actually removed)");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b34]: restoreSkipped (never actually removed)");
             return;
         }
         // Stale-split guard (Codex re-audit#3/#4): the app-split can be torn down and rebuilt
@@ -3212,9 +3271,9 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
         if (split && [split respondsToSelector:sel]) {
             @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
             [split.viewIfLoaded setNeedsLayout];
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b33]: restored");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b34]: restored");
         } else if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"extContent[b33]: restore noop (stale/rebuilt split stored=%@ live=%@)",
+            NFBLogEvent([NSString stringWithFormat:@"extContent[b34]: restore noop (stale/rebuilt split stored=%@ live=%@)",
                          stored ? @"y" : @"n", liveSplit ? @"y" : @"n"]);
         }
         gNFBExtendedContentActuallyRemoved = NO;
@@ -3265,7 +3324,7 @@ static void nfb_suppressSplitResidueViews(UIView *root) {
     gNFBColumnsSuppressedSplitViews = [views copy];
     if (gNFBLogRecording) {
         static NSString *lastSplitResidueKey = nil;
-        NSString *key = [NSString stringWithFormat:@"splitResidue[b33] hidden=%lu root=%@",
+        NSString *key = [NSString stringWithFormat:@"splitResidue[b34] hidden=%lu root=%@",
             (unsigned long)views.count, NSStringFromClass(root.class)];
         if (![key isEqualToString:lastSplitResidueKey]) {
             lastSplitResidueKey = [key copy];
@@ -3293,7 +3352,7 @@ static void nfb_columnsRetryRemoveRebuiltExtendedContent(UIViewController *pagin
         [split.viewIfLoaded setNeedsLayout];
         if (gNFBLogRecording) {
             static NSString *lastRetryKey = nil;
-            NSString *key = [NSString stringWithFormat:@"extContent[b33]: reRemoved rebuilt split=%@", NSStringFromClass(split.class)];
+            NSString *key = [NSString stringWithFormat:@"extContent[b34]: reRemoved rebuilt split=%@", NSStringFromClass(split.class)];
             if (![key isEqualToString:lastRetryKey]) {
                 lastRetryKey = [key copy];
                 NFBLogEvent(key);
@@ -3316,7 +3375,7 @@ static void nfb_suppressSecondarySearchHostIfNeeded(UIViewController *paging, UI
     if (gNFBLogRecording) {
         static NSString *lastSecondaryHostKey = nil;
         CGRect f = secondaryHost.frame;
-        NSString *key = [NSString stringWithFormat:@"secondaryHost[b33] hidden %@ f=(%.0f,%.0f,%.0f,%.0f)",
+        NSString *key = [NSString stringWithFormat:@"secondaryHost[b34] hidden %@ f=(%.0f,%.0f,%.0f,%.0f)",
             NSStringFromClass(secondaryHost.class), f.origin.x, f.origin.y, f.size.width, f.size.height];
         if (![key isEqualToString:lastSecondaryHostKey]) {
             lastSecondaryHostKey = [key copy];
@@ -3412,6 +3471,132 @@ static void nfb_fitSearchColumnSubviewTree(UIView *view, CGFloat width, CGFloat 
     }
 }
 
+// === Issue C: hide the iPad home logo/nav bar while columns are at root ==========================
+// The columns root view shows only a near-empty TFNNavigationBar with the centred Twitter logo (the
+// "上部ロゴバー"). Hide it via the nav controller's own API (reclaims the vertical space) ONLY while
+// the home stack is at root; a pushed detail must keep its bar (back button/title), so we restore it
+// the instant the stack has >1 controller (also via the pushViewController hook below). Pref-gated,
+// default ON. iPad only.
+static UINavigationController *gNFBColumnsLogoNav = nil;
+static UINavigationController *nfb_homeTimelineNavController(UIViewController *paging) {
+    UIViewController *r = paging;
+    for (int i = 0; i < 14 && r; i++) {
+        if ([r isKindOfClass:UINavigationController.class] &&
+            [NSStringFromClass(r.class) containsString:@"TimelineNavigationController"]) return (UINavigationController *)r;
+        r = r.parentViewController;
+    }
+    return nil;
+}
+static void nfb_restoreColumnsLogoBar(void) {
+    if (gNFBColumnsLogoNav) {
+        UINavigationController *nav = gNFBColumnsLogoNav;
+        gNFBColumnsLogoNav = nil;
+        @try { if (nav.navigationBarHidden) [nav setNavigationBarHidden:NO animated:NO]; } @catch (NSException *e) {}
+    }
+}
+static void nfb_applyColumnsLogoBarHidden(UIViewController *paging) {
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return;
+    BOOL pref = ([NSUserDefaults.standardUserDefaults objectForKey:@"NFBHideColumnsLogoBar"] == nil)
+        ? YES : [NSUserDefaults.standardUserDefaults boolForKey:@"NFBHideColumnsLogoBar"];
+    UINavigationController *nav = nfb_homeTimelineNavController(paging);
+    if (!nav) return;
+    BOOL atRoot = nav.viewControllers.count <= 1;
+    BOOL shouldHide = pref && gInlineColumnsEnabled && atRoot;
+    @try {
+        if (shouldHide) {
+            if (!nav.navigationBarHidden) [nav setNavigationBarHidden:YES animated:NO];
+            gNFBColumnsLogoNav = nav;
+        } else if (gNFBColumnsLogoNav == nav || (!gInlineColumnsEnabled && nav.navigationBarHidden)) {
+            if (nav.navigationBarHidden) [nav setNavigationBarHidden:NO animated:NO];
+            gNFBColumnsLogoNav = nil;
+        }
+    } @catch (NSException *e) {}
+}
+
+// === Issue B: full-width columns via Auto Layout CONSTANT (the SAFE method) =======================
+// b31 crashed by frame-fighting the split's Auto Layout every pass (non-converging -> watchdog). The
+// correct way to resize an Auto-Layout-managed view is to change the CONSTRAINT CONSTANT so the engine
+// computes our target and stops (no ping-pong). We widen the primary app-split host over the (hidden,
+// empty) secondary trends pane. SAFETY: iPad+columns only; we ONLY touch a literal width==currentWidth
+// constraint we can positively identify (else do nothing); converged passes write nothing; a hard cap
+// of 8 non-converging writes LATCHES the feature off (so the split resetting the constant can never
+// hang the app); and a build-stamped crash guard self-recovers across a relaunch. The diagnostic in
+// showDiag dumps the host constraints so the exact one can be pinned if the heuristic misses it.
+static char kNFBPrimaryWidthConstraintKey;
+static char kNFBPrimaryWidthOriginalKey;
+static int  gNFBFullWidthApplyCount = 0;
+static BOOL gNFBFullWidthLatched = NO;
+
+static NSLayoutConstraint *nfb_primaryHostWidthConstraint(UIView *host, CGFloat currentWidth) {
+    if (!host) return nil;
+    NSMutableArray<NSLayoutConstraint *> *cands = [NSMutableArray array];
+    [cands addObjectsFromArray:host.constraints];
+    if (host.superview) [cands addObjectsFromArray:host.superview.constraints];
+    for (NSLayoutConstraint *c in cands) {
+        if (c.firstItem == host && c.firstAttribute == NSLayoutAttributeWidth && c.secondItem == nil &&
+            c.relation == NSLayoutRelationEqual && fabs(c.constant - currentWidth) < 4.0) {
+            return c;
+        }
+    }
+    return nil;
+}
+static void nfb_columnsRestorePrimaryWidth(UIView *primaryHost) {
+    if (!primaryHost) return;
+    NSLayoutConstraint *c = objc_getAssociatedObject(primaryHost, &kNFBPrimaryWidthConstraintKey);
+    NSNumber *orig = objc_getAssociatedObject(primaryHost, &kNFBPrimaryWidthOriginalKey);
+    if (c && orig) { @try { c.constant = orig.doubleValue; [primaryHost setNeedsLayout]; } @catch (NSException *e) {} }
+    objc_setAssociatedObject(primaryHost, &kNFBPrimaryWidthConstraintKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(primaryHost, &kNFBPrimaryWidthOriginalKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static void nfb_columnsExpandPrimaryViaConstraint(UIViewController *paging, UIScrollView *nativeScrollView) {
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad || !gInlineColumnsEnabled) return;
+    if (gNFBFullWidthLatched) return;
+    BOOL pref = ([NSUserDefaults.standardUserDefaults objectForKey:@"NFBColumnsFullWidth"] == nil)
+        ? YES : [NSUserDefaults.standardUserDefaults boolForKey:@"NFBColumnsFullWidth"];
+    if (!pref) return;
+    UIView *primaryHost = nfb_enclosingAppSplitHostView((UIView *)nativeScrollView);
+    if (!primaryHost || !primaryHost.window) return;
+    UIView *container = primaryHost.superview;
+    if (!container) return;
+    CGFloat haveW = primaryHost.bounds.size.width;
+    CGFloat fullW = container.bounds.size.width;
+    if (fullW - haveW < 120.0 || fullW < 320.0 || fullW > 4000.0) return;   // no meaningful empty space
+
+    NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
+    NSInteger kBuild = 34;
+    if ([defs integerForKey:@"NFBFullWidthCrashedBuild"] == kBuild) return;
+
+    NSLayoutConstraint *c = objc_getAssociatedObject(primaryHost, &kNFBPrimaryWidthConstraintKey);
+    if (!c) {
+        c = nfb_primaryHostWidthConstraint(primaryHost, haveW);
+        if (!c) return;   // can't positively identify it -> do nothing (diagnostic dumps candidates)
+        objc_setAssociatedObject(primaryHost, &kNFBPrimaryWidthOriginalKey, @(c.constant), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(primaryHost, &kNFBPrimaryWidthConstraintKey, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    CGFloat target = fullW;
+    if (fabs(c.constant - target) < 1.0) { gNFBFullWidthApplyCount = 0; return; }   // converged: no write, no loop
+
+    if ([defs integerForKey:@"NFBFullWidthInFlightBuild"] == kBuild) {   // we hung here last time -> disable
+        [defs setInteger:kBuild forKey:@"NFBFullWidthCrashedBuild"]; [defs synchronize];
+        gNFBFullWidthLatched = YES; return;
+    }
+    [defs setInteger:kBuild forKey:@"NFBFullWidthInFlightBuild"]; [defs synchronize];
+    @try { c.constant = target; [primaryHost setNeedsLayout]; } @catch (NSException *e) {}
+    [defs removeObjectForKey:@"NFBFullWidthInFlightBuild"]; [defs synchronize];
+
+    if (++gNFBFullWidthApplyCount > 8) {   // split keeps resetting the constant -> stop (never hang)
+        gNFBFullWidthLatched = YES;
+        if (gNFBLogRecording) NFBLogEvent(@"fullWidth[b34] latched (constant kept resetting; stopped to avoid hang)");
+        return;
+    }
+    if (gNFBLogRecording) {
+        static NSString *lastK = nil;
+        NSString *k = [NSString stringWithFormat:@"fullWidth[b34] widen %.1f->%.1f (host=%.1f container=%.1f n=%d)",
+            haveW, target, haveW, fullW, gNFBFullWidthApplyCount];
+        if (![k isEqualToString:lastK]) { lastK = [k copy]; NFBLogEvent(k); }
+    }
+}
+
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!nfb_inlineColumnsActiveForHomePaging(paging) || ![paging isViewLoaded]) return;
     // Twitter's own paging layout runs in %orig (before us) on every pass and snaps the pages back
@@ -3493,6 +3678,8 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
 
     UIView *host = nfb_columnsHostViewForPaging(paging);
     nfb_expandColumnsPrimaryWidthIfNeeded(nativeScrollView);
+    nfb_columnsExpandPrimaryViaConstraint(paging, nativeScrollView);   // Issue B: full-width (safe constraint method)
+    nfb_applyColumnsLogoBarHidden(paging);                              // Issue C: hide iPad logo/nav bar at root
     CGRect bounds = nativeScrollView.bounds;
     if (bounds.size.width < 120.0 || bounds.size.height < 240.0) return;
     CGFloat columnWidth = nfb_columnsColumnWidth(bounds.size.width);
@@ -3503,7 +3690,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         guideColumnVC = nfb_columnsBorrowGuideHost(paging);
         if (gNFBLogRecording) {
             static NSString *lastBorrowStateKey = nil;
-            NSString *bk = [NSString stringWithFormat:@"guideBorrowState[b33] failed=%d host=%d attempts=%d reason=%@",
+            NSString *bk = [NSString stringWithFormat:@"guideBorrowState[b34] failed=%d host=%d attempts=%d reason=%@",
                 gNFBColumnsGuideBorrowFailed ? 1 : 0, guideColumnVC ? 1 : 0, gNFBGuideBorrowAttempts,
                 gNFBGuideBorrowReason ?: @"-"];
             if (![bk isEqualToString:lastBorrowStateKey]) {
@@ -3616,7 +3803,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         if (!gNFBColumnsGuideContentReady) nfb_kickGuideColumnLoadIfNeeded(guideHost);
         if (gNFBLogRecording) {
             static NSString *lastGuideColKey = nil;
-            NSString *k = [NSString stringWithFormat:@"guideColumn[b33] host=%@ ready=%d x=%.0f w=%.0f content=%.0fx%.0f text=%@",
+            NSString *k = [NSString stringWithFormat:@"guideColumn[b34] host=%@ ready=%d x=%.0f w=%.0f content=%.0fx%.0f text=%@",
                 NSStringFromClass(guideHost.class), gNFBColumnsGuideContentReady ? 1 : 0,
                 columnWidth * pages.count, columnWidth,
                 gs ? gs.contentSize.width : 0.0, gs ? gs.contentSize.height : 0.0,
@@ -3660,7 +3847,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
             static NSString *lastSearchColKey = nil;
             UIScrollView *searchScroll = nfb_mainScrollViewOf(searchColumnVC);
             NSString *text = nfb_diagTextForView(searchView, 72);
-            NSString *k = [NSString stringWithFormat:@"searchColumn[b33] vc=%@ x=%.0f w=%.0f h=%.0f scroll=%@ content=%.0fx%.0f text=%@",
+            NSString *k = [NSString stringWithFormat:@"searchColumn[b34] vc=%@ x=%.0f w=%.0f h=%.0f scroll=%@ content=%.0fx%.0f text=%@",
                 NSStringFromClass(searchColumnVC.class), columnWidth * pages.count, columnWidth, height,
                 searchScroll ? NSStringFromClass(searchScroll.class) : @"nil",
                 searchScroll ? searchScroll.contentSize.width : 0.0,
@@ -3710,7 +3897,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b33] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b34] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -3921,6 +4108,16 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     // rail could be left permanently removed when restore is reached through a short-circuit path.
     gNFBExtRemoveScheduled = NO;
     nfb_columnsSetExtendedContentRemoved(paging, NO);
+    // Issue C + B: restore the logo/nav bar and the primary-width constraint, reset the full-width
+    // latch. Done before any early return so columns-off always undoes them.
+    nfb_restoreColumnsLogoBar();
+    {
+        UIScrollView *sv = nfb_horizontalPagingScrollViewOf(paging);
+        UIView *primaryHost = sv ? nfb_enclosingAppSplitHostView((UIView *)sv) : nil;
+        if (primaryHost) nfb_columnsRestorePrimaryWidth(primaryHost);
+    }
+    gNFBFullWidthLatched = NO;
+    gNFBFullWidthApplyCount = 0;
     if (!nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
     nfb_removeColumnsOverlay();
     nfb_setColumnsSegmentedHiddenForPaging(paging, NO);
@@ -4098,14 +4295,89 @@ static NSArray<UIViewController *> *nfb_allHomePagingTimelinePages(UIViewControl
     return pages;
 }
 
-static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void) {
+// === Column management (reorder / show-hide / persist) ===========================================
+// Layered over the pager's natural page order. State persists in NSUserDefaults keyed by the stable
+// column identity (nfb_columnTimelineIdentity). The crash path is never touched: this only changes
+// WHICH live pages and in WHAT order nfb_currentColumnTimelinePages returns; the layout/transplant is
+// unchanged. A hidden-everything state is impossible (the toggle UI refuses the last visible column,
+// and nfb_currentColumnTimelinePages ignores the hidden set if it would empty the result).
+static NSString * const kNFBColumnsOrderKey = @"NFBColumnsOrderV1";
+static NSString * const kNFBColumnsHiddenKey = @"NFBColumnsHiddenV1";
+
+static NSArray<NSString *> *nfb_columnsSavedOrder(void) {
+    NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:kNFBColumnsOrderKey];
+    return [a isKindOfClass:NSArray.class] ? a : @[];
+}
+static NSSet<NSString *> *nfb_columnsHiddenSet(void) {
+    NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:kNFBColumnsHiddenKey];
+    return [a isKindOfClass:NSArray.class] ? [NSSet setWithArray:a] : [NSSet set];
+}
+static void nfb_columnsSetHidden(NSString *identity, BOOL hidden) {
+    if (!identity.length) return;
+    NSMutableArray *a = [[NSUserDefaults.standardUserDefaults arrayForKey:kNFBColumnsHiddenKey] mutableCopy] ?: [NSMutableArray array];
+    [a removeObject:identity];
+    if (hidden) [a addObject:identity];
+    [NSUserDefaults.standardUserDefaults setObject:a forKey:kNFBColumnsHiddenKey];
+    [NSUserDefaults.standardUserDefaults synchronize];
+}
+// Reorder by delta within the supplied current display order, then persist the full order so new
+// (not-yet-seen) lists keep falling to the natural tail until the user moves them.
+static void nfb_columnsMove(NSString *identity, NSInteger delta, NSArray<NSString *> *currentOrderIdentities) {
+    if (!identity.length || !currentOrderIdentities.count) return;
+    NSMutableArray *order = [currentOrderIdentities mutableCopy];
+    NSUInteger idx = [order indexOfObject:identity];
+    if (idx == NSNotFound) return;
+    NSInteger target = (NSInteger)idx + delta;
+    if (target < 0 || target >= (NSInteger)order.count) return;
+    [order removeObjectAtIndex:idx];
+    [order insertObject:identity atIndex:(NSUInteger)target];
+    [NSUserDefaults.standardUserDefaults setObject:order forKey:kNFBColumnsOrderKey];
+    [NSUserDefaults.standardUserDefaults synchronize];
+}
+// Ordered pages first (by saved index), then any page not in the saved order in natural order.
+static NSArray<UIViewController *> *nfb_columnsApplyOrder(NSArray<UIViewController *> *pages) {
+    NSArray<NSString *> *order = nfb_columnsSavedOrder();
+    if (!order.count) return pages;
+    NSMutableArray<UIViewController *> *remaining = [pages mutableCopy];
+    NSMutableArray<UIViewController *> *result = [NSMutableArray array];
+    for (NSString *ident in order) {
+        for (UIViewController *p in remaining) {
+            if ([nfb_columnTimelineIdentity(p) isEqualToString:ident]) { [result addObject:p]; [remaining removeObject:p]; break; }
+        }
+    }
+    [result addObjectsFromArray:remaining];
+    return result;
+}
+static NSString *nfb_columnDisplayName(UIViewController *page) {
+    if (page.title.length) return page.title;
+    NSString *cls = NSStringFromClass(page.class);
+    if ([cls containsString:@"HomeTimelineItemsViewController"]) return @"ホーム（フォロー中）";
+    NSString *ident = nfb_columnTimelineIdentity(page);
+    NSArray *parts = [ident componentsSeparatedByString:@"|"];
+    return (parts.count > 1 && [parts[1] length]) ? parts[1] : cls;
+}
+// All column-eligible pages (INCLUDING hidden), in saved display order — for the management UI.
+static NSArray<UIViewController *> *nfb_eligibleColumnPagesAll(void) {
     UIViewController *paging = nfb_findVisibleHomePagingController();
     NSMutableArray<UIViewController *> *pages = [NSMutableArray array];
     for (UIViewController *page in nfb_allHomePagingTimelinePages(paging)) {
-        if (!nfb_shouldUseTimelinePageAsColumn(page)) continue;
-        [pages addObject:page];
+        if (nfb_shouldUseTimelinePageAsColumn(page)) [pages addObject:page];
     }
-    return pages;
+    return nfb_columnsApplyOrder(pages);
+}
+
+static NSArray<UIViewController *> *nfb_currentColumnTimelinePages(void) {
+    UIViewController *paging = nfb_findVisibleHomePagingController();
+    NSSet<NSString *> *hidden = nfb_columnsHiddenSet();
+    NSMutableArray<UIViewController *> *eligible = [NSMutableArray array];
+    NSMutableArray<UIViewController *> *visible = [NSMutableArray array];
+    for (UIViewController *page in nfb_allHomePagingTimelinePages(paging)) {
+        if (!nfb_shouldUseTimelinePageAsColumn(page)) continue;
+        [eligible addObject:page];
+        if (![hidden containsObject:nfb_columnTimelineIdentity(page)]) [visible addObject:page];
+    }
+    // Never return empty when there ARE eligible pages (hiding all would make the layout retry-loop).
+    return nfb_columnsApplyOrder(visible.count ? visible : eligible);
 }
 
 static NSArray<UIViewController *> *nfb_currentColumnRefreshControllers(void) {
@@ -4959,6 +5231,37 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
             gsv ? gsv.contentSize.width : 0.0, gsv ? gsv.contentSize.height : 0.0,
             gNFBGuideBorrowReason ?: @"-"];
     }
+    // Issue B (full-width) constraint introspection: dump the primary app-split host's width-governing
+    // constraints so the exact one can be pinned if the heuristic in nfb_columnsExpandPrimaryViaConstraint
+    // misses it. Read-only.
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        UIViewController *fwPaging = nfb_findVisibleHomePagingController();
+        UIScrollView *fwScroll = fwPaging ? nfb_horizontalPagingScrollViewOf(fwPaging) : nil;
+        UIView *primaryHost = fwScroll ? nfb_enclosingAppSplitHostView((UIView *)fwScroll) : nil;
+        if (primaryHost) {
+            UIView *fwContainer = primaryHost.superview;
+            [s appendFormat:@"fullWidthDiag[b34] latched=%d host=%@ hostW=%.1f containerW=%.1f\n",
+                gNFBFullWidthLatched ? 1 : 0, NSStringFromClass(primaryHost.class),
+                primaryHost.bounds.size.width, fwContainer ? fwContainer.bounds.size.width : -1.0];
+            NSMutableArray<NSLayoutConstraint *> *cs = [NSMutableArray array];
+            [cs addObjectsFromArray:primaryHost.constraints];
+            if (fwContainer) [cs addObjectsFromArray:fwContainer.constraints];
+            int n = 0;
+            for (NSLayoutConstraint *c in cs) {
+                if (c.firstItem != primaryHost && c.secondItem != primaryHost) continue;
+                if (!(c.firstAttribute == NSLayoutAttributeWidth || c.firstAttribute == NSLayoutAttributeTrailing ||
+                      c.firstAttribute == NSLayoutAttributeRight || c.firstAttribute == NSLayoutAttributeLeading ||
+                      c.firstAttribute == NSLayoutAttributeLeft ||
+                      c.secondAttribute == NSLayoutAttributeWidth || c.secondAttribute == NSLayoutAttributeTrailing)) continue;
+                [s appendFormat:@"  fwC[%d] %@ a1=%ld a2=%ld const=%.1f mult=%.2f rel=%ld active=%d owner=%@\n",
+                    n++, [primaryHost.constraints containsObject:c] ? @"onHost" : @"onSuper",
+                    (long)c.firstAttribute, (long)c.secondAttribute, c.constant, c.multiplier,
+                    (long)c.relation, c.isActive ? 1 : 0,
+                    c.secondItem ? NSStringFromClass([c.secondItem class]) : @"nil"];
+                if (n >= 12) break;
+            }
+        }
+    }
     UIViewController *searchVC = gNFBColumnsSearchColumnController;
     if (searchVC && [searchVC isViewLoaded]) {
         UIView *searchView = searchVC.view;
@@ -5133,6 +5436,16 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
         }
     }
     %orig(enabled);
+}
+%end
+
+// Issue C safety: a pushed detail must keep its nav bar (back button/title). If columns hid the home
+// logo bar (setNavigationBarHidden:YES at root), restore it the instant anything is pushed, BEFORE the
+// detail appears — so the back affordance is never missing. Popping back to root re-hides via layout.
+%hook T1TimelineNavigationController
+- (void)pushViewController:(UIViewController *)vc animated:(BOOL)animated {
+    if (gNFBColumnsLogoNav == self) nfb_restoreColumnsLogoBar();
+    %orig(vc, animated);
 }
 %end
 
