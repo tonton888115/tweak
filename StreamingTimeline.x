@@ -1572,6 +1572,11 @@ static __weak UIViewController *gNFBColumnsGuideContentVC = nil; // the GuideCon
 static BOOL gNFBColumnsGuideBorrowFailed = NO;
 static BOOL gNFBColumnsGuideContentReady = NO;  // latched once the borrowed guide loads content (Codex guard: only surface it after content-load success; until then the trends fallback stays on top)
 static NSString *gNFBGuideBorrowReason = @"(not attempted)";  // last borrow outcome — surfaced in FINAL DIAG so it's visible even when the (one-time) borrow ran before recording started
+// Issue B (iPad): while columns are active we REMOVE the extended-content rail (the right trends/
+// search pane) via the app-split's own -private_removeExtendedContentViewController, so the split
+// re-lays-out the primary content (our columns) to the full width — instead of hiding it + manually
+// resizing (which froze before). Restored on columns-off. See [[neofreebird-liquidglass-and-open-bugs]].
+static BOOL gNFBExtendedContentRemoved = NO;
 // User chose "remove the right pane + move search into a column": we also hide the app-split
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
 // panel. Captured from the search view's ancestor chain before transplant; un-hidden on restore.
@@ -2939,6 +2944,54 @@ static UIViewController *nfb_columnsBorrowGuideHost(UIViewController *paging) {
     return host;
 }
 
+// Walk up from paging to the T1AppSplitViewController (iPad split host).
+static UIViewController *nfb_columnsAppSplitForPaging(UIViewController *paging) {
+    UIViewController *r = paging;
+    for (int i = 0; i < 14 && r; i++) {
+        if ([NSStringFromClass(r.class) containsString:@"AppSplitViewController"]) return r;
+        r = r.parentViewController;
+    }
+    return nil;
+}
+
+// Issue B: remove/restore the iPad extended-content rail via the split's own private methods so the
+// columns fill the full width. Guarded (respondsToSelector + @try + build-stamped crash guard: a hard
+// crash leaves the in-flight stamp → next launch promotes it to a crashed stamp and stops trying for
+// this build, so the app self-recovers). Idempotent via gNFBExtendedContentRemoved.
+static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL removed) {
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return;
+    UIViewController *split = nfb_columnsAppSplitForPaging(paging);
+    if (!split) return;
+    NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
+    static NSInteger const kExtBuild = 25;
+    if (removed) {
+        if (gNFBExtendedContentRemoved) return;                 // already removed
+        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; return; }  // nothing to remove
+        SEL sel = @selector(private_removeExtendedContentViewController);
+        if (![split respondsToSelector:sel]) { gNFBExtendedContentRemoved = YES; return; }
+        if ([defs integerForKey:@"NFBExtContentCrashedBuild"] == kExtBuild) { gNFBExtendedContentRemoved = YES; return; }
+        if ([defs integerForKey:@"NFBExtContentInFlightBuild"] == kExtBuild) {
+            [defs setInteger:kExtBuild forKey:@"NFBExtContentCrashedBuild"]; [defs synchronize];
+            gNFBExtendedContentRemoved = YES;
+            if (gNFBLogRecording) NFBLogEvent(@"extContent: prior remove crashed; disabled this build");
+            return;
+        }
+        [defs setInteger:kExtBuild forKey:@"NFBExtContentInFlightBuild"]; [defs synchronize];
+        @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
+        [defs removeObjectForKey:@"NFBExtContentInFlightBuild"]; [defs synchronize];
+        gNFBExtendedContentRemoved = YES;
+        if (gNFBLogRecording) NFBLogEvent(@"extContent: removed (columns full-width)");
+    } else {
+        if (!gNFBExtendedContentRemoved) return;
+        SEL sel = @selector(private_addExtendedContentViewController);
+        if ([split respondsToSelector:sel]) {
+            @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
+        }
+        gNFBExtendedContentRemoved = NO;
+        if (gNFBLogRecording) NFBLogEvent(@"extContent: restored");
+    }
+}
+
 static BOOL nfb_searchColumnVCUsableForCurrentSplit(UIViewController *paging, UIScrollView *nativeScrollView, UIView *searchView) {
     if (!paging || !nativeScrollView || !searchView) return NO;
     if (searchView.superview == nativeScrollView) return YES;   // already transplanted; do not chase a resizing split.
@@ -3108,12 +3161,29 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     UIScrollView *nativeScrollView = nfb_horizontalPagingScrollViewOf(paging);
     if (!nativeScrollView) return;
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
-    UIViewController *searchColumnVC = nfb_iPadColumnsSearchSidebarVC(paging);
-    if (searchColumnVC && [searchColumnVC isViewLoaded] && searchColumnVC.view) {
-        if (nfb_searchColumnVCUsableForCurrentSplit(paging, nativeScrollView, searchColumnVC.view)) {
-            nfb_prepareSplitForSearchColumn(paging, nativeScrollView, searchColumnVC.view);
-        } else {
-            searchColumnVC = nil;
+    // Issue B (width): remove the iPad extended-content rail so the columns re-flow to full width.
+    nfb_columnsSetExtendedContentRemoved(paging, YES);
+    // With the rail removed there is no trends sidebar to transplant; the search column is the borrowed
+    // Guide (re-hosted in a later build). For now keep ATTEMPTING the borrow so its outcome is logged
+    // (guideBorrowState) — but do not host it yet. The trends path stays only as a fallback if the rail
+    // could not be removed.
+    UIViewController *searchColumnVC = nil;
+    if (!gNFBExtendedContentRemoved) {
+        searchColumnVC = nfb_iPadColumnsSearchSidebarVC(paging);
+        if (searchColumnVC && [searchColumnVC isViewLoaded] && searchColumnVC.view) {
+            if (nfb_searchColumnVCUsableForCurrentSplit(paging, nativeScrollView, searchColumnVC.view)) {
+                nfb_prepareSplitForSearchColumn(paging, nativeScrollView, searchColumnVC.view);
+            } else {
+                searchColumnVC = nil;
+            }
+        }
+    } else if (!gNFBColumnsGuideBorrowFailed || gNFBLogRecording) {
+        UIViewController *gh = nfb_columnsBorrowGuideHost(paging);
+        if (gNFBLogRecording) {
+            static NSString *lastBorrowStateKey2 = nil;
+            NSString *bk = [NSString stringWithFormat:@"guideBorrowState failed=%d host=%d attempts=%d reason=%@",
+                gNFBColumnsGuideBorrowFailed ? 1 : 0, gh ? 1 : 0, gNFBGuideBorrowAttempts, gNFBGuideBorrowReason ?: @"-"];
+            if (![bk isEqualToString:lastBorrowStateKey2]) { lastBorrowStateKey2 = [bk copy]; NFBLogEvent(bk); }
         }
     }
 
@@ -3556,6 +3626,8 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     BOOL wasApplied = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) != nil;
     if (!wasApplied) return;
 
+    // Issue B: restore the iPad extended-content rail we removed for full-width columns.
+    nfb_columnsSetExtendedContentRemoved(paging, NO);
     // Detach the borrowed guide (we own it) from the paging controller + remove its view; keep the
     // cached instance for reuse on the next columns-open. Reset the content-ready latch so it re-proves
     // itself (the view tree is torn down on detach).
