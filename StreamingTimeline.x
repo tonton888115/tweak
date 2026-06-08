@@ -1581,6 +1581,17 @@ static BOOL gNFBExtendedContentActuallyRemoved = NO; // private_removeExtendedCo
 static UIViewController *gNFBExtRemovedSplit = nil;  // strong: the split we removed the rail from, kept alive until restore so the rail is never abandoned (Codex). Cleared (released) on restore. The app-split is long-lived so this is plain ownership, not a cycle.
 static BOOL gNFBExtRemoveScheduled = NO;   // a one-shot deferred remove is queued (Codex: don't remove during the layout pass)
 static NSArray<UIView *> *gNFBColumnsExpandedWidthViews = nil; // content ancestors widened after rail removal; restored on columns-off
+// Oscillation latch for nfb_expandColumnsPrimaryWidthIfNeeded: the app-split's Auto Layout settles
+// the home scroll view a few points off our computed full-width target, so each layout pass we'd
+// "fix" the same ancestor, call setNeedsLayout, re-trigger -viewDidLayoutSubviews, and run again —
+// a non-converging layout loop that pins the main thread until the watchdog kills the app (the
+// freeze on opening iPad columns). Once the width gap stops shrinking we latch and stop re-applying
+// until the geometry really changes (rotation / Stage Manager). Cleared on convergence + columns-off.
+static CGFloat gNFBColumnsExpandLastGap = -1.0;        // |scrollWidth - target| from the previous pass
+static int gNFBColumnsExpandStableGapCount = 0;        // consecutive passes the gap stayed ~constant
+static BOOL gNFBColumnsExpandLatched = NO;             // stop re-applying (we are oscillating, not converging)
+static CGFloat gNFBColumnsExpandLatchFrom = 0.0;       // scrollWidth when latched (unlatch if it changes)
+static CGFloat gNFBColumnsExpandLatchTo = 0.0;         // target when latched (unlatch if it changes)
 // User chose "remove the right pane + move search into a column": we also hide the app-split
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
 // panel. Captured from the search view's ancestor chain before transplant; un-hidden on restore.
@@ -2666,7 +2677,44 @@ static void nfb_expandColumnsPrimaryWidthIfNeeded(UIScrollView *nativeScrollView
 
     CGFloat currentWidth = nativeScrollView.bounds.size.width;
     CGFloat targetWidth = nfb_columnsTargetWidthAfterRailRemoval(nativeScrollView);
-    if (targetWidth < 240.0 || targetWidth > 2400.0 || fabs(targetWidth - currentWidth) <= 1.0) return;
+    if (targetWidth < 240.0 || targetWidth > 2400.0 || fabs(targetWidth - currentWidth) <= 1.0) {
+        // At target (or N/A) → converged. Clear the oscillation latch so a later real resize re-runs.
+        gNFBColumnsExpandLatched = NO;
+        gNFBColumnsExpandStableGapCount = 0;
+        gNFBColumnsExpandLastGap = -1.0;
+        return;
+    }
+
+    // If we already latched this exact geometry as non-converging, do nothing: returning WITHOUT any
+    // frame write or setNeedsLayout is what breaks the layout feedback loop that froze the app. A
+    // genuine resize changes currentWidth/targetWidth, which unlatches us below and lets us re-flow.
+    if (gNFBColumnsExpandLatched &&
+        fabs(currentWidth - gNFBColumnsExpandLatchFrom) <= 1.0 &&
+        fabs(targetWidth - gNFBColumnsExpandLatchTo) <= 1.0) {
+        return;
+    }
+    gNFBColumnsExpandLatched = NO;   // geometry changed (or first run for it) → proceed
+
+    // Non-convergence detector: when the split keeps resetting the scroll view a fixed few points off
+    // our target, the gap stays essentially constant pass after pass. During genuine settling the gap
+    // varies wildly (the chain reflows), so this only trips in the stuck steady state.
+    CGFloat gap = fabs(currentWidth - targetWidth);
+    if (gNFBColumnsExpandLastGap >= 0.0 && fabs(gap - gNFBColumnsExpandLastGap) <= 2.0) {
+        gNFBColumnsExpandStableGapCount++;
+    } else {
+        gNFBColumnsExpandStableGapCount = 0;
+    }
+    gNFBColumnsExpandLastGap = gap;
+    if (gNFBColumnsExpandStableGapCount >= 4) {
+        gNFBColumnsExpandLatched = YES;
+        gNFBColumnsExpandLatchFrom = currentWidth;
+        gNFBColumnsExpandLatchTo = targetWidth;
+        if (gNFBLogRecording) {
+            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b31] latch (stuck gap=%.1f, %.1f->%.1f)",
+                gap, currentWidth, targetWidth]);
+        }
+        return;
+    }
 
     NSMutableArray<UIView *> *expanded = [NSMutableArray array];
     CGFloat scrollHeight = nativeScrollView.bounds.size.height;
@@ -2701,12 +2749,12 @@ static void nfb_expandColumnsPrimaryWidthIfNeeded(UIScrollView *nativeScrollView
         }
         gNFBColumnsExpandedWidthViews = [all copy];
         if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b30] from=%.1f to=%.1f views=%lu",
+            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b31] from=%.1f to=%.1f views=%lu",
                 currentWidth, targetWidth, (unsigned long)expanded.count]);
         }
     } else if (gNFBLogRecording) {
         static NSString *lastColumnsExpandMiss = nil;
-        NSString *miss = [NSString stringWithFormat:@"columnsExpand[b30] miss from=%.1f to=%.1f chain=%lu",
+        NSString *miss = [NSString stringWithFormat:@"columnsExpand[b31] miss from=%.1f to=%.1f chain=%lu",
             currentWidth, targetWidth, (unsigned long)chain.count];
         if (![miss isEqualToString:lastColumnsExpandMiss]) {
             lastColumnsExpandMiss = [miss copy];
@@ -3062,7 +3110,7 @@ static void nfb_kickGuideColumnLoadIfNeeded(UIViewController *guideHost) {
     if (!kicked) kicked = nfb_streamTriggerTarget(guideHost);
     if (gNFBLogRecording) {
         static NSString *lastGuideKickKey = nil;
-        NSString *key = [NSString stringWithFormat:@"guideKick[b30] kicked=%d content=%.0fx%.0f target=%@",
+        NSString *key = [NSString stringWithFormat:@"guideKick[b31] kicked=%d content=%.0fx%.0f target=%@",
             kicked ? 1 : 0,
             sv ? sv.contentSize.width : 0.0, sv ? sv.contentSize.height : 0.0,
             content ? NSStringFromClass(content.class) : NSStringFromClass(guideHost.class)];
@@ -3092,25 +3140,25 @@ static UIViewController *nfb_columnsAppSplitForPaging(UIViewController *paging) 
 // this build, so the app self-recovers). Idempotent via gNFBExtendedContentRemoved.
 static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL removed) {
     NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
-    static NSInteger const kExtBuild = 30;
+    static NSInteger const kExtBuild = 31;
     if (removed) {
         if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) {
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b30]: skip notPad"); return;
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b31]: skip notPad"); return;
         }
-        if (gNFBExtendedContentRemoved) { if (gNFBLogRecording) NFBLogEvent(@"extContent[b30]: alreadyRemoved"); return; }
+        if (gNFBExtendedContentRemoved) { if (gNFBLogRecording) NFBLogEvent(@"extContent[b31]: alreadyRemoved"); return; }
         UIViewController *split = nfb_columnsAppSplitForPaging(paging);
-        if (!split) { if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b30]: splitNil paging=%@", paging ? NSStringFromClass(paging.class) : @"nil"]); return; }
+        if (!split) { if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b31]: splitNil paging=%@", paging ? NSStringFromClass(paging.class) : @"nil"]); return; }
         // Decision paths below set gNFBExtendedContentRemoved (so we stop trying / stop showing trends)
         // but NOT gNFBExtendedContentActuallyRemoved — the latter is set ONLY when the private remove
         // really runs, so restore never calls add on a rail we never removed (Codex).
-        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b30]: noSidebar (nothing to remove)"); return; }
+        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b31]: noSidebar (nothing to remove)"); return; }
         SEL sel = @selector(private_removeExtendedContentViewController);
-        if (![split respondsToSelector:sel]) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b30]: noSelector on %@", NSStringFromClass(split.class)]); return; }
-        if ([defs integerForKey:@"NFBExtContentCrashedBuild"] == kExtBuild) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b30]: skip (crashed before this build)"); return; }
+        if (![split respondsToSelector:sel]) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b31]: noSelector on %@", NSStringFromClass(split.class)]); return; }
+        if ([defs integerForKey:@"NFBExtContentCrashedBuild"] == kExtBuild) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b31]: skip (crashed before this build)"); return; }
         if ([defs integerForKey:@"NFBExtContentInFlightBuild"] == kExtBuild) {
             [defs setInteger:kExtBuild forKey:@"NFBExtContentCrashedBuild"]; [defs synchronize];
             gNFBExtendedContentRemoved = YES;
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b30]: prior remove crashed; disabled this build");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b31]: prior remove crashed; disabled this build");
             return;
         }
         [defs setInteger:kExtBuild forKey:@"NFBExtContentInFlightBuild"]; [defs synchronize];
@@ -3122,16 +3170,16 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
             gNFBExtendedContentActuallyRemoved = YES;   // ONLY on a throw-free remove — guards the add on restore
             gNFBExtRemovedSplit = split;                 // remember the exact split for a paging-independent restore
             [split.viewIfLoaded setNeedsLayout];   // re-flow the split on its own (nil-safe; no forced load, no layoutIfNeeded)
-            if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b30]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
+            if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b31]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
         } else {
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b30]: remove threw (not marked removed)");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b31]: remove threw (not marked removed)");
         }
     } else {
         // Restore. Only re-add if we actually removed; use the stored split so this works even when
         // paging is unavailable (e.g., disabled via a path that can't resolve the home pager).
         if (!gNFBExtendedContentActuallyRemoved) {
             gNFBExtendedContentRemoved = NO; gNFBExtRemoveScheduled = NO; gNFBExtRemovedSplit = nil;
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b30]: restoreSkipped (never actually removed)");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b31]: restoreSkipped (never actually removed)");
             return;
         }
         // Stale-split guard (Codex re-audit#3/#4): the app-split can be torn down and rebuilt
@@ -3152,9 +3200,9 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
         if (split && [split respondsToSelector:sel]) {
             @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
             [split.viewIfLoaded setNeedsLayout];
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b30]: restored");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b31]: restored");
         } else if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"extContent[b30]: restore noop (stale/rebuilt split stored=%@ live=%@)",
+            NFBLogEvent([NSString stringWithFormat:@"extContent[b31]: restore noop (stale/rebuilt split stored=%@ live=%@)",
                          stored ? @"y" : @"n", liveSplit ? @"y" : @"n"]);
         }
         gNFBExtendedContentActuallyRemoved = NO;
@@ -3205,7 +3253,7 @@ static void nfb_suppressSplitResidueViews(UIView *root) {
     gNFBColumnsSuppressedSplitViews = [views copy];
     if (gNFBLogRecording) {
         static NSString *lastSplitResidueKey = nil;
-        NSString *key = [NSString stringWithFormat:@"splitResidue[b30] hidden=%lu root=%@",
+        NSString *key = [NSString stringWithFormat:@"splitResidue[b31] hidden=%lu root=%@",
             (unsigned long)views.count, NSStringFromClass(root.class)];
         if (![key isEqualToString:lastSplitResidueKey]) {
             lastSplitResidueKey = [key copy];
@@ -3233,7 +3281,7 @@ static void nfb_columnsRetryRemoveRebuiltExtendedContent(UIViewController *pagin
         [split.viewIfLoaded setNeedsLayout];
         if (gNFBLogRecording) {
             static NSString *lastRetryKey = nil;
-            NSString *key = [NSString stringWithFormat:@"extContent[b30]: reRemoved rebuilt split=%@", NSStringFromClass(split.class)];
+            NSString *key = [NSString stringWithFormat:@"extContent[b31]: reRemoved rebuilt split=%@", NSStringFromClass(split.class)];
             if (![key isEqualToString:lastRetryKey]) {
                 lastRetryKey = [key copy];
                 NFBLogEvent(key);
@@ -3256,7 +3304,7 @@ static void nfb_suppressSecondarySearchHostIfNeeded(UIViewController *paging, UI
     if (gNFBLogRecording) {
         static NSString *lastSecondaryHostKey = nil;
         CGRect f = secondaryHost.frame;
-        NSString *key = [NSString stringWithFormat:@"secondaryHost[b30] hidden %@ f=(%.0f,%.0f,%.0f,%.0f)",
+        NSString *key = [NSString stringWithFormat:@"secondaryHost[b31] hidden %@ f=(%.0f,%.0f,%.0f,%.0f)",
             NSStringFromClass(secondaryHost.class), f.origin.x, f.origin.y, f.size.width, f.size.height];
         if (![key isEqualToString:lastSecondaryHostKey]) {
             lastSecondaryHostKey = [key copy];
@@ -3433,7 +3481,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         guideColumnVC = nfb_columnsBorrowGuideHost(paging);
         if (gNFBLogRecording) {
             static NSString *lastBorrowStateKey = nil;
-            NSString *bk = [NSString stringWithFormat:@"guideBorrowState[b30] failed=%d host=%d attempts=%d reason=%@",
+            NSString *bk = [NSString stringWithFormat:@"guideBorrowState[b31] failed=%d host=%d attempts=%d reason=%@",
                 gNFBColumnsGuideBorrowFailed ? 1 : 0, guideColumnVC ? 1 : 0, gNFBGuideBorrowAttempts,
                 gNFBGuideBorrowReason ?: @"-"];
             if (![bk isEqualToString:lastBorrowStateKey]) {
@@ -3546,7 +3594,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         if (!gNFBColumnsGuideContentReady) nfb_kickGuideColumnLoadIfNeeded(guideHost);
         if (gNFBLogRecording) {
             static NSString *lastGuideColKey = nil;
-            NSString *k = [NSString stringWithFormat:@"guideColumn[b30] host=%@ ready=%d x=%.0f w=%.0f content=%.0fx%.0f text=%@",
+            NSString *k = [NSString stringWithFormat:@"guideColumn[b31] host=%@ ready=%d x=%.0f w=%.0f content=%.0fx%.0f text=%@",
                 NSStringFromClass(guideHost.class), gNFBColumnsGuideContentReady ? 1 : 0,
                 columnWidth * pages.count, columnWidth,
                 gs ? gs.contentSize.width : 0.0, gs ? gs.contentSize.height : 0.0,
@@ -3698,7 +3746,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b30] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b31] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -3953,6 +4001,10 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
         nfb_restoreColumnOriginalViewState(view);
     }
     gNFBColumnsExpandedWidthViews = nil;
+    // Reset the width-expand oscillation latch so the next columns-on re-flows to full width.
+    gNFBColumnsExpandLatched = NO;
+    gNFBColumnsExpandStableGapCount = 0;
+    gNFBColumnsExpandLastGap = -1.0;
 
     NSNumber *pagingEnabled = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey);
     NSNumber *bounceH = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsBounceHKey);
