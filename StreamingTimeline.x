@@ -69,6 +69,7 @@ static UIViewController *nfb_columnEntryViewController(NSDictionary *entry);
 static BOOL nfb_columnEntryIsHidden(NSDictionary *entry);
 static void nfb_columnEntrySetHidden(NSDictionary *entry, BOOL hidden);
 static UIViewController *nfb_columnsAppTabControllerForEntry(NSDictionary *entry, UIViewController *paging);
+static UIViewController *nfb_makeColumnsSettingsViewController(void);
 static void nfb_layoutActiveHomePaging(void);
 // Issue C: hide the iPad home logo/nav bar while columns are at root. Pref-gated, restored on detail push / exit.
 static void nfb_applyColumnsLogoBarHidden(UIViewController *paging);
@@ -108,6 +109,11 @@ static __weak UIViewController *gPendingNewTweetsVC = nil;
 static __weak UIScrollView *gActiveTimelineScrollView = nil;
 static UIButton *gNewTweetsPill = nil;
 static BOOL gInlineColumnsEnabled = NO;
+static NSString * const kNFBColumnsOrderKey = @"NFBColumnsOrderV1";
+static NSString * const kNFBColumnsHiddenKey = @"NFBColumnsHiddenV1";
+static NSString * const kNFBColumnsEnabledTabsKey = @"NFBColumnsEnabledTabsV1";
+static NSString * const kNFBColumnEntryKindTimeline = @"timeline";
+static NSString * const kNFBColumnEntryKindTab = @"tab";
 static BOOL gActiveTimelineAtTop = YES;
 static CGFloat gActiveTimelineOffsetY = 0.0;
 static CGFloat gActiveTimelineTopY = 0.0;
@@ -1172,7 +1178,7 @@ NSString *NFBLogSavedFileContents(void) {
 - (void)showColumnsManage {
     UIViewController *top = [self topVC];
     if (!top) return;
-    UIViewController *vc = [[NFBColumnsSettingsViewController alloc] init];
+    UIViewController *vc = nfb_makeColumnsSettingsViewController();
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationFormSheet;
     [top presentViewController:nav animated:YES completion:nil];
@@ -1341,6 +1347,10 @@ NSString *NFBLogSavedFileContents(void) {
 }
 
 @end
+
+static UIViewController *nfb_makeColumnsSettingsViewController(void) {
+    return [[NFBColumnsSettingsViewController alloc] init];
+}
 
 #pragma mark - button visuals + lifecycle
 
@@ -4644,12 +4654,6 @@ static NSArray<UIViewController *> *nfb_allHomePagingTimelinePages(UIViewControl
 // WHICH live pages and in WHAT order nfb_currentColumnTimelinePages returns; the layout/transplant is
 // unchanged. A hidden-everything state is impossible (the toggle UI refuses the last visible column,
 // and nfb_currentColumnTimelinePages ignores the hidden set if it would empty the result).
-static NSString * const kNFBColumnsOrderKey = @"NFBColumnsOrderV1";
-static NSString * const kNFBColumnsHiddenKey = @"NFBColumnsHiddenV1";
-static NSString * const kNFBColumnsEnabledTabsKey = @"NFBColumnsEnabledTabsV1";
-static NSString * const kNFBColumnEntryKindTimeline = @"timeline";
-static NSString * const kNFBColumnEntryKindTab = @"tab";
-
 static NSString *nfb_columnEntryIdentity(NSDictionary *entry) {
     id value = entry[@"id"];
     return [value isKindOfClass:NSString.class] ? (NSString *)value : @"";
