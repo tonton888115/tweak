@@ -1576,7 +1576,9 @@ static NSString *gNFBGuideBorrowReason = @"(not attempted)";  // last borrow out
 // search pane) via the app-split's own -private_removeExtendedContentViewController, so the split
 // re-lays-out the primary content (our columns) to the full width — instead of hiding it + manually
 // resizing (which froze before). Restored on columns-off. See [[neofreebird-liquidglass-and-open-bugs]].
-static BOOL gNFBExtendedContentRemoved = NO;
+static BOOL gNFBExtendedContentRemoved = NO;        // we've decided about removal (gates trends + scheduling); does NOT mean private_remove ran
+static BOOL gNFBExtendedContentActuallyRemoved = NO; // private_removeExtendedContentViewController actually ran → ONLY then may we call add (Codex: avoid unbalanced add)
+static __weak UIViewController *gNFBExtRemovedSplit = nil;  // the split we removed the rail from, for a robust restore that doesn't need paging
 static BOOL gNFBExtRemoveScheduled = NO;   // a one-shot deferred remove is queued (Codex: don't remove during the layout pass)
 // User chose "remove the right pane + move search into a column": we also hide the app-split
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
@@ -2960,16 +2962,19 @@ static UIViewController *nfb_columnsAppSplitForPaging(UIViewController *paging) 
 // crash leaves the in-flight stamp → next launch promotes it to a crashed stamp and stops trying for
 // this build, so the app self-recovers). Idempotent via gNFBExtendedContentRemoved.
 static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL removed) {
-    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) {
-        if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: skip notPad"); return;
-    }
-    UIViewController *split = nfb_columnsAppSplitForPaging(paging);
-    if (!split) { if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: splitNil paging=%@", paging ? NSStringFromClass(paging.class) : @"nil"]); return; }
     NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
     static NSInteger const kExtBuild = 26;
     if (removed) {
+        if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) {
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: skip notPad"); return;
+        }
         if (gNFBExtendedContentRemoved) { if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: alreadyRemoved"); return; }
-        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: noSidebar (nothing to remove) -> flag set"); return; }
+        UIViewController *split = nfb_columnsAppSplitForPaging(paging);
+        if (!split) { if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: splitNil paging=%@", paging ? NSStringFromClass(paging.class) : @"nil"]); return; }
+        // Decision paths below set gNFBExtendedContentRemoved (so we stop trying / stop showing trends)
+        // but NOT gNFBExtendedContentActuallyRemoved — the latter is set ONLY when the private remove
+        // really runs, so restore never calls add on a rail we never removed (Codex).
+        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: noSidebar (nothing to remove)"); return; }
         SEL sel = @selector(private_removeExtendedContentViewController);
         if (![split respondsToSelector:sel]) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: noSelector on %@", NSStringFromClass(split.class)]); return; }
         if ([defs integerForKey:@"NFBExtContentCrashedBuild"] == kExtBuild) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: skip (crashed before this build)"); return; }
@@ -2983,16 +2988,28 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
         @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
         [defs removeObjectForKey:@"NFBExtContentInFlightBuild"]; [defs synchronize];
         gNFBExtendedContentRemoved = YES;
+        gNFBExtendedContentActuallyRemoved = YES;   // ONLY here — guards the add on restore
+        gNFBExtRemovedSplit = split;                  // remember the exact split for a paging-independent restore
         [split setNeedsLayout];   // Codex: let the split re-flow on its own; do NOT force layout here
         if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
     } else {
-        if (!gNFBExtendedContentRemoved) { if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: restoreSkipped (not removed)"); return; }
+        // Restore. Only re-add if we actually removed; use the stored split so this works even when
+        // paging is unavailable (e.g., disabled via a path that can't resolve the home pager).
+        if (!gNFBExtendedContentActuallyRemoved) {
+            gNFBExtendedContentRemoved = NO; gNFBExtRemoveScheduled = NO; gNFBExtRemovedSplit = nil;
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: restoreSkipped (never actually removed)");
+            return;
+        }
+        UIViewController *split = gNFBExtRemovedSplit ?: nfb_columnsAppSplitForPaging(paging);
         SEL sel = @selector(private_addExtendedContentViewController);
-        if ([split respondsToSelector:sel]) {
+        if (split && [split respondsToSelector:sel]) {
             @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
             [split setNeedsLayout];
         }
+        gNFBExtendedContentActuallyRemoved = NO;
         gNFBExtendedContentRemoved = NO;
+        gNFBExtRemoveScheduled = NO;
+        gNFBExtRemovedSplit = nil;
         if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: restored");
     }
 }
@@ -3174,16 +3191,22 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         gNFBExtRemoveScheduled = YES;
         __weak UIViewController *wpaging = paging;
         dispatch_async(dispatch_get_main_queue(), ^{
-            nfb_columnsSetExtendedContentRemoved(wpaging, YES);
+            // Codex: the schedule may have been cancelled by nfb_restoreInlineColumns (columns turned
+            // off) before this fired — only remove if still scheduled, paging alive, and columns active.
+            if (gNFBExtRemoveScheduled && wpaging && gInlineColumnsEnabled) {
+                nfb_columnsSetExtendedContentRemoved(wpaging, YES);
+            }
             gNFBExtRemoveScheduled = NO;
         });
     }
-    // With the rail removed there is no trends sidebar to transplant; the search column is the borrowed
-    // Guide (re-hosted in a later build). For now keep ATTEMPTING the borrow so its outcome is logged
-    // (guideBorrowState) — but do not host it yet. The trends path stays only as a fallback if the rail
-    // could not be removed.
+    // Build 26 scope: confirm deployment (layout[b26] marker) + the width fix (rail removal) ONLY.
+    // No search column this build — the trends transplant crashed on trend-tap, and hosting the borrowed
+    // guide is deferred until width + deployment are confirmed (and Codex flagged hosting risks). On
+    // iPad we always schedule the rail removal, so the trends branch below never runs there (gated on
+    // !removed && !scheduled); it stays compiled so the trends helpers keep their references. The big
+    // search-column hosting block further down is skipped because searchColumnVC stays nil.
     UIViewController *searchColumnVC = nil;
-    if (!gNFBExtendedContentRemoved) {
+    if (!gNFBExtendedContentRemoved && !gNFBExtRemoveScheduled) {
         searchColumnVC = nfb_iPadColumnsSearchSidebarVC(paging);
         if (searchColumnVC && [searchColumnVC isViewLoaded] && searchColumnVC.view) {
             if (nfb_searchColumnVCUsableForCurrentSplit(paging, nativeScrollView, searchColumnVC.view)) {
@@ -3192,14 +3215,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
                 searchColumnVC = nil;
             }
         }
-    } else if (!gNFBColumnsGuideBorrowFailed || gNFBLogRecording) {
-        UIViewController *gh = nfb_columnsBorrowGuideHost(paging);
-        if (gNFBLogRecording) {
-            static NSString *lastBorrowStateKey2 = nil;
-            NSString *bk = [NSString stringWithFormat:@"guideBorrowState failed=%d host=%d attempts=%d reason=%@",
-                gNFBColumnsGuideBorrowFailed ? 1 : 0, gh ? 1 : 0, gNFBGuideBorrowAttempts, gNFBGuideBorrowReason ?: @"-"];
-            if (![bk isEqualToString:lastBorrowStateKey2]) { lastBorrowStateKey2 = [bk copy]; NFBLogEvent(bk); }
-        }
+        searchColumnVC = nil;   // do not host the trends column this build (it crashed on trend-tap)
     }
 
     UIView *host = nfb_columnsHostViewForPaging(paging);
@@ -3632,6 +3648,11 @@ static void nfb_rememberInlineColumnsOriginals(UIScrollView *scrollView) {
 }
 
 static void nfb_restoreInlineColumns(UIViewController *paging) {
+    // Issue B (Codex): restore the iPad extended-content rail FIRST, before any early return, and via
+    // the stored split so it does not depend on paging being a resolvable home pager — otherwise the
+    // rail could be left permanently removed when restore is reached through a short-circuit path.
+    gNFBExtRemoveScheduled = NO;
+    nfb_columnsSetExtendedContentRemoved(paging, NO);
     if (!nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
     nfb_removeColumnsOverlay();
     nfb_setColumnsSegmentedHiddenForPaging(paging, NO);
@@ -3641,9 +3662,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     BOOL wasApplied = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) != nil;
     if (!wasApplied) return;
 
-    // Issue B: restore the iPad extended-content rail we removed for full-width columns.
-    gNFBExtRemoveScheduled = NO;
-    nfb_columnsSetExtendedContentRemoved(paging, NO);
+    // (extended-content rail already restored at the top of this function, before early returns)
     // Detach the borrowed guide (we own it) from the paging controller + remove its view; keep the
     // cached instance for reuse on the next columns-open. Reset the content-ready latch so it re-proves
     // itself (the view tree is torn down on detach).
@@ -4714,7 +4733,12 @@ static NSString *nfb_buildDiagnosticReport(void) {
 static void nfb_layoutActiveHomePaging(void) {
     UIViewController *paging = gInlineColumnsEnabled ? nfb_findVisibleHomePagingController() : nfb_findAnyHomePagingController();
     if (!paging || ![paging isViewLoaded]) {
-        if (!gInlineColumnsEnabled) nfb_removeColumnsOverlay();
+        if (!gInlineColumnsEnabled) {
+            nfb_removeColumnsOverlay();
+            // Codex: columns are off but we couldn't resolve a pager — still restore the extended-content
+            // rail (the helper uses the stored split, so paging is not required).
+            if (gNFBExtendedContentActuallyRemoved) { gNFBExtRemoveScheduled = NO; nfb_columnsSetExtendedContentRemoved(nil, NO); }
+        }
         return;
     }
     [paging.view setNeedsLayout];
