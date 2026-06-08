@@ -1578,7 +1578,7 @@ static NSString *gNFBGuideBorrowReason = @"(not attempted)";  // last borrow out
 // resizing (which froze before). Restored on columns-off. See [[neofreebird-liquidglass-and-open-bugs]].
 static BOOL gNFBExtendedContentRemoved = NO;        // we've decided about removal (gates trends + scheduling); does NOT mean private_remove ran
 static BOOL gNFBExtendedContentActuallyRemoved = NO; // private_removeExtendedContentViewController actually ran → ONLY then may we call add (Codex: avoid unbalanced add)
-static __weak UIViewController *gNFBExtRemovedSplit = nil;  // the split we removed the rail from, for a robust restore that doesn't need paging
+static UIViewController *gNFBExtRemovedSplit = nil;  // strong: the split we removed the rail from, kept alive until restore so the rail is never abandoned (Codex). Cleared (released) on restore. The app-split is long-lived so this is plain ownership, not a cycle.
 static BOOL gNFBExtRemoveScheduled = NO;   // a one-shot deferred remove is queued (Codex: don't remove during the layout pass)
 // User chose "remove the right pane + move search into a column": we also hide the app-split
 // secondary host (the persistent iPad 587pt trends/search panel) so it is not left as an empty
@@ -2985,13 +2985,18 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
             return;
         }
         [defs setInteger:kExtBuild forKey:@"NFBExtContentInFlightBuild"]; [defs synchronize];
-        @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
+        BOOL removeOK = NO;
+        @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); removeOK = YES; } @catch (NSException *e) {}
         [defs removeObjectForKey:@"NFBExtContentInFlightBuild"]; [defs synchronize];
-        gNFBExtendedContentRemoved = YES;
-        gNFBExtendedContentActuallyRemoved = YES;   // ONLY here — guards the add on restore
-        gNFBExtRemovedSplit = split;                  // remember the exact split for a paging-independent restore
-        [split setNeedsLayout];   // Codex: let the split re-flow on its own; do NOT force layout here
-        if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
+        gNFBExtendedContentRemoved = YES;   // stop retrying regardless
+        if (removeOK) {
+            gNFBExtendedContentActuallyRemoved = YES;   // ONLY on a throw-free remove — guards the add on restore
+            gNFBExtRemovedSplit = split;                 // remember the exact split for a paging-independent restore
+            [split setNeedsLayout];   // Codex: let the split re-flow on its own; do NOT force layout here
+            if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b26]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
+        } else {
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: remove threw (not marked removed)");
+        }
     } else {
         // Restore. Only re-add if we actually removed; use the stored split so this works even when
         // paging is unavailable (e.g., disabled via a path that can't resolve the home pager).
