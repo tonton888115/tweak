@@ -3005,16 +3005,19 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
             if (gNFBLogRecording) NFBLogEvent(@"extContent[b26]: restoreSkipped (never actually removed)");
             return;
         }
-        // Stale-split identity guard (Codex re-audit#3): the app-split can be torn down and rebuilt
-        // (rotation, multitasking, scene changes). After a rebuild the stored reference is stale —
-        // it points at a detached split, while the freshly rebuilt live split already owns its own
-        // rail. Re-add ONLY to the exact split we removed from, and only while it is still live
-        // (attached to a window). Otherwise drop the stale reference and clear flags (no double-add,
-        // no add on a dead split); state self-heals on the next columns on/off cycle.
+        // Stale-split guard (Codex re-audit#3/#4): the app-split can be torn down and rebuilt
+        // (rotation, multitasking, scene changes), and restore may be invoked from a DIFFERENT or
+        // multi-window paging than the one we removed from. The criterion is split IDENTITY +
+        // liveness, NOT equality with the paging-resolved split: re-add the rail to the EXACT split
+        // we removed it from, as long as that split is still attached to a window — even if the
+        // paging passed here resolves to a different live split (that case must NOT drop our still-
+        // live stored split — Codex re-audit#4). A detached stored split (window == nil) means it was
+        // torn down/replaced; the replacement owns its own rail, so we skip the add. We never add to
+        // the paging-resolved split (that would double a rail), and we always clear flags + release
+        // the strong ref below, so a torn-down split is never retained as a zombie.
         UIViewController *stored = gNFBExtRemovedSplit;
-        UIViewController *liveSplit = nfb_columnsAppSplitForPaging(paging);
-        BOOL storedIsLive = stored && stored.viewIfLoaded.window != nil &&
-                            (liveSplit == nil || liveSplit == stored);
+        UIViewController *liveSplit = nfb_columnsAppSplitForPaging(paging);  // diagnostic only (logged below)
+        BOOL storedIsLive = stored && stored.viewIfLoaded.window != nil;
         UIViewController *split = storedIsLive ? stored : nil;
         SEL sel = @selector(private_addExtendedContentViewController);
         if (split && [split respondsToSelector:sel]) {
