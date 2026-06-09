@@ -4832,7 +4832,7 @@ static BOOL BHTHandleTabSelectionRequest(UIViewController *tabBarController, NSI
         if (!gBHTUserTabTouchSelectionInProgress && !realTabBarTap) {
             BHTUpdateColumnsTabSelection(tabBarController, YES);
             NFBUpdateStreamButtonVisibility();
-            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b48] source=%@ index=%ld page=%@",
+            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b49] source=%@ index=%ld page=%@",
                 source ?: @"?", (long)index, page ?: @"-"]);
             return YES;
         }
@@ -5086,18 +5086,6 @@ static NSInteger BHTSetFloatingComposeButtonsHiddenInView(UIView *view, UIView *
     return count;
 }
 
-static NSInteger BHTSetFloatingComposeButtonsHiddenForColumns(BOOL hidden) {
-    NSInteger count = 0;
-    UIViewController *host = gBHTColumnsHostController;
-    if (host.view) count += BHTSetFloatingComposeButtonsHiddenInView(host.view, host.view, hidden, 0);
-    for (UIWindow *window in UIApplication.sharedApplication.windows) {
-        if (!window.hidden && window.alpha > 0.01) {
-            count += BHTSetFloatingComposeButtonsHiddenInView(window, window, hidden, 0);
-        }
-    }
-    return count;
-}
-
 static void BHTBringTabChromeToFront(UIViewController *tabBarController) {
     NSArray *tabViews = nil;
     @try {
@@ -5231,58 +5219,6 @@ NSString *BHTColumnsModeDiagnostic(void) {
         (unsigned long)tabs.count];
 }
 
-static void BHTShowColumnsOverlayOnTabBar(UIViewController *tabBarController) {
-    if (!tabBarController || !tabBarController.view.window) return;
-    if (gBHTColumnsWindow && gBHTColumnsNavigationController) {
-        BHTLayoutColumnsOverlay();
-        BHTUpdateColumnsTabSelection(tabBarController, YES);
-        return;
-    }
-    BHTDismissColumnsMode();
-
-    Class columnsClass = NSClassFromString(@"NFBColumnsViewController");
-    if (!columnsClass) return;
-    UIViewController *columns = [[columnsClass alloc] init];
-    UIViewController *homeContainer = BHTFindHomeContainerController(tabBarController, 0);
-    if (homeContainer) {
-        @try {
-            [columns setValue:homeContainer forKey:@"sourceHomeContainer"];
-        } @catch (NSException *e) {
-        }
-    }
-    @try {
-        [columns setValue:tabBarController forKey:@"sourceTabBarController"];
-    } @catch (NSException *e) {
-    }
-
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:columns];
-    nav.view.backgroundColor = UIColor.systemBackgroundColor;
-    nav.navigationBar.translucent = NO;
-
-    UIWindow *baseWindow = tabBarController.view.window ?: BHT_activeKeyWindow();
-    UIWindow *columnsWindow = nil;
-    if (@available(iOS 13.0, *)) {
-        if (baseWindow.windowScene) columnsWindow = [[UIWindow alloc] initWithWindowScene:baseWindow.windowScene];
-    }
-    CGRect windowFrame = baseWindow ? baseWindow.bounds : UIScreen.mainScreen.bounds;
-    if (!columnsWindow) columnsWindow = [[UIWindow alloc] initWithFrame:windowFrame];
-    columnsWindow.frame = windowFrame;
-    columnsWindow.windowLevel = MAX(baseWindow.windowLevel + 10.0, UIWindowLevelAlert + 2.0);
-    columnsWindow.backgroundColor = UIColor.systemBackgroundColor;
-    columnsWindow.rootViewController = nav;
-    columnsWindow.hidden = NO;
-
-    gBHTColumnsPreviousKeyWindow = baseWindow;
-    gBHTColumnsWindow = columnsWindow;
-    gBHTColumnsNavigationController = nav;
-    gBHTColumnsHostController = tabBarController;
-    gBHTColumnsOverlayView = nil;
-    NFBSetInlineColumnsEnabled(NO);
-    [columnsWindow makeKeyAndVisible];
-    BHTLayoutColumnsOverlay();
-    BHTUpdateColumnsTabSelection(tabBarController, YES);
-}
-
 void BHTPresentColumnsMode(void) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ BHTPresentColumnsMode(); });
@@ -5297,7 +5233,7 @@ void BHTPresentColumnsMode(void) {
         UIViewController *selectionRoot = tabBarController ?: activeWindow.rootViewController;
         if (selectionRoot) BHTUpdateColumnsTabSelection(selectionRoot, YES);
         NFBColumnsRetapFocusAndRefresh();
-        NFBLogEvent(@"present.alreadyInline retapFocus[b48]");
+        NFBLogEvent(@"present.alreadyInline retapFocus[b49]");
         return;
     }
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
@@ -5552,7 +5488,7 @@ static void BHTPresentColumnsViewController(void) {
     BOOL markedUserTabTouch = (!isHome && !isColumns && gBHTColumnsIntent);
     if (markedUserTabTouch) {
         gBHTUserTabTouchSelectionInProgress = YES;
-        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b48] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
+        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b49] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
     }
     %orig(touches, event);
     if (markedUserTabTouch) {
@@ -5744,24 +5680,6 @@ static BOOL isTimestampText(NSString *text) {
     }
 
     return YES;
-}
-
-// Helper to find player controls in view hierarchy
-static UIView *findPlayerControlsInHierarchy(UIView *startView) {
-    if (!startView) return nil;
-
-    __block UIView *playerControls = nil;
-    BH_EnumerateSubviewsRecursively(startView, ^(UIView *view) {
-        if (playerControls) return;
-
-        NSString *className = NSStringFromClass([view class]);
-        if ([className containsString:@"PlayerControlsView"] ||
-            [className containsString:@"VideoControls"]) {
-            playerControls = view;
-        }
-    });
-
-    return playerControls;
 }
 
 %hook UILabel
@@ -6083,10 +6001,6 @@ static BOOL BHT_isInConversationContainerHierarchy(UIViewController *viewControl
 }
 
 %end
-
-static NSBundle *BHBundle() {
-    return [NSBundle bundleWithIdentifier:@"com.bandarhelal.BHTwitter"];
-}
 
 // MARK: Theme TFNBarButtonItemButtonV1
 %hook TFNBarButtonItemButtonV1
