@@ -88,7 +88,7 @@
 + (BOOL)restoreReplyContext;
 + (BOOL)disableXChat;
 
-// Streaming timeline (native auto-refresh / 垂れ流し)
+// Streaming timeline (native auto-refresh)
 + (BOOL)autoStreamTimeline;
 + (NSInteger)autoStreamInterval;
 

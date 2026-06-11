@@ -383,7 +383,7 @@
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"disable_xchat"];
 }
 
-// Streaming timeline (native auto-refresh / 垂れ流し)
+// Streaming timeline (native auto-refresh)
 + (BOOL)autoStreamTimeline {
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"auto_stream_timeline"];
 }

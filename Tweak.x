@@ -4832,7 +4832,7 @@ static BOOL BHTHandleTabSelectionRequest(UIViewController *tabBarController, NSI
         if (!gBHTUserTabTouchSelectionInProgress && !realTabBarTap) {
             BHTUpdateColumnsTabSelection(tabBarController, YES);
             NFBUpdateStreamButtonVisibility();
-            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b64] source=%@ index=%ld page=%@",
+            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b65] source=%@ index=%ld page=%@",
                 source ?: @"?", (long)index, page ?: @"-"]);
             return YES;
         }
@@ -5059,7 +5059,7 @@ void BHTPresentColumnsMode(void) {
         UIViewController *selectionRoot = tabBarController ?: activeWindow.rootViewController;
         if (selectionRoot) BHTUpdateColumnsTabSelection(selectionRoot, YES);
         NFBColumnsRetapFocusAndRefresh();
-        NFBLogEvent(@"present.alreadyInline retapFocus[b64]");
+        NFBLogEvent(@"present.alreadyInline retapFocus[b65]");
         return;
     }
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
@@ -5311,7 +5311,7 @@ static void BHTPresentColumnsViewController(void) {
     BOOL markedUserTabTouch = (!isHome && !isColumns && gBHTColumnsIntent);
     if (markedUserTabTouch) {
         gBHTUserTabTouchSelectionInProgress = YES;
-        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b64] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
+        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b65] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
     }
     %orig(touches, event);
     if (markedUserTabTouch) {
