@@ -58,6 +58,7 @@ extern void NFBSetInlineColumnsEnabled(BOOL enabled);
 extern void BHTPresentColumnsMode(void);
 extern UIViewController *NFBMakeColumnsManageViewController(void);
 extern void NFBStreamPrefsChanged(void);
+extern NSString *BHTColumnsHostPageID(void);
 
 // BHTBundle key with an inline English fallback: a sideload repackage can ship a stale
 // BHTwitter.bundle, and BHTBundle returns the raw KEY for unknown keys.
@@ -2944,6 +2945,7 @@ if ([type isEqualToString:@"compactButton"]) {
         @{ @"type": @"compactButton", @"parentKey": @"auto_stream_timeline", @"key": @"auto_stream_interval_button", @"titleKey": mst_nfbLoc(@"NFB_SETTINGS_INTERVAL_ROW", @"Change auto-refresh interval…"), @"action": @"showAutoStreamIntervalPicker:" },
         @{ @"type": @"compactButton", @"key": @"columns_mode_button", @"titleKey": mst_nfbLoc(@"NFB_SETTINGS_COLUMNS_TOGGLE", @"Toggle columns mode (TweetDeck-style)"), @"action": @"toggleColumnsModeFromSettings:" },
         @{ @"type": @"compactButton", @"key": @"columns_manage_button", @"titleKey": mst_nfbLoc(@"NFB_SETTINGS_COLUMNS_MANAGE", @"Manage columns (reorder / show)…"), @"action": @"showColumnsManageFromSettings:" },
+        @{ @"type": @"compactButton", @"key": @"columns_host_button", @"titleKey": mst_nfbLoc(@"NFB_SETTINGS_COLUMNS_HOST", @"Columns host tab…"), @"action": @"showColumnsHostPicker:" },
         @{ @"key": @"padlock", @"titleKey": @"PADLOCK_OPTION_TITLE", @"subtitleKey": @"PADLOCK_OPTION_DETAIL_TITLE", @"default": @NO },
         @{ @"key": @"hide_topics", @"titleKey": @"HIDE_TOPICS_OPTION_TITLE", @"subtitleKey": @"HIDE_TOPICS_OPTION_DETAIL_TITLE", @"default": @YES },
         @{ @"key": @"hide_topics_to_follow", @"titleKey": @"HIDE_TOPICS_TO_FOLLOW_OPTION", @"subtitleKey": @"HIDE_TOPICS_TO_FOLLOW_OPTION_DETAIL_TITLE", @"default": @YES },
@@ -3210,6 +3212,30 @@ if ([type isEqualToString:@"compactButton"]) {
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationFormSheet;
     [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)showColumnsHostPicker:(NSDictionary *)sender {
+    NSString *current = BHTColumnsHostPageID();
+    NSString *communitiesName = mst_nfbLoc(@"CUSTOM_TAB_BAR_COMMUNITIES", @"Communities");
+    NSString *listsName = mst_nfbLoc(@"CUSTOM_TAB_BAR_LISTS", @"Lists");
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:mst_nfbLoc(@"NFB_HOST_PICKER_TITLE", @"Which tab hosts Columns?")
+        message:[NSString stringWithFormat:mst_nfbLoc(@"NFB_HOST_PICKER_MSG", @"Current: %@. The chosen tab opens Columns instead of its native page; the other tab goes back to normal. Fully applies after restarting the app."),
+                 [current isEqualToString:@"lists"] ? listsName : communitiesName]
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    void (^choose)(NSString *) = ^(NSString *page){
+        [[NSUserDefaults standardUserDefaults] setObject:page forKey:@"columns_host_page"];
+        // Force-show the chosen host's native tab (the feature-switch hook reads these keys),
+        // so the Columns tab is actually present in the bar.
+        NSString *showKey = [page isEqualToString:@"lists"] ? @"ios_tab_bar_default_show_lists" : @"ios_tab_bar_default_show_communities";
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:showKey];
+    };
+    [ac addAction:[UIAlertAction actionWithTitle:communitiesName style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ choose(@"communities"); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:listsName style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ choose(@"lists"); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:mst_nfbLoc(@"CANCEL_BUTTON_TITLE", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    ac.popoverPresentationController.sourceView = self.view;
+    ac.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1.0, 1.0);
+    ac.popoverPresentationController.permittedArrowDirections = 0;
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 @end

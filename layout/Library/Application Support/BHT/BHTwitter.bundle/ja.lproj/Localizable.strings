@@ -555,3 +555,6 @@
 "NFB_SETTINGS_COLUMNS_MANAGE" = "カラム管理（並び替え・表示）…";
 "NFB_INTERVAL_PICKER_TITLE" = "自動更新の間隔";
 "NFB_INTERVAL_CURRENT" = "現在: %ld秒";
+"NFB_SETTINGS_COLUMNS_HOST" = "カラムのホストタブ…";
+"NFB_HOST_PICKER_TITLE" = "カラムをどのタブに表示する？";
+"NFB_HOST_PICKER_MSG" = "現在: %@。選んだタブがカラムの入口になり、本来のページは開けなくなります（もう一方のタブは通常に戻ります）。アプリ再起動で完全に反映されます。";

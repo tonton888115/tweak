@@ -4593,8 +4593,16 @@ static NSString *BHTPageOfTabView(T1TabView *tabView) {
     return page;
 }
 
+// The native tab that hosts Columns mode: tapping the host tab opens Columns instead of its
+// native page; every other tab is untouched. Configurable (Settings → Layout → Columns host
+// tab) so users who want the real Communities tab can host Columns on the Lists tab instead.
+NSString *BHTColumnsHostPageID(void) {
+    NSString *page = [[NSUserDefaults standardUserDefaults] stringForKey:@"columns_host_page"];
+    return [page isEqualToString:@"lists"] ? @"lists" : @"communities";
+}
+
 static BOOL BHTIsColumnsPageID(NSString *page) {
-    return [page isEqualToString:@"communities"];
+    return page.length && [page isEqualToString:BHTColumnsHostPageID()];
 }
 
 static BOOL BHTIsColumnsTabView(T1TabView *tabView) {
@@ -4824,7 +4832,7 @@ static BOOL BHTHandleTabSelectionRequest(UIViewController *tabBarController, NSI
         if (!gBHTUserTabTouchSelectionInProgress && !realTabBarTap) {
             BHTUpdateColumnsTabSelection(tabBarController, YES);
             NFBUpdateStreamButtonVisibility();
-            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b63] source=%@ index=%ld page=%@",
+            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b64] source=%@ index=%ld page=%@",
                 source ?: @"?", (long)index, page ?: @"-"]);
             return YES;
         }
@@ -5051,7 +5059,7 @@ void BHTPresentColumnsMode(void) {
         UIViewController *selectionRoot = tabBarController ?: activeWindow.rootViewController;
         if (selectionRoot) BHTUpdateColumnsTabSelection(selectionRoot, YES);
         NFBColumnsRetapFocusAndRefresh();
-        NFBLogEvent(@"present.alreadyInline retapFocus[b63]");
+        NFBLogEvent(@"present.alreadyInline retapFocus[b64]");
         return;
     }
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
@@ -5171,7 +5179,17 @@ static void BHTPresentColumnsViewController(void) {
 
 %new
 - (void)bh_setupColumnsTabIfNeeded {
-    if (!BHTIsColumnsTabView((T1TabView *)self)) return;
+    UITapGestureRecognizer *existingTap = objc_getAssociatedObject(self, &kBHTColumnsTapGestureKey);
+    if (!BHTIsColumnsTabView((T1TabView *)self)) {
+        // Host-tab pref changed: this tab no longer hosts Columns. Remove the stale tap gesture
+        // (it cancels touches, so leaving it would make the tab unresponsive); Twitter's own
+        // label updates restore the native title.
+        if (existingTap) {
+            [self removeGestureRecognizer:existingTap];
+            objc_setAssociatedObject(self, &kBHTColumnsTapGestureKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        return;
+    }
 
     UILabel *titleLabel = [self valueForKey:@"titleLabel"];
     if (titleLabel) {
@@ -5182,7 +5200,7 @@ static void BHTPresentColumnsViewController(void) {
     self.userInteractionEnabled = YES;
     BHTApplyTabVisibility((T1TabView *)self);
 
-    if (!objc_getAssociatedObject(self, &kBHTColumnsTapGestureKey)) {
+    if (!existingTap) {
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bh_openColumns:)];
         tap.cancelsTouchesInView = YES;
         tap.delaysTouchesBegan = NO;
@@ -5293,7 +5311,7 @@ static void BHTPresentColumnsViewController(void) {
     BOOL markedUserTabTouch = (!isHome && !isColumns && gBHTColumnsIntent);
     if (markedUserTabTouch) {
         gBHTUserTabTouchSelectionInProgress = YES;
-        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b63] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
+        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b64] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
     }
     %orig(touches, event);
     if (markedUserTabTouch) {

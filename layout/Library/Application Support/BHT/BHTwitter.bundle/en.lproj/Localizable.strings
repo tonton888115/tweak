@@ -555,3 +555,6 @@
 "NFB_SETTINGS_COLUMNS_MANAGE" = "Manage columns (reorder / show)…";
 "NFB_INTERVAL_PICKER_TITLE" = "Auto-refresh interval";
 "NFB_INTERVAL_CURRENT" = "Current: %lds";
+"NFB_SETTINGS_COLUMNS_HOST" = "Columns host tab…";
+"NFB_HOST_PICKER_TITLE" = "Which tab hosts Columns?";
+"NFB_HOST_PICKER_MSG" = "Current: %@. The chosen tab opens Columns instead of its native page; the other tab goes back to normal. Fully applies after restarting the app.";

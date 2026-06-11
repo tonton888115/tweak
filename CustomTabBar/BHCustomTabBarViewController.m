@@ -249,7 +249,7 @@ static UIFont *TwitterChirpFont(TwitterFontStyle style) {
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_HOME" pageID:@"home"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_EXPLORE" pageID:@"guide"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_SPACES" pageID:@"audiospace"],
-            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_COLUMNS" pageID:@"communities"],
+            [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_COMMUNITIES" pageID:@"communities"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_NOTIFICATIONS" pageID:@"ntab"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_MESSAGES" pageID:@"messages"],
             [[BHCustomTabBarItem alloc] initWithTitle:@"CUSTOM_TAB_BAR_GROK" pageID:@"grok"],
@@ -261,12 +261,22 @@ static UIFont *TwitterChirpFont(TwitterFontStyle style) {
     }
     BOOL migrateColumnsFromMedia = NO;
     BOOL mediaWasEnabled = [self.enabledPageIDs containsObject:@"media"];
+    // The Columns host tab (default communities, configurable to lists) is shown as "Columns"
+    // in this list; every non-host tab keeps its native name so e.g. the real Communities tab
+    // stays reachable when Columns is hosted on Lists.
+    NSString *hostPageID = [[NSUserDefaults standardUserDefaults] stringForKey:@"columns_host_page"];
+    if (![hostPageID isEqualToString:@"lists"]) hostPageID = @"communities";
+    NSDictionary<NSString *, NSString *> *nativeTitles = @{ @"communities": @"CUSTOM_TAB_BAR_COMMUNITIES",
+                                                            @"lists": @"CUSTOM_TAB_BAR_LISTS",
+                                                            @"media": @"CUSTOM_TAB_BAR_VIDEO" };
     for (BHCustomTabBarItem *item in self.allItems) {
-        if ([item.pageID isEqualToString:@"communities"]) {
+        if ([item.pageID isEqualToString:@"media"] && [item.title isEqualToString:@"CUSTOM_TAB_BAR_COLUMNS"]) {
+            migrateColumnsFromMedia = YES;   // early builds hosted Columns on the Video tab
+        }
+        if ([item.pageID isEqualToString:hostPageID]) {
             item.title = @"CUSTOM_TAB_BAR_COLUMNS";
-        } else if ([item.pageID isEqualToString:@"media"]) {
-            migrateColumnsFromMedia = [item.title isEqualToString:@"CUSTOM_TAB_BAR_COLUMNS"];
-            item.title = @"CUSTOM_TAB_BAR_VIDEO";
+        } else if (nativeTitles[item.pageID]) {
+            item.title = nativeTitles[item.pageID];
         }
     }
     if (migrateColumnsFromMedia || mediaWasEnabled) {
