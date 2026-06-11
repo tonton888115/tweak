@@ -59,6 +59,13 @@ extern void BHTPresentColumnsMode(void);
 extern UIViewController *NFBMakeColumnsManageViewController(void);
 extern void NFBStreamPrefsChanged(void);
 
+// BHTBundle key with an inline English fallback: a sideload repackage can ship a stale
+// BHTwitter.bundle, and BHTBundle returns the raw KEY for unknown keys.
+static NSString *mst_nfbLoc(NSString *key, NSString *fallback) {
+    NSString *value = [[BHTBundle sharedBundle] localizedStringForKey:key];
+    return (value.length && ![value isEqualToString:key]) ? value : fallback;
+}
+
 typedef NS_ENUM(NSInteger, TwitterFontStyle) {
     TwitterFontStyleRegular,
     TwitterFontStyleSemibold,
@@ -2931,13 +2938,12 @@ if ([type isEqualToString:@"compactButton"]) {
 - (void)buildToggleList {
     self.toggles = @[
         @{ @"key": @"auto_stream_timeline", @"titleKey": @"AUTO_STREAM_TIMELINE_OPTION_TITLE", @"subtitleKey": @"AUTO_STREAM_TIMELINE_OPTION_DETAIL_TITLE", @"default": @NO },
-        // NeoFreeBird streaming/columns rows. BHTBundle falls back to the key itself for unknown
-        // localization keys, so these literal titles render as-is (the streaming feature UI is
-        // Japanese throughout, same as the stream-button menu these mirror). The interval row is a
-        // child of the auto-stream toggle, like the font-picker rows under en_font.
-        @{ @"type": @"compactButton", @"parentKey": @"auto_stream_timeline", @"key": @"auto_stream_interval_button", @"titleKey": @"自動更新の間隔を変更…", @"action": @"showAutoStreamIntervalPicker:" },
-        @{ @"type": @"compactButton", @"key": @"columns_mode_button", @"titleKey": @"カラムモード（TweetDeck風）を切り替え", @"action": @"toggleColumnsModeFromSettings:" },
-        @{ @"type": @"compactButton", @"key": @"columns_manage_button", @"titleKey": @"カラム管理（並び替え・表示）…", @"action": @"showColumnsManageFromSettings:" },
+        // NeoFreeBird streaming/columns rows. titleKey is pre-resolved via mst_nfbLoc (localized
+        // string with an English fallback) so a stale sideload bundle never shows a raw key.
+        // The interval row is a child of the auto-stream toggle, like the font rows under en_font.
+        @{ @"type": @"compactButton", @"parentKey": @"auto_stream_timeline", @"key": @"auto_stream_interval_button", @"titleKey": mst_nfbLoc(@"NFB_SETTINGS_INTERVAL_ROW", @"Change auto-refresh interval…"), @"action": @"showAutoStreamIntervalPicker:" },
+        @{ @"type": @"compactButton", @"key": @"columns_mode_button", @"titleKey": mst_nfbLoc(@"NFB_SETTINGS_COLUMNS_TOGGLE", @"Toggle columns mode (TweetDeck-style)"), @"action": @"toggleColumnsModeFromSettings:" },
+        @{ @"type": @"compactButton", @"key": @"columns_manage_button", @"titleKey": mst_nfbLoc(@"NFB_SETTINGS_COLUMNS_MANAGE", @"Manage columns (reorder / show)…"), @"action": @"showColumnsManageFromSettings:" },
         @{ @"key": @"padlock", @"titleKey": @"PADLOCK_OPTION_TITLE", @"subtitleKey": @"PADLOCK_OPTION_DETAIL_TITLE", @"default": @NO },
         @{ @"key": @"hide_topics", @"titleKey": @"HIDE_TOPICS_OPTION_TITLE", @"subtitleKey": @"HIDE_TOPICS_OPTION_DETAIL_TITLE", @"default": @YES },
         @{ @"key": @"hide_topics_to_follow", @"titleKey": @"HIDE_TOPICS_TO_FOLLOW_OPTION", @"subtitleKey": @"HIDE_TOPICS_TO_FOLLOW_OPTION_DETAIL_TITLE", @"default": @YES },
@@ -3171,18 +3177,18 @@ if ([type isEqualToString:@"compactButton"]) {
 - (void)showAutoStreamIntervalPicker:(NSDictionary *)sender {
     NSInteger current = [[NSUserDefaults standardUserDefaults] integerForKey:@"auto_stream_interval"];
     if (current <= 0) current = 20;
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"自動更新の間隔"
-        message:[NSString stringWithFormat:@"現在: %ld秒", (long)current]
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:mst_nfbLoc(@"NFB_INTERVAL_PICKER_TITLE", @"Auto-refresh interval")
+        message:[NSString stringWithFormat:mst_nfbLoc(@"NFB_INTERVAL_CURRENT", @"Current: %lds"), (long)current]
         preferredStyle:UIAlertControllerStyleActionSheet];
     for (NSNumber *n in @[@5, @10, @15, @20, @30, @60]) {
         NSInteger sec = n.integerValue;
-        [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%ld秒", (long)sec] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:mst_nfbLoc(@"NFB_SECONDS_FMT", @"%lds"), (long)sec] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
             [[NSUserDefaults standardUserDefaults] setInteger:sec forKey:@"auto_stream_interval"];
             [[NSUserDefaults standardUserDefaults] synchronize];
             NFBStreamPrefsChanged();
         }]];
     }
-    [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:mst_nfbLoc(@"CANCEL_BUTTON_TITLE", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
     ac.popoverPresentationController.sourceView = self.view;
     ac.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1.0, 1.0);
     ac.popoverPresentationController.permittedArrowDirections = 0;

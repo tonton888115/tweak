@@ -57,6 +57,7 @@ jobs:
           sed -i '' "s/^TARGET.*$/TARGET := iphone:clang:${{ inputs.sdk_version }}:${{ inputs.target_version }}/" Makefile
           make clean || true
           make
+          make package
         env:
           THEOS: ${{ github.workspace }}/theos
 
@@ -79,4 +80,20 @@ jobs:
         with:
           name: BHTwitter-dylib-sideload
           path: out/BHTwitter.dylib
+          if-no-files-found: error
+
+      # The repackager takes the BHTwitter.bundle (Localizable.strings etc.) from the .deb,
+      # so bundle changes only reach the sideloaded IPA when a fresh deb ships with the dylib.
+      - name: Collect deb (bundle source for repackaging)
+        run: |
+          cd main
+          PKG=$(find packages -name '*.deb' | head -n1)
+          echo "deb: $PKG"
+          cp "$PKG" ../out/com.bandarhl.bhtwitter_5.2-1+debug_iphoneos-arm.deb
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: BHTwitter-deb
+          path: out/com.bandarhl.bhtwitter_5.2-1+debug_iphoneos-arm.deb
           if-no-files-found: error
