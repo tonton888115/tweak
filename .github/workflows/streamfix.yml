@@ -87,7 +87,7 @@ jobs:
       - name: Collect deb (bundle source for repackaging)
         run: |
           cd main
-          PKG=$(find packages -name '*.deb' | head -n1)
+          PKG=$(ls -t packages/*.deb | head -n1)
           echo "deb: $PKG"
           cp "$PKG" ../out/com.bandarhl.bhtwitter_5.2-1+debug_iphoneos-arm.deb
 
