@@ -13,6 +13,8 @@
 
 // Import external function to get theme color
 extern UIColor *BHTCurrentAccentColor(void);
+// Columns host tab pageID — communities/grok/profile, validated (Tweak.x)
+extern NSString *BHTColumnsHostPageID(void);
 
 // Interface declaration for TFNFloatingActionButton
 @interface TFNFloatingActionButton : UIView
@@ -261,14 +263,15 @@ static UIFont *TwitterChirpFont(TwitterFontStyle style) {
     }
     BOOL migrateColumnsFromMedia = NO;
     BOOL mediaWasEnabled = [self.enabledPageIDs containsObject:@"media"];
-    // The Columns host tab (default communities, configurable to lists) is shown as "Columns"
-    // in this list; every non-host tab keeps its native name so e.g. the real Communities tab
-    // stays reachable when Columns is hosted on Lists.
-    NSString *hostPageID = [[NSUserDefaults standardUserDefaults] stringForKey:@"columns_host_page"];
-    if (![hostPageID isEqualToString:@"lists"]) hostPageID = @"communities";
+    // The Columns host tab (default communities, configurable to grok/profile) is shown as
+    // "Columns" in this list; every non-host tab keeps its native name so e.g. the real
+    // Communities tab stays reachable when Columns is hosted elsewhere.
+    NSString *hostPageID = BHTColumnsHostPageID();
     NSDictionary<NSString *, NSString *> *nativeTitles = @{ @"communities": @"CUSTOM_TAB_BAR_COMMUNITIES",
                                                             @"lists": @"CUSTOM_TAB_BAR_LISTS",
-                                                            @"media": @"CUSTOM_TAB_BAR_VIDEO" };
+                                                            @"media": @"CUSTOM_TAB_BAR_VIDEO",
+                                                            @"grok": @"CUSTOM_TAB_BAR_GROK",
+                                                            @"profile": @"CUSTOM_TAB_BAR_PROFILE" };
     for (BHCustomTabBarItem *item in self.allItems) {
         if ([item.pageID isEqualToString:@"media"] && [item.title isEqualToString:@"CUSTOM_TAB_BAR_COLUMNS"]) {
             migrateColumnsFromMedia = YES;   // early builds hosted Columns on the Video tab
@@ -284,7 +287,11 @@ static UIFont *TwitterChirpFont(TwitterFontStyle style) {
         [self.enabledPageIDs addObject:@"communities"];
         [self persistChanges];
     }
-    
+    // b67: the host tab is force-shown (the picker set its ios_tab_bar_default_show_* switch),
+    // so show it as enabled here — otherwise a save with it unselected writes that switch back
+    // to NO and the Columns tab silently disappears from the bar.
+    [self.enabledPageIDs addObject:hostPageID];
+
     // Store initial state for comparison later
     self.originalEnabledPageIDs = [self.enabledPageIDs mutableCopy];
     
@@ -338,12 +345,15 @@ static UIFont *TwitterChirpFont(TwitterFontStyle style) {
     NSData *disabledData = [NSKeyedArchiver archivedDataWithRootObject:disabledItems];
     [[NSUserDefaults standardUserDefaults] setObject:enabledData forKey:@"allowed"];
     [[NSUserDefaults standardUserDefaults] setObject:disabledData forKey:@"hidden"];
-    // Keep feature flags in sync with tab choices
-    BOOL grokEnabled = [self.enabledPageIDs containsObject:@"grok"];
+    // Keep feature flags in sync with tab choices. b67: the Columns host tab's switch must
+    // survive every save — without it Twitter never creates the host tab and Columns loses
+    // its home, regardless of what the user selected in this grid.
+    NSString *columnsHost = BHTColumnsHostPageID();
+    BOOL grokEnabled = [self.enabledPageIDs containsObject:@"grok"] || [columnsHost isEqualToString:@"grok"];
     [[NSUserDefaults standardUserDefaults] setBool:grokEnabled forKey:@"ios_tab_bar_default_show_grok"];
-    BOOL profileEnabled = [self.enabledPageIDs containsObject:@"profile"];
+    BOOL profileEnabled = [self.enabledPageIDs containsObject:@"profile"] || [columnsHost isEqualToString:@"profile"];
     [[NSUserDefaults standardUserDefaults] setBool:profileEnabled forKey:@"ios_tab_bar_default_show_profile"];
-    BOOL communitiesEnabled = [self.enabledPageIDs containsObject:@"communities"];
+    BOOL communitiesEnabled = [self.enabledPageIDs containsObject:@"communities"] || [columnsHost isEqualToString:@"communities"];
     [[NSUserDefaults standardUserDefaults] setBool: communitiesEnabled forKey:@"ios_tab_bar_default_show_communities"];
     BOOL listsEnabled = [self.enabledPageIDs containsObject:@"lists"];
     [[NSUserDefaults standardUserDefaults] setBool:listsEnabled forKey:@"ios_tab_bar_default_show_lists"];

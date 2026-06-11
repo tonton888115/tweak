@@ -3215,22 +3215,30 @@ if ([type isEqualToString:@"compactButton"]) {
 }
 
 - (void)showColumnsHostPicker:(NSDictionary *)sender {
+    // b67: hosts limited to pages Twitter 11.35 can force-show client-side (an
+    // ios_tab_bar_default_show_* switch exists for exactly these three). Lists/media/audiospace
+    // have no such switch — their tabs cannot be summoned, so they were removed as host options.
     NSString *current = BHTColumnsHostPageID();
-    NSString *communitiesName = mst_nfbLoc(@"CUSTOM_TAB_BAR_COMMUNITIES", @"Communities");
-    NSString *listsName = mst_nfbLoc(@"CUSTOM_TAB_BAR_LISTS", @"Lists");
+    NSArray<NSString *> *hostPages = @[@"communities", @"grok", @"profile"];
+    NSDictionary<NSString *, NSString *> *hostNames = @{
+        @"communities": mst_nfbLoc(@"CUSTOM_TAB_BAR_COMMUNITIES", @"Communities"),
+        @"grok":        mst_nfbLoc(@"CUSTOM_TAB_BAR_GROK", @"Grok"),
+        @"profile":     mst_nfbLoc(@"CUSTOM_TAB_BAR_PROFILE", @"Profile"),
+    };
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:mst_nfbLoc(@"NFB_HOST_PICKER_TITLE", @"Which tab hosts Columns?")
         message:[NSString stringWithFormat:mst_nfbLoc(@"NFB_HOST_PICKER_MSG", @"Current: %@. The chosen tab opens Columns instead of its native page; the other tab goes back to normal. Fully applies after restarting the app."),
-                 [current isEqualToString:@"lists"] ? listsName : communitiesName]
+                 hostNames[current] ?: hostNames[@"communities"]]
         preferredStyle:UIAlertControllerStyleActionSheet];
     void (^choose)(NSString *) = ^(NSString *page){
         [[NSUserDefaults standardUserDefaults] setObject:page forKey:@"columns_host_page"];
         // Force-show the chosen host's native tab (the feature-switch hook reads these keys),
         // so the Columns tab is actually present in the bar.
-        NSString *showKey = [page isEqualToString:@"lists"] ? @"ios_tab_bar_default_show_lists" : @"ios_tab_bar_default_show_communities";
+        NSString *showKey = [NSString stringWithFormat:@"ios_tab_bar_default_show_%@", page];
         [[NSUserDefaults standardUserDefaults] setBool:YES forKey:showKey];
     };
-    [ac addAction:[UIAlertAction actionWithTitle:communitiesName style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ choose(@"communities"); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:listsName style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ choose(@"lists"); }]];
+    for (NSString *page in hostPages) {
+        [ac addAction:[UIAlertAction actionWithTitle:hostNames[page] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ choose(page); }]];
+    }
     [ac addAction:[UIAlertAction actionWithTitle:mst_nfbLoc(@"CANCEL_BUTTON_TITLE", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
     ac.popoverPresentationController.sourceView = self.view;
     ac.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1.0, 1.0);

@@ -4595,10 +4595,16 @@ static NSString *BHTPageOfTabView(T1TabView *tabView) {
 
 // The native tab that hosts Columns mode: tapping the host tab opens Columns instead of its
 // native page; every other tab is untouched. Configurable (Settings → Layout → Columns host
-// tab) so users who want the real Communities tab can host Columns on the Lists tab instead.
+// tab) so users who want the real Communities tab can host Columns on Grok or Profile instead.
+// b67: only pages this Twitter build can force-show client-side are eligible — T1Twitter checks
+// an ios_tab_bar_default_show_* switch for exactly communities / grok / profile, and no such
+// switch exists for lists / media / audiospace (verified against the 11.35 binaries), so those
+// tabs can never be summoned and cannot host Columns. A stale "lists" pref from b64-b66 falls
+// back to communities here.
 NSString *BHTColumnsHostPageID(void) {
     NSString *page = [[NSUserDefaults standardUserDefaults] stringForKey:@"columns_host_page"];
-    return [page isEqualToString:@"lists"] ? @"lists" : @"communities";
+    if ([page isEqualToString:@"grok"] || [page isEqualToString:@"profile"]) return page;
+    return @"communities";
 }
 
 static BOOL BHTIsColumnsPageID(NSString *page) {
@@ -4832,7 +4838,7 @@ static BOOL BHTHandleTabSelectionRequest(UIViewController *tabBarController, NSI
         if (!gBHTUserTabTouchSelectionInProgress && !realTabBarTap) {
             BHTUpdateColumnsTabSelection(tabBarController, YES);
             NFBUpdateStreamButtonVisibility();
-            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b66] source=%@ index=%ld page=%@",
+            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b67] source=%@ index=%ld page=%@",
                 source ?: @"?", (long)index, page ?: @"-"]);
             return YES;
         }
@@ -5059,7 +5065,7 @@ void BHTPresentColumnsMode(void) {
         UIViewController *selectionRoot = tabBarController ?: activeWindow.rootViewController;
         if (selectionRoot) BHTUpdateColumnsTabSelection(selectionRoot, YES);
         NFBColumnsRetapFocusAndRefresh();
-        NFBLogEvent(@"present.alreadyInline retapFocus[b66]");
+        NFBLogEvent(@"present.alreadyInline retapFocus[b67]");
         return;
     }
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
@@ -5311,7 +5317,7 @@ static void BHTPresentColumnsViewController(void) {
     BOOL markedUserTabTouch = (!isHome && !isColumns && gBHTColumnsIntent);
     if (markedUserTabTouch) {
         gBHTUserTabTouchSelectionInProgress = YES;
-        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b66] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
+        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b67] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
     }
     %orig(touches, event);
     if (markedUserTabTouch) {
