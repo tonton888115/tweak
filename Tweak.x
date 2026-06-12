@@ -19,6 +19,7 @@
 #import "BHTManager.h"
 #import "BHDimPalette.h"
 #import <math.h>
+#import <stdio.h>   // snprintf (b68 watchdog-suppression notice)
 #import "BHTBundle/BHTBundle.h"
 #import "TWHeaders.h"
 #import "SAMKeychain/SAMKeychain.h"
@@ -46,6 +47,7 @@ extern void NFBSetInlineColumnsEnabled(BOOL enabled);
 extern BOOL NFBInlineColumnsEnabled(void);
 extern void NFBLogEvent(NSString *msg);       // operation-log recorder (no-op unless recording)
 extern void NFBLogSnapshot(NSString *reason); // compact state snapshot (no-op unless recording)
+extern void NFBAppendCrashLogRaw(const char *s); // persistent-oplog raw append (works without recording)
 extern void NFBUpdateStreamButtonVisibility(void);
 extern void NFBColumnsRetapFocusAndRefresh(void);
 NSString *BHTColumnsLogFlags(void);           // columns flags + tab selectedIndex, used by the snapshot
@@ -2052,6 +2054,16 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
         return ![BHTManager restoreReplyContext];
     }
 
+    if ([key isEqualToString:@"ios_performance_watchdog_disabled"]) {
+        // b68: Twitter's hang watchdog turns any multi-second main-thread stall into a deliberate
+        // abort() — the device crash on search → tweet → profile was exactly that (SIGABRT raised
+        // from TFNTwitterWatchdogLogHang on a background queue, captured by the b67 signal logger).
+        // A freeze the user can wait out must never kill the app: report the watchdog as disabled.
+        // The crash() no-op hooks below stay as the second line of defense, and the b68 hang
+        // sampler records the stall stacks so the underlying hang can be root-fixed.
+        return true;
+    }
+
     if ([key isEqualToString:@"ios_tab_bar_default_show_grok"]) {
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"ios_tab_bar_default_show_grok"];
     }
@@ -2078,6 +2090,37 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
     
     return %orig;
 }
+%end
+
+// MARK: b68 watchdog defuse — every TFNTwitterWatchdog flavor funnels a detected main-thread
+// hang into -crash (log + abort; the b67 signal capture caught it as SIGABRT inside
+// TFNTwitterWatchdogLogHang). The feature switch above should keep the watchdog from ever
+// starting; these no-ops are the guarantee if some path arms it anyway. Each suppression is
+// appended to the persistent oplog (first few only — a re-arming watchdog may retry) so the
+// saved log shows that a kill was averted and the hang-sampler stacks around it name the cause.
+static void BHTWatchdogCrashSuppressed(const char *cls) {
+    static int suppressedCount = 0;   // racy increment is fine — worst case the cap is fuzzy
+    int n = ++suppressedCount;
+    if (n > 5) return;
+    char line[160];
+    snprintf(line, sizeof(line), "\n=== WATCHDOG crash() suppressed #%d (%s) ===\n", n, cls ?: "?");
+    NFBAppendCrashLogRaw(line);
+}
+
+%hook TFNTwitterWatchdog
+- (void)crash { BHTWatchdogCrashSuppressed("TFNTwitterWatchdog"); }
+%end
+%hook TFNTwitterDefaultWatchdog
+- (void)crash { BHTWatchdogCrashSuppressed("TFNTwitterDefaultWatchdog"); }
+%end
+%hook TFNTwitterLaunchWatchdog
+- (void)crash { BHTWatchdogCrashSuppressed("TFNTwitterLaunchWatchdog"); }
+%end
+%hook TFNTwitterEnterForegroundWatchdog
+- (void)crash { BHTWatchdogCrashSuppressed("TFNTwitterEnterForegroundWatchdog"); }
+%end
+%hook TFNTwitterEnterBackgroundWatchdog
+- (void)crash { BHTWatchdogCrashSuppressed("TFNTwitterEnterBackgroundWatchdog"); }
 %end
 
 // MARK: Force Tweets to show images as Full frame: https://github.com/BandarHL/BHTwitter/issues/101
@@ -4838,7 +4881,7 @@ static BOOL BHTHandleTabSelectionRequest(UIViewController *tabBarController, NSI
         if (!gBHTUserTabTouchSelectionInProgress && !realTabBarTap) {
             BHTUpdateColumnsTabSelection(tabBarController, YES);
             NFBUpdateStreamButtonVisibility();
-            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b67] source=%@ index=%ld page=%@",
+            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b68] source=%@ index=%ld page=%@",
                 source ?: @"?", (long)index, page ?: @"-"]);
             return YES;
         }
@@ -5065,7 +5108,7 @@ void BHTPresentColumnsMode(void) {
         UIViewController *selectionRoot = tabBarController ?: activeWindow.rootViewController;
         if (selectionRoot) BHTUpdateColumnsTabSelection(selectionRoot, YES);
         NFBColumnsRetapFocusAndRefresh();
-        NFBLogEvent(@"present.alreadyInline retapFocus[b67]");
+        NFBLogEvent(@"present.alreadyInline retapFocus[b68]");
         return;
     }
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
@@ -5317,7 +5360,7 @@ static void BHTPresentColumnsViewController(void) {
     BOOL markedUserTabTouch = (!isHome && !isColumns && gBHTColumnsIntent);
     if (markedUserTabTouch) {
         gBHTUserTabTouchSelectionInProgress = YES;
-        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b67] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
+        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b68] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
     }
     %orig(touches, event);
     if (markedUserTabTouch) {

@@ -549,6 +549,7 @@
 "NFB_COL_PROFILE" = "Profile";
 "NFB_COL_HOME" = "Home";
 "NFB_COL_HOME_FOLLOWING" = "Home (Following)";
+"NFB_COL_HOME_FORYOU" = "Home (For You)";
 "NFB_COL_TAB_N" = "Tab %lu";
 "NFB_SETTINGS_INTERVAL_ROW" = "Change auto-refresh interval…";
 "NFB_SETTINGS_COLUMNS_TOGGLE" = "Toggle columns mode (TweetDeck-style)";
