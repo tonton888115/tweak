@@ -550,6 +550,7 @@
 "NFB_COL_HOME" = "ホーム";
 "NFB_COL_HOME_FOLLOWING" = "ホーム（フォロー中）";
 "NFB_COL_HOME_FORYOU" = "ホーム（おすすめ）";
+"NFB_COL_HOME_COMBINED" = "ホーム（切替）";
 "NFB_COL_TAB_N" = "タブ %lu";
 "NFB_SETTINGS_INTERVAL_ROW" = "自動更新の間隔を変更…";
 "NFB_SETTINGS_COLUMNS_TOGGLE" = "カラムモード（TweetDeck風）を切り替え";

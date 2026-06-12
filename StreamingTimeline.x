@@ -45,6 +45,8 @@ static void nfb_showNewTweetsPill(UIViewController *vc);
 static BOOL nfb_streamTriggerColumns(void);
 static void nfb_revealAllColumnTops(void);
 static void nfb_columnsAxisRestoreSuppressedScroll(void);
+static void nfb_columnsLayoutCombinedBar(UIScrollView *nativeScrollView, NSInteger slotIdx, CGFloat columnWidth);
+static void nfb_columnsRemoveCombinedBar(void);
 static UIViewController *nfb_findVCByClassSubstring(UIViewController *root, NSString *sub, int depth);
 #if NFB_DIAG   // 🔍 diagnostic-report builders — compiled out with `make NFB_DIAG=0` (see Makefile)
 static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active);
@@ -151,6 +153,10 @@ static NSString * const kNFBColumnsEnabledTabsKey = @"NFBColumnsEnabledTabsV1";
 static NSString * const kNFBColumnsShownKey = @"NFBColumnsShownV1";
 static NSString * const kNFBColumnEntryKindTimeline = @"timeline";
 static NSString * const kNFBColumnEntryKindTab = @"tab";
+// b71: combined Home column — one opt-in slot that hosts the SELECTED home-family timeline
+// (おすすめ/フォロー中/pinned lists) with a switcher bar on top; selection persisted by identity.
+static NSString * const kNFBColumnsHomeCombinedIdentity = @"home|combined";
+static NSString * const kNFBColumnsHomeCombinedSelectedKey = @"NFBColumnsHomeCombinedSelectedV1";
 static BOOL gActiveTimelineAtTop = YES;
 static CGFloat gActiveTimelineOffsetY = 0.0;
 static CGFloat gActiveTimelineTopY = 0.0;
@@ -1883,7 +1889,7 @@ static BOOL nfb_streamShouldFire(UIViewController *vc) {
             nfb_updateStreamStateIconForVC(searchTarget);
             return NO;
         }
-        NFBLogEvent([NSString stringWithFormat:@"streamShould searchLatest[b70] vc=%@",
+        NFBLogEvent([NSString stringWithFormat:@"streamShould searchLatest[b71] vc=%@",
             NSStringFromClass(searchTarget.class)]);
         nfb_updateStreamStateIconForVC(searchTarget);
         return YES;
@@ -3201,7 +3207,7 @@ static void nfb_expandColumnsPrimaryWidthIfNeeded(UIScrollView *nativeScrollView
         static BOOL logged = NO;
         if (!logged) {
             logged = YES;
-            NFBLogEvent(@"columnsExpand[b70] disabled (prevent split layout crash)");
+            NFBLogEvent(@"columnsExpand[b71] disabled (prevent split layout crash)");
         }
     }
     return;
@@ -3241,7 +3247,7 @@ static void nfb_expandColumnsPrimaryWidthIfNeeded(UIScrollView *nativeScrollView
         gNFBColumnsExpandLatchFrom = currentWidth;
         gNFBColumnsExpandLatchTo = targetWidth;
         if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b70] latch (stuck gap=%.1f, %.1f->%.1f)",
+            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b71] latch (stuck gap=%.1f, %.1f->%.1f)",
                 gap, currentWidth, targetWidth]);
         }
         return;
@@ -3280,12 +3286,12 @@ static void nfb_expandColumnsPrimaryWidthIfNeeded(UIScrollView *nativeScrollView
         }
         gNFBColumnsExpandedWidthViews = [all copy];
         if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b70] from=%.1f to=%.1f views=%lu",
+            NFBLogEvent([NSString stringWithFormat:@"columnsExpand[b71] from=%.1f to=%.1f views=%lu",
                 currentWidth, targetWidth, (unsigned long)expanded.count]);
         }
     } else if (gNFBLogRecording) {
         static NSString *lastColumnsExpandMiss = nil;
-        NSString *miss = [NSString stringWithFormat:@"columnsExpand[b70] miss from=%.1f to=%.1f chain=%lu",
+        NSString *miss = [NSString stringWithFormat:@"columnsExpand[b71] miss from=%.1f to=%.1f chain=%lu",
             currentWidth, targetWidth, (unsigned long)chain.count];
         if (![miss isEqualToString:lastColumnsExpandMiss]) {
             lastColumnsExpandMiss = [miss copy];
@@ -3409,6 +3415,7 @@ static void nfb_adjustColumnScrollForPage(UIViewController *page, UIView *pageVi
 }
 
 static void nfb_removeColumnsOverlay(void) {
+    nfb_columnsRemoveCombinedBar();   // b71
     NSArray<UIViewController *> *pages = gColumnsOverlayPages ?: @[];
     for (UIViewController *page in pages) {
         nfb_restoreColumnScrollAdjustmentForPage(page);
@@ -3567,7 +3574,7 @@ static BOOL nfb_columnsNativeSplitTierGuardBegin(NSString *reason) {
     [defs synchronize];
     if (gNFBLogRecording && reason.length) {
         static NSString *lastGuardKey = nil;
-        NSString *key = [NSString stringWithFormat:@"nativeSplit[b70]: guard %@", reason];
+        NSString *key = [NSString stringWithFormat:@"nativeSplit[b71]: guard %@", reason];
         if (![key isEqualToString:lastGuardKey]) { lastGuardKey = [key copy]; NFBLogEvent(key); }
     }
     return YES;
@@ -3598,14 +3605,14 @@ static void nfb_columnsApplyNativeSplitTierForPaging(UIViewController *paging, B
     if (!split || split.viewIfLoaded.window == nil) split = nfb_columnsAppSplitForPaging(paging);
     if (!split) {
         if (!suppress) { gNFBNativeSplitTierSuppressed = NO; gNFBNativeSplitTierSplit = nil; }
-        if (gNFBLogRecording) NFBLogEvent(@"nativeSplit[b70]: splitNil");
+        if (gNFBLogRecording) NFBLogEvent(@"nativeSplit[b71]: splitNil");
         return;
     }
     if (suppress && gNFBNativeSplitTierSuppressed && gNFBNativeSplitTierSplit == split) return;
     if (gNFBNativeSplitTierApplying) {
         if (gNFBLogRecording) {
             static NSString *lastReentryKey = nil;
-            NSString *key = [NSString stringWithFormat:@"nativeSplit[b70]: reentry skip %@", suppress ? @"suppress" : @"restore"];
+            NSString *key = [NSString stringWithFormat:@"nativeSplit[b71]: reentry skip %@", suppress ? @"suppress" : @"restore"];
             if (![key isEqualToString:lastReentryKey]) { lastReentryKey = [key copy]; NFBLogEvent(key); }
         }
         return;
@@ -3641,7 +3648,7 @@ static void nfb_columnsApplyNativeSplitTierForPaging(UIViewController *paging, B
         // already reaches private_splitModeForSize:, so keep this native-tier pass one-shot.
         [split.viewIfLoaded setNeedsLayout];
     } @catch (NSException *e) {
-        if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"nativeSplit[b70]: %@ threw %@", suppress ? @"suppress" : @"restore", e.name ?: @"exception"]);
+        if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"nativeSplit[b71]: %@ threw %@", suppress ? @"suppress" : @"restore", e.name ?: @"exception"]);
     }
     gNFBNativeSplitTierApplying = NO;
     nfb_columnsNativeSplitTierGuardEnd();
@@ -3652,7 +3659,7 @@ static void nfb_columnsApplyNativeSplitTierForPaging(UIViewController *paging, B
     }
     if (gNFBLogRecording) {
         static NSString *lastNativeSplitKey = nil;
-        NSString *key = [NSString stringWithFormat:@"nativeSplit[b70]: %@ split=%@ set=%d update=%d recalc=%d",
+        NSString *key = [NSString stringWithFormat:@"nativeSplit[b71]: %@ split=%@ set=%d update=%d recalc=%d",
             suppress ? @"medium" : @"restore", NSStringFromClass(split.class),
             setOK ? 1 : 0, updateOK ? 1 : 0, recalcOK ? 1 : 0];
         if (![key isEqualToString:lastNativeSplitKey]) { lastNativeSplitKey = [key copy]; NFBLogEvent(key); }
@@ -3668,22 +3675,22 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
     static NSInteger const kExtBuild = 36;
     if (removed) {
         if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) {
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b70]: skip notPad"); return;
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b71]: skip notPad"); return;
         }
-        if (gNFBExtendedContentRemoved) { if (gNFBLogRecording) NFBLogEvent(@"extContent[b70]: alreadyRemoved"); return; }
+        if (gNFBExtendedContentRemoved) { if (gNFBLogRecording) NFBLogEvent(@"extContent[b71]: alreadyRemoved"); return; }
         UIViewController *split = nfb_columnsAppSplitForPaging(paging);
-        if (!split) { if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b70]: splitNil paging=%@", paging ? NSStringFromClass(paging.class) : @"nil"]); return; }
+        if (!split) { if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b71]: splitNil paging=%@", paging ? NSStringFromClass(paging.class) : @"nil"]); return; }
         // Decision paths below set gNFBExtendedContentRemoved (so we stop trying / stop showing trends)
         // but NOT gNFBExtendedContentActuallyRemoved — the latter is set ONLY when the private remove
         // really runs, so restore never calls add on a rail we never removed.
-        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b70]: noSidebar (nothing to remove)"); return; }
+        if (!nfb_iPadColumnsSearchSidebarVC(paging)) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b71]: noSidebar (nothing to remove)"); return; }
         SEL sel = @selector(private_removeExtendedContentViewController);
-        if (![split respondsToSelector:sel]) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b70]: noSelector on %@", NSStringFromClass(split.class)]); return; }
-        if ([defs integerForKey:@"NFBExtContentCrashedBuild"] == kExtBuild) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b70]: skip (crashed before this build)"); return; }
+        if (![split respondsToSelector:sel]) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b71]: noSelector on %@", NSStringFromClass(split.class)]); return; }
+        if ([defs integerForKey:@"NFBExtContentCrashedBuild"] == kExtBuild) { gNFBExtendedContentRemoved = YES; if (gNFBLogRecording) NFBLogEvent(@"extContent[b71]: skip (crashed before this build)"); return; }
         if ([defs integerForKey:@"NFBExtContentInFlightBuild"] == kExtBuild) {
             [defs setInteger:kExtBuild forKey:@"NFBExtContentCrashedBuild"]; [defs synchronize];
             gNFBExtendedContentRemoved = YES;
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b70]: prior remove crashed; disabled this build");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b71]: prior remove crashed; disabled this build");
             return;
         }
         [defs setInteger:kExtBuild forKey:@"NFBExtContentInFlightBuild"]; [defs synchronize];
@@ -3695,9 +3702,9 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
             gNFBExtendedContentActuallyRemoved = YES;   // ONLY on a throw-free remove — guards the add on restore
             gNFBExtRemovedSplit = split;                 // remember the exact split for a paging-independent restore
             [split.viewIfLoaded setNeedsLayout];   // re-flow the split on its own (nil-safe; no forced load, no layoutIfNeeded)
-            if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b70]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
+            if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"extContent[b71]: removed (columns full-width) split=%@", NSStringFromClass(split.class)]);
         } else {
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b70]: remove threw (not marked removed)");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b71]: remove threw (not marked removed)");
         }
     } else {
         // Restore. Only re-add if we actually removed; use the stored split so this works even when
@@ -3707,7 +3714,7 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
             gNFBExtendedContentRemoved = NO; gNFBExtRemoveScheduled = NO; gNFBExtRemovedSplit = nil;
             // Log only when something was actually reset — this branch runs on every pager layout
             // pass while columns are off and used to spam the recording.
-            if (hadState && gNFBLogRecording) NFBLogEvent(@"extContent[b70]: restoreSkipped (never actually removed)");
+            if (hadState && gNFBLogRecording) NFBLogEvent(@"extContent[b71]: restoreSkipped (never actually removed)");
             return;
         }
         // Stale-split guard: the app-split can be torn down and rebuilt
@@ -3728,9 +3735,9 @@ static void nfb_columnsSetExtendedContentRemoved(UIViewController *paging, BOOL 
         if (split && [split respondsToSelector:sel]) {
             @try { ((void (*)(id, SEL))objc_msgSend)(split, sel); } @catch (NSException *e) {}
             [split.viewIfLoaded setNeedsLayout];
-            if (gNFBLogRecording) NFBLogEvent(@"extContent[b70]: restored");
+            if (gNFBLogRecording) NFBLogEvent(@"extContent[b71]: restored");
         } else if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"extContent[b70]: restore noop (stale/rebuilt split stored=%@ live=%@)",
+            NFBLogEvent([NSString stringWithFormat:@"extContent[b71]: restore noop (stale/rebuilt split stored=%@ live=%@)",
                          stored ? @"y" : @"n", liveSplit ? @"y" : @"n"]);
         }
         gNFBExtendedContentActuallyRemoved = NO;
@@ -3764,7 +3771,7 @@ static void nfb_suppressSplitResidueViews(UIView *root) {
     gNFBColumnsSuppressedSplitViews = [views copy];
     if (gNFBLogRecording) {
         static NSString *lastSplitResidueKey = nil;
-        NSString *key = [NSString stringWithFormat:@"splitResidue[b70] hidden=%lu root=%@",
+        NSString *key = [NSString stringWithFormat:@"splitResidue[b71] hidden=%lu root=%@",
             (unsigned long)views.count, NSStringFromClass(root.class)];
         if (![key isEqualToString:lastSplitResidueKey]) {
             lastSplitResidueKey = [key copy];
@@ -3792,7 +3799,7 @@ static void nfb_columnsRetryRemoveRebuiltExtendedContent(UIViewController *pagin
         [split.viewIfLoaded setNeedsLayout];
         if (gNFBLogRecording) {
             static NSString *lastRetryKey = nil;
-            NSString *key = [NSString stringWithFormat:@"extContent[b70]: reRemoved rebuilt split=%@", NSStringFromClass(split.class)];
+            NSString *key = [NSString stringWithFormat:@"extContent[b71]: reRemoved rebuilt split=%@", NSStringFromClass(split.class)];
             if (![key isEqualToString:lastRetryKey]) {
                 lastRetryKey = [key copy];
                 NFBLogEvent(key);
@@ -3815,7 +3822,7 @@ static void nfb_suppressSecondarySearchHostIfNeeded(UIViewController *paging, UI
     if (gNFBLogRecording) {
         static NSString *lastSecondaryHostKey = nil;
         CGRect f = secondaryHost.frame;
-        NSString *key = [NSString stringWithFormat:@"secondaryHost[b70] hidden %@ f=(%.0f,%.0f,%.0f,%.0f)",
+        NSString *key = [NSString stringWithFormat:@"secondaryHost[b71] hidden %@ f=(%.0f,%.0f,%.0f,%.0f)",
             NSStringFromClass(secondaryHost.class), f.origin.x, f.origin.y, f.size.width, f.size.height];
         if (![key isEqualToString:lastSecondaryHostKey]) {
             lastSecondaryHostKey = [key copy];
@@ -4007,12 +4014,12 @@ static void nfb_columnsExpandPrimaryViaConstraint(UIViewController *paging, UISc
 
     if (++gNFBFullWidthApplyCount > 8) {   // split keeps resetting the constant -> stop (never hang)
         gNFBFullWidthLatched = YES;
-        if (gNFBLogRecording) NFBLogEvent(@"fullWidth[b70] latched (constant kept resetting; stopped to avoid hang)");
+        if (gNFBLogRecording) NFBLogEvent(@"fullWidth[b71] latched (constant kept resetting; stopped to avoid hang)");
         return;
     }
     if (gNFBLogRecording) {
         static NSString *lastK = nil;
-        NSString *k = [NSString stringWithFormat:@"fullWidth[b70] widen %.1f->%.1f (host=%.1f container=%.1f n=%d)",
+        NSString *k = [NSString stringWithFormat:@"fullWidth[b71] widen %.1f->%.1f (host=%.1f container=%.1f n=%d)",
             haveW, target, haveW, fullW, gNFBFullWidthApplyCount];
         if (![k isEqualToString:lastK]) { lastK = [k copy]; NFBLogEvent(k); }
     }
@@ -4089,7 +4096,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
                 copy[@"vc"] = tabVC;
                 [layoutEntries addObject:copy];
             } else if (gNFBLogRecording) {
-                NFBLogEvent([NSString stringWithFormat:@"appTabColumn[b70] skip id=%@", nfb_columnEntryIdentity(entry)]);
+                NFBLogEvent([NSString stringWithFormat:@"appTabColumn[b71] skip id=%@", nfb_columnEntryIdentity(entry)]);
             }
         }
     }
@@ -4199,11 +4206,13 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     }
 
     NSUInteger idx = 0;
+    NSInteger combinedSlotIdx = -1;   // b71: the combined Home column's slot, if laid out this pass
     for (NSDictionary *entry in layoutEntries) {
         UIViewController *vc = nfb_columnEntryViewController(entry);
         if (!vc) continue;
         BOOL isTimeline = [entry[@"kind"] isEqualToString:kNFBColumnEntryKindTimeline];
         NSString *columnKey = nfb_columnsKeyForEntry(entry, idx);
+        if ([entry[@"combined"] boolValue]) combinedSlotIdx = (NSInteger)idx;
         [vc loadViewIfNeeded];
         UIView *columnView = vc.view;
         UIScrollView *appTabScroll = isTimeline ? nil : nfb_mainScrollViewOf(vc);
@@ -4223,7 +4232,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
                 }
                 if (columnView.superview == nativeScrollView) [columnView removeFromSuperview];
                 if (gNFBLogRecording) {
-                    NFBLogEvent([NSString stringWithFormat:@"appTabColumn[b70] cycleGuard disabled id=%@ vc=%@",
+                    NFBLogEvent([NSString stringWithFormat:@"appTabColumn[b71] cycleGuard disabled id=%@ vc=%@",
                         identity ?: @"-", NSStringFromClass(vc.class)]);
                 }
                 idx++;
@@ -4237,7 +4246,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
             [gNFBColumnsAppTabControllers removeObjectForKey:identity];
             if (columnView.superview == nativeScrollView) [columnView removeFromSuperview];
             if (gNFBLogRecording) {
-                NFBLogEvent([NSString stringWithFormat:@"appTabColumn[b70] zeroContent disabled id=%@ vc=%@", identity, NSStringFromClass(vc.class)]);
+                NFBLogEvent([NSString stringWithFormat:@"appTabColumn[b71] zeroContent disabled id=%@ vc=%@", identity, NSStringFromClass(vc.class)]);
             }
             idx++;
             continue;
@@ -4299,7 +4308,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
             if (!lastAppTabLayoutKeys) lastAppTabLayoutKeys = [NSMutableDictionary dictionary];
             UIScrollView *sv = appTabScroll ?: nfb_mainScrollViewOf(vc);
             NSString *identity = nfb_columnEntryIdentity(entry) ?: @"-";
-            NSString *key = [NSString stringWithFormat:@"appTabColumn[b70] layout id=%@ vc=%@ x=%.0f w=%.0f content=%.0fx%.0f text=%@",
+            NSString *key = [NSString stringWithFormat:@"appTabColumn[b71] layout id=%@ vc=%@ x=%.0f w=%.0f content=%.0fx%.0f text=%@",
                 identity, NSStringFromClass(vc.class), columnWidth * idx, columnWidth,
                 sv ? sv.contentSize.width : 0.0, sv ? sv.contentSize.height : 0.0,
                 nfb_diagTextForView(columnView, 64) ?: @"-"];
@@ -4308,6 +4317,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         nfb_columnsLayoutDetailNavForKey(columnKey, CGRectMake(columnWidth * idx, 0.0, columnWidth, height), nativeScrollView);
         idx++;
     }
+    nfb_columnsLayoutCombinedBar(nativeScrollView, combinedSlotIdx, columnWidth);   // b71
 
     // Legacy fallback only. b37 sources Search/Explore from the compact app-tab Guide VC instead of
     // transplanting the wide app-split trends/search sidebar.
@@ -4340,7 +4350,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
             static NSString *lastSearchColKey = nil;
             UIScrollView *searchScroll = nfb_mainScrollViewOf(searchColumnVC);
             NSString *text = nfb_diagTextForView(searchView, 72);
-            NSString *k = [NSString stringWithFormat:@"searchColumn[b70] vc=%@ x=%.0f w=%.0f h=%.0f scroll=%@ content=%.0fx%.0f text=%@",
+            NSString *k = [NSString stringWithFormat:@"searchColumn[b71] vc=%@ x=%.0f w=%.0f h=%.0f scroll=%@ content=%.0fx%.0f text=%@",
                 NSStringFromClass(searchColumnVC.class), columnWidth * layoutEntries.count, columnWidth, height,
                 searchScroll ? NSStringFromClass(searchScroll.class) : @"nil",
                 searchScroll ? searchScroll.contentSize.width : 0.0,
@@ -4390,7 +4400,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b70] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b71] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -4804,7 +4814,7 @@ static void nfb_columnsNoteLayoutPassDuration(CFTimeInterval seconds) {
     if (seconds > worst) worst = seconds;
     if (now - windowStart < 2.0) return;
     if (gNFBLogRecording && passes > 0) {
-        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b70] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
+        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b71] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
             (long)passes, total / passes * 1000.0, worst * 1000.0,
             total / (now - windowStart) * 100.0, now - windowStart]);
     }
@@ -5218,17 +5228,59 @@ static NSArray<NSDictionary *> *nfb_columnsAppTabEntriesForPaging(UIViewControll
     return entries;
 }
 
+// b71: the home-family pages eligible for the combined Home column, captured by the entries
+// builder each pass (nil while combined is hidden) so the switcher bar can list the variants.
+static NSArray<UIViewController *> *gNFBColumnsCombinedPages = nil;
+
+static UIViewController *nfb_columnsCombinedHomeSelectedPage(NSArray<UIViewController *> *pages) {
+    NSString *sel = [NSUserDefaults.standardUserDefaults stringForKey:kNFBColumnsHomeCombinedSelectedKey];
+    UIViewController *following = nil;
+    for (UIViewController *p in pages) {
+        if (sel.length && [nfb_columnTimelineIdentity(p) isEqualToString:sel]) return p;
+        if (!following && !nfb_isRecommendedHomeTimeline(p)) following = p;   // default = Following
+    }
+    return following ?: pages.firstObject;
+}
+
 static NSArray<NSDictionary *> *nfb_allColumnEntriesForPaging(UIViewController *paging) {
     NSMutableArray<NSDictionary *> *entries = [NSMutableArray array];
+    NSMutableArray<UIViewController *> *homePages = [NSMutableArray array];
     for (UIViewController *page in nfb_allHomePagingTimelinePages(paging)) {
         if (!nfb_shouldUseTimelinePageAsColumn(page)) continue;
-        NSString *identity = nfb_columnTimelineIdentity(page);
-        if (!identity.length) continue;
-        [entries addObject:@{ @"kind": kNFBColumnEntryKindTimeline,
-                              @"id": identity,
-                              @"title": nfb_columnDisplayName(page) ?: identity,
-                              @"vc": page,
-                              @"defaultHidden": @(nfb_isRecommendedHomeTimeline(page)) }];
+        if (!nfb_columnTimelineIdentity(page).length) continue;
+        [homePages addObject:page];
+    }
+    // b71: while the combined Home entry is SHOWN it replaces the individual home-family
+    // entries — its slot displays the selected variant (the native home's "one surface,
+    // switchable timelines" semantics, per the user's 通常ホームの定義). While hidden it is
+    // still emitted (defaultHidden, opt-in via the shown list — same machinery as For You)
+    // so カラム管理 offers the row. Probing nfb_columnEntryIsHidden keeps the builder's
+    // decision identical to the visibility filter's.
+    NSDictionary *combinedProbe = @{ @"kind": kNFBColumnEntryKindTimeline,
+                                     @"id": kNFBColumnsHomeCombinedIdentity,
+                                     @"defaultHidden": @YES };
+    BOOL combinedShown = homePages.count && !nfb_columnEntryIsHidden(combinedProbe);
+    gNFBColumnsCombinedPages = combinedShown ? [homePages copy] : nil;
+    if (!combinedShown) {
+        for (UIViewController *page in homePages) {
+            NSString *identity = nfb_columnTimelineIdentity(page);
+            [entries addObject:@{ @"kind": kNFBColumnEntryKindTimeline,
+                                  @"id": identity,
+                                  @"title": nfb_columnDisplayName(page) ?: identity,
+                                  @"vc": page,
+                                  @"defaultHidden": @(nfb_isRecommendedHomeTimeline(page)) }];
+        }
+    }
+    if (homePages.count) {
+        UIViewController *sel = nfb_columnsCombinedHomeSelectedPage(homePages);
+        if (sel) {
+            [entries addObject:@{ @"kind": kNFBColumnEntryKindTimeline,
+                                  @"id": kNFBColumnsHomeCombinedIdentity,
+                                  @"title": nfb_loc(@"NFB_COL_HOME_COMBINED", @"Home (switcher)"),
+                                  @"vc": sel,
+                                  @"defaultHidden": @YES,
+                                  @"combined": @YES }];
+        }
     }
     [entries addObjectsFromArray:nfb_columnsAppTabEntriesForPaging(paging)];
     return nfb_columnsApplyEntryOrder(entries);
@@ -5268,7 +5320,7 @@ static UIViewController *nfb_columnsAppTabControllerForEntry(NSDictionary *entry
         return nil;
     }
 
-    static NSInteger const kAppTabBuild = 70;
+    static NSInteger const kAppTabBuild = 71;
     NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
     if ([defs integerForKey:@"NFBColumnsAppTabFactoryCrashedBuild"] == kAppTabBuild) {
         [gNFBColumnsAppTabFailed addObject:identity];
@@ -5313,7 +5365,7 @@ static UIViewController *nfb_columnsAppTabControllerForEntry(NSDictionary *entry
     fresh.preferredContentSize = CGSizeMake(340.0, MAX(400.0, fresh.preferredContentSize.height));
     gNFBColumnsAppTabControllers[identity] = fresh;
     if (gNFBLogRecording) {
-        NFBLogEvent([NSString stringWithFormat:@"appTabColumn[b70] factory OK id=%@ vc=%@", identity, NSStringFromClass(fresh.class)]);
+        NFBLogEvent([NSString stringWithFormat:@"appTabColumn[b71] factory OK id=%@ vc=%@", identity, NSStringFromClass(fresh.class)]);
     }
     return fresh;
 }
@@ -5344,6 +5396,82 @@ static NSString *nfb_columnDisplayName(UIViewController *page) {
     NSString *ident = nfb_columnTimelineIdentity(page);
     NSArray *parts = [ident componentsSeparatedByString:@"|"];
     return (parts.count > 1 && [parts[1] length]) ? parts[1] : cls;
+}
+
+// b71 combined Home column switcher bar. Lives INSIDE the columns scroll (so it slides with the
+// slot), floats over the column's empty top-inset strip, and swaps which home-family page occupies
+// the combined slot by rewriting the persisted selection and letting the next layout pass place
+// the other VC — the engine's normal column placement does the swap, nothing is reparented here.
+// Every mutation is change-gated (b56: an idle pass must mutate nothing).
+static UIScrollView *gNFBColumnsCombinedBar = nil;
+static NSString *gNFBColumnsCombinedBarSignature = nil;
+
+static void nfb_columnsRemoveCombinedBar(void) {
+    if (!gNFBColumnsCombinedBar) return;
+    [gNFBColumnsCombinedBar removeFromSuperview];
+    gNFBColumnsCombinedBar = nil;
+    gNFBColumnsCombinedBarSignature = nil;
+}
+
+static void nfb_columnsCombinedSelectIdentity(NSString *identity) {
+    if (!identity.length) return;
+    [NSUserDefaults.standardUserDefaults setObject:identity forKey:kNFBColumnsHomeCombinedSelectedKey];
+    [NSUserDefaults.standardUserDefaults synchronize];
+    nfb_columnsPrefsDidChange();
+    if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"combinedHome[b71] select %@", identity]);
+    nfb_scheduleLayoutActiveHomePaging();
+}
+
+static void nfb_columnsLayoutCombinedBar(UIScrollView *nativeScrollView, NSInteger slotIdx, CGFloat columnWidth) {
+    if (slotIdx < 0 || !gNFBColumnsCombinedPages.count || !nativeScrollView) {
+        nfb_columnsRemoveCombinedBar();
+        return;
+    }
+    NSArray<UIViewController *> *pages = gNFBColumnsCombinedPages;
+    UIViewController *selected = nfb_columnsCombinedHomeSelectedPage(pages);
+    NSString *selIdentity = nfb_columnTimelineIdentity(selected) ?: @"";
+    NSMutableString *sig = [NSMutableString stringWithString:selIdentity];
+    for (UIViewController *p in pages) [sig appendFormat:@"|%@:%@", nfb_columnTimelineIdentity(p), nfb_columnDisplayName(p)];
+
+    if (!gNFBColumnsCombinedBar) {
+        UIScrollView *bar = [[UIScrollView alloc] initWithFrame:CGRectZero];
+        bar.showsHorizontalScrollIndicator = NO;
+        bar.backgroundColor = [UIColor.systemBackgroundColor colorWithAlphaComponent:0.95];
+        bar.layer.borderWidth = 0.5;
+        bar.layer.borderColor = UIColor.separatorColor.CGColor;
+        gNFBColumnsCombinedBar = bar;
+    }
+    UIScrollView *bar = gNFBColumnsCombinedBar;
+    if (bar.superview != nativeScrollView) [nativeScrollView addSubview:bar];
+    CGRect barFrame = CGRectMake(columnWidth * slotIdx, 0.0, columnWidth, 40.0);
+    if (!CGRectEqualToRect(bar.frame, barFrame)) bar.frame = barFrame;
+    if (nativeScrollView.subviews.lastObject != bar) [nativeScrollView bringSubviewToFront:bar];
+
+    if (![sig isEqualToString:gNFBColumnsCombinedBarSignature]) {
+        gNFBColumnsCombinedBarSignature = [sig copy];
+        for (UIView *v in bar.subviews.copy) [v removeFromSuperview];
+        CGFloat x = 6.0;
+        for (UIViewController *p in pages) {
+            NSString *identity = nfb_columnTimelineIdentity(p);
+            if (!identity.length) continue;
+            NSString *title = nfb_columnDisplayName(p) ?: identity;
+            BOOL isSel = [identity isEqualToString:selIdentity];
+            UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem
+                primaryAction:[UIAction actionWithTitle:title image:nil identifier:nil
+                    handler:^(__unused UIAction *action) { nfb_columnsCombinedSelectIdentity(identity); }]];
+            btn.titleLabel.font = isSel ? [UIFont boldSystemFontOfSize:13.0] : [UIFont systemFontOfSize:13.0];
+            [btn setTitleColor:(isSel ? UIColor.labelColor : UIColor.secondaryLabelColor) forState:UIControlStateNormal];
+            CGSize fit = [btn sizeThatFits:CGSizeMake(200.0, 28.0)];
+            btn.frame = CGRectMake(x, 6.0, MIN(MAX(fit.width + 14.0, 44.0), 160.0), 28.0);
+            btn.layer.cornerRadius = 14.0;
+            btn.backgroundColor = isSel ? [UIColor.systemFillColor colorWithAlphaComponent:0.9] : UIColor.clearColor;
+            [bar addSubview:btn];
+            x = CGRectGetMaxX(btn.frame) + 4.0;
+        }
+        bar.contentSize = CGSizeMake(MAX(x + 2.0, columnWidth), 40.0);
+        if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"combinedHome[b71] bar slot=%ld variants=%lu sel=%@",
+            (long)slotIdx, (unsigned long)pages.count, selIdentity]);
+    }
 }
 // All column-eligible pages (INCLUDING hidden), in saved display order — for the management UI.
 static NSArray<UIViewController *> *nfb_eligibleColumnPagesAll(void) {
@@ -5462,7 +5590,7 @@ static void nfb_revealAllColumnTops(void) {
         if (sv && (sv.isDragging || sv.isTracking || sv.isDecelerating)) continue;
         if (nfb_isTimelineAtTop(page)) nfb_streamTriggerTarget(page);
     }
-    NFBLogEvent([NSString stringWithFormat:@"columnsAllTop[b70] top=%lu refresh=%lu",
+    NFBLogEvent([NSString stringWithFormat:@"columnsAllTop[b71] top=%lu refresh=%lu",
         (unsigned long)topControllers.count, (unsigned long)refreshControllers.count]);
     gPendingNewTweetsVC = nil;
     nfb_hideNewTweetsPill();
@@ -5485,7 +5613,7 @@ void NFBColumnsRetapFocusAndRefresh(void) {
     }
     nfb_revealAllColumnTops();
     nfb_scheduleLayoutActiveHomePagingLight();
-    NFBLogEvent([NSString stringWithFormat:@"columnsRetap[b70] focusLeft refresh h=%@",
+    NFBLogEvent([NSString stringWithFormat:@"columnsRetap[b71] focusLeft refresh h=%@",
         horizontalScroll ? NSStringFromClass(horizontalScroll.class) : @"nil"]);
 }
 
@@ -5668,7 +5796,7 @@ static void nfb_columnsNoteTouchedView(UIView *view, NSString *phase) {
     gNFBLastTouchedColumnIndex = idx ? idx.unsignedIntegerValue : NSNotFound;
     gNFBLastTouchedColumnAt = CACurrentMediaTime();
     if (gNFBLogRecording) {
-        NFBLogEvent([NSString stringWithFormat:@"columnTouch[b70] phase=%@ key=%@ idx=%lu view=%@",
+        NFBLogEvent([NSString stringWithFormat:@"columnTouch[b71] phase=%@ key=%@ idx=%lu view=%@",
             phase ?: @"?", gNFBLastTouchedColumnKey ?: @"-", (unsigned long)gNFBLastTouchedColumnIndex,
             NSStringFromClass(view.class)]);
     }
@@ -5691,7 +5819,7 @@ static void nfb_columnsAxisRestoreSuppressedScroll(void) {
     gNFBColumnsAxisSuppressedScroll = nil;
     if (sv && !sv.scrollEnabled) {
         sv.scrollEnabled = YES;
-        if (gNFBLogRecording) NFBLogEvent(@"columnsAxis[b70] innerRestored");
+        if (gNFBLogRecording) NFBLogEvent(@"columnsAxis[b71] innerRestored");
     }
 }
 
@@ -5721,7 +5849,7 @@ static void nfb_columnsAxisSuppressInnerScroll(void) {
     if (!inner || !inner.scrollEnabled) return;
     inner.scrollEnabled = NO;
     gNFBColumnsAxisSuppressedScroll = inner;
-    if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"columnsAxis[b70] innerSuppressed %@",
+    if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"columnsAxis[b71] innerSuppressed %@",
         NSStringFromClass(inner.class)]);
 }
 
@@ -5850,7 +5978,7 @@ static void nfb_columnsDismissDetailNav(UINavigationController *nav) {
     [nav removeFromParentViewController];
     if (key.length && gNFBColumnsDetailNavControllers[key] == nav) [gNFBColumnsDetailNavControllers removeObjectForKey:key];
     if (key.length) [gNFBColumnsDetailNavLRU removeObject:key];
-    if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"columnDetail[b70] close key=%@", key ?: @"-"]);
+    if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"columnDetail[b71] close key=%@", key ?: @"-"]);
 }
 
 static void nfb_columnsDismissAllDetailNavs(void) {
@@ -5872,7 +6000,7 @@ static void nfb_columnsTrimDetailNavsBeforeOpening(NSString *newKey) {
             }
         }
         if (!victim) break;
-        if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"columnDetail[b70] evictLRU key=%@", victim]);
+        if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"columnDetail[b71] evictLRU key=%@", victim]);
         nfb_columnsDismissDetailNav(gNFBColumnsDetailNavControllers[victim]);
     }
 }
@@ -5894,7 +6022,7 @@ static void nfb_columnsKickDetailNavContentSoon(UINavigationController *nav) {
         id leaf = nfb_findLeafResponder(target, @selector(loadTop:), 0) ?: nfb_findResponder(target, @selector(loadTop:), 0);
         if (!leaf) return;
         @try { ((void (*)(id, SEL, id))objc_msgSend)(leaf, @selector(loadTop:), nil); } @catch (__unused NSException *e) {}
-        NFBLogEvent([NSString stringWithFormat:@"columnDetail[b70] kickLoad top=%@ leaf=%@ content=%.0f",
+        NFBLogEvent([NSString stringWithFormat:@"columnDetail[b71] kickLoad top=%@ leaf=%@ content=%.0f",
             NSStringFromClass(target.class), NSStringFromClass([leaf class]), sv ? sv.contentSize.height : -1.0]);
     });
 }
@@ -5949,7 +6077,7 @@ static void nfb_columnsApplyMobileWebViewInTree(UIView *view, int depth) {
                     @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1");
             }
             if (nfb_resp(view, @selector(reload))) ((void (*)(id, SEL))objc_msgSend)(view, @selector(reload));
-            NFBLogEvent([NSString stringWithFormat:@"columnDetail[b70] webMobile applied wk=%@", NSStringFromClass(view.class)]);
+            NFBLogEvent([NSString stringWithFormat:@"columnDetail[b71] webMobile applied wk=%@", NSStringFromClass(view.class)]);
         } @catch (__unused NSException *e) {}
         return;
     }
@@ -6034,7 +6162,7 @@ static BOOL nfb_columnsRouteControllerIntoTouchedColumn(UIViewController *vc, NS
             return NO;
         }
         gNFBColumnsAppTabRedirecting = NO;
-        if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"columnDetail[b70] appTabRedirect reason=%@ vc=%@ depth=%lu",
+        if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"columnDetail[b71] appTabRedirect reason=%@ vc=%@ depth=%lu",
             reason ?: @"?", NSStringFromClass(vc.class), (unsigned long)appTabNav.viewControllers.count]);
         nfb_columnsScheduleMobileWebCheckForController(vc);
         nfb_scheduleLayoutActiveHomePagingLight();
@@ -6061,7 +6189,7 @@ static BOOL nfb_columnsRouteControllerIntoTouchedColumn(UIViewController *vc, NS
         [nav pushViewController:vc animated:animated];
         nfb_columnsNoteDetailNavUsed(key);
         nfb_columnsScheduleMobileWebCheckForController(vc);
-        NFBLogEvent([NSString stringWithFormat:@"columnDetail[b70] push key=%@ reason=%@ vc=%@ depth=%lu",
+        NFBLogEvent([NSString stringWithFormat:@"columnDetail[b71] push key=%@ reason=%@ vc=%@ depth=%lu",
             key, reason ?: @"?", NSStringFromClass(vc.class), (unsigned long)nav.viewControllers.count]);
     } else {
         // b55: keep one detail PER COLUMN (TweetDeck-like; the b51 "only one anywhere" rule closed
@@ -6112,7 +6240,7 @@ static BOOL nfb_columnsRouteControllerIntoTouchedColumn(UIViewController *vc, NS
         gNFBColumnsDetailNavControllers[key] = nav;
         nfb_columnsNoteDetailNavUsed(key);
         [scroll bringSubviewToFront:nav.view];
-        NFBLogEvent([NSString stringWithFormat:@"columnDetail[b70] open key=%@ reason=%@ vc=%@ frame=(%.0f,%.0f,%.0f,%.0f)",
+        NFBLogEvent([NSString stringWithFormat:@"columnDetail[b71] open key=%@ reason=%@ vc=%@ frame=(%.0f,%.0f,%.0f,%.0f)",
             key, reason ?: @"?", NSStringFromClass(vc.class),
             frame.origin.x, frame.origin.y, frame.size.width, frame.size.height]);
     }
@@ -6798,7 +6926,7 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
         UIScrollView *dsv = (dtop && [dtop isViewLoaded]) ? nfb_mainScrollViewOf(dtop) : nil;
         CGRect dnavFrame = [dnav isViewLoaded] ? dnav.view.frame : CGRectZero;
         CGRect dtopFrame = (dtop && [dtop isViewLoaded]) ? dtop.view.frame : CGRectZero;
-        [s appendFormat:@"columnDetail[b70] key=%@ top=%@ win=%d hidden=%d alpha=%.2f traitH=%ld navFrame=(%.1f,%.1f,%.1f,%.1f) topFrame=(%.1f,%.1f,%.1f,%.1f) scroll=%@ sframe=(%.1f,%.1f,%.1f,%.1f) content=(%.1f,%.1f)\n",
+        [s appendFormat:@"columnDetail[b71] key=%@ top=%@ win=%d hidden=%d alpha=%.2f traitH=%ld navFrame=(%.1f,%.1f,%.1f,%.1f) topFrame=(%.1f,%.1f,%.1f,%.1f) scroll=%@ sframe=(%.1f,%.1f,%.1f,%.1f) content=(%.1f,%.1f)\n",
             detailKey,
             dtop ? NSStringFromClass(dtop.class) : @"-",
             ([dnav isViewLoaded] && dnav.view.window) ? 1 : 0,
@@ -6835,12 +6963,12 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
         if (primaryHost) {
             UIView *fwContainer = primaryHost.superview;
             UIViewController *split = fwPaging ? nfb_columnsAppSplitForPaging(fwPaging) : nil;
-            [s appendFormat:@"nativeSplitDiag[b70] split=%@ suppressed=%d storedLive=%d crashed=%ld\n",
+            [s appendFormat:@"nativeSplitDiag[b71] split=%@ suppressed=%d storedLive=%d crashed=%ld\n",
                 split ? NSStringFromClass(split.class) : @"nil",
                 gNFBNativeSplitTierSuppressed ? 1 : 0,
                 (gNFBNativeSplitTierSplit && gNFBNativeSplitTierSplit.viewIfLoaded.window) ? 1 : 0,
                 (long)[NSUserDefaults.standardUserDefaults integerForKey:@"NFBNativeSplitTierCrashedBuild"]];
-            [s appendFormat:@"fullWidthDiag[b70] hostW=%.1f containerW=%.1f scrollW=%.1f chainLatched=%d pref=%d\n",
+            [s appendFormat:@"fullWidthDiag[b71] hostW=%.1f containerW=%.1f scrollW=%.1f chainLatched=%d pref=%d\n",
                 primaryHost.bounds.size.width, fwContainer ? fwContainer.bounds.size.width : -1.0,
                 fwScroll ? fwScroll.bounds.size.width : -1.0, gNFBFWChainLatched ? 1 : 0, nfb_columnsFullWidthPref() ? 1 : 0];
             NSMutableArray<NSLayoutConstraint *> *cs = [NSMutableArray array];
@@ -6934,7 +7062,7 @@ static void nfb_layoutActiveHomePaging(void) {
     if (gNFBLayoutActiveHomePagingRunning) {
         if (gNFBLogRecording) {
             static NSString *lastLayoutReentryKey = nil;
-            NSString *key = @"layout[b70] activeHome reentry deferred";
+            NSString *key = @"layout[b71] activeHome reentry deferred";
             if (![key isEqualToString:lastLayoutReentryKey]) { lastLayoutReentryKey = [key copy]; NFBLogEvent(key); }
         }
         nfb_requestLayoutActiveHomePagingOnNextTurn();
@@ -7003,12 +7131,12 @@ static void nfb_columnsBeginSizeTransition(void) {
     gNFBColumnsSizeTransitioning = YES;
     NSTimeInterval stamp = CACurrentMediaTime();
     gNFBColumnsSizeTransitionStamp = stamp;
-    if (gNFBLogRecording) NFBLogEvent(@"columnsResize[b70] begin lightLayout");
+    if (gNFBLogRecording) NFBLogEvent(@"columnsResize[b71] begin lightLayout");
     nfb_scheduleLayoutActiveHomePagingLight();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gNFBColumnsSizeTransitioning || fabs(gNFBColumnsSizeTransitionStamp - stamp) > 0.001) return;
         gNFBColumnsSizeTransitioning = NO;
-        if (gNFBLogRecording) NFBLogEvent(@"columnsResize[b70] timeout finalLayout");
+        if (gNFBLogRecording) NFBLogEvent(@"columnsResize[b71] timeout finalLayout");
         nfb_scheduleLayoutActiveHomePaging();
     });
 }
@@ -7019,7 +7147,7 @@ static void nfb_columnsEndSizeTransition(void) {
         return;
     }
     gNFBColumnsSizeTransitioning = NO;
-    if (gNFBLogRecording) NFBLogEvent(@"columnsResize[b70] end finalLayout");
+    if (gNFBLogRecording) NFBLogEvent(@"columnsResize[b71] end finalLayout");
     nfb_scheduleLayoutActiveHomePaging();
 }
 
@@ -7250,7 +7378,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
         NSInteger mode = %orig(size, NO, displaySideBar);
         if (gNFBLogRecording) {
             static NSString *lastNativeTierKey = nil;
-            NSString *key = [NSString stringWithFormat:@"nativeTier[b70] size=%.0fx%.0f ext=%d->0 side=%d mode=%ld",
+            NSString *key = [NSString stringWithFormat:@"nativeTier[b71] size=%.0fx%.0f ext=%d->0 side=%d mode=%ld",
                 size.width, size.height, displayExtendedContent ? 1 : 0, displaySideBar ? 1 : 0, (long)mode];
             if (![key isEqualToString:lastNativeTierKey]) { lastNativeTierKey = [key copy]; NFBLogEvent(key); }
         }
@@ -7360,7 +7488,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
         ((UIScrollView *)self).directionalLockEnabled = clearlyVertical;
         if (clearlyHorizontal) nfb_columnsAxisSuppressInnerScroll();
         if (gNFBLogRecording) {
-            NFBLogEvent([NSString stringWithFormat:@"columnsAxis[b70] t=(%.1f,%.1f) %@",
+            NFBLogEvent([NSString stringWithFormat:@"columnsAxis[b71] t=(%.1f,%.1f) %@",
                 t.x, t.y, clearlyVertical ? @"vertical" : (clearlyHorizontal ? @"horizontal" : @"free")]);
         }
     }
