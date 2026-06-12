@@ -328,10 +328,38 @@ static void BHTCollapseSpacesChromeDescendants(UIView *view, NSInteger depth) {
     }
 }
 
+// b69: any view inside the profile header layout domain (T1ProfileSummaryView / T1ProfileHeader*)
+// must never get geometry-collapsed — see BHTCollapseSpacesChromeViewAndNearbyContainers. The hooked
+// presence class (T1ProfileHeaderUserPresenceView) matches by its own name, so it is covered
+// anywhere it appears; the Home Spaces bar has no Profile* ancestor and keeps the full collapse.
+static BOOL BHTViewIsInsideProfileHeader(UIView *view) {
+    UIView *current = view;
+    for (NSInteger depth = 0; current && depth < 10; depth++, current = current.superview) {
+        NSString *cls = NSStringFromClass(current.class);
+        if ([cls containsString:@"ProfileSummary"] || [cls containsString:@"ProfileHeader"]) return YES;
+    }
+    return NO;
+}
+
 static void BHTCollapseSpacesChromeViewAndNearbyContainers(UIView *view) {
     if (!view) return;
     if (!BHTShouldHideSpacesBarNow()) {
         BHTRestoreSpacesChromeViewAndNearbyContainers(view);
+        return;
+    }
+    if (BHTViewIsInsideProfileHeader(view)) {
+        // b69 hang root fix: the iPad profile header (T1ProfileSummaryView) re-asserts the
+        // avatar/presence geometry from calculatedLayoutMetrics on EVERY layout pass, so the
+        // frame/bounds/height-constraint collapse below (and the ancestor shrink walk) — running
+        // from inside layoutSubviews — re-dirties the tree and the layout commit never converges.
+        // Twitter's hang watchdog then abort()s: that was the b65-b68 "search → tweet → profile"
+        // death, hang-sampled on device as T1ProfileSummaryView layoutSubviews ↔ FleetLine/
+        // UserPresence collapse (logs/hang-b68-ipad-guide-20260612.log). Inside a profile header
+        // only hide the chrome view itself: hidden/alpha are not inputs to the _t1_ manual layout,
+        // so there is nothing to fight (writes change-gated so a re-shown view costs nothing).
+        BHTSaveSpacesChromeViewIfNeeded(view);
+        if (!view.hidden) view.hidden = YES;
+        if (view.alpha != 0.0) view.alpha = 0.0;
         return;
     }
     BHTCollapseSpacesChromeDescendants(view, 0);
@@ -2099,7 +2127,7 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
 // appended to the persistent oplog (first few only — a re-arming watchdog may retry) so the
 // saved log shows that a kill was averted and the hang-sampler stacks around it name the cause.
 static void BHTWatchdogCrashSuppressed(const char *cls) {
-    static int suppressedCount = 0;   // racy increment is fine — worst case the cap is fuzzy
+    static _Atomic int suppressedCount = 0;   // b69: watchdogs fire from arbitrary queues
     int n = ++suppressedCount;
     if (n > 5) return;
     char line[160];
@@ -4881,7 +4909,7 @@ static BOOL BHTHandleTabSelectionRequest(UIViewController *tabBarController, NSI
         if (!gBHTUserTabTouchSelectionInProgress && !realTabBarTap) {
             BHTUpdateColumnsTabSelection(tabBarController, YES);
             NFBUpdateStreamButtonVisibility();
-            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b68] source=%@ index=%ld page=%@",
+            NFBLogEvent([NSString stringWithFormat:@"tabSelect.keepColumns[b69] source=%@ index=%ld page=%@",
                 source ?: @"?", (long)index, page ?: @"-"]);
             return YES;
         }
@@ -5108,7 +5136,7 @@ void BHTPresentColumnsMode(void) {
         UIViewController *selectionRoot = tabBarController ?: activeWindow.rootViewController;
         if (selectionRoot) BHTUpdateColumnsTabSelection(selectionRoot, YES);
         NFBColumnsRetapFocusAndRefresh();
-        NFBLogEvent(@"present.alreadyInline retapFocus[b68]");
+        NFBLogEvent(@"present.alreadyInline retapFocus[b69]");
         return;
     }
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
@@ -5360,7 +5388,7 @@ static void BHTPresentColumnsViewController(void) {
     BOOL markedUserTabTouch = (!isHome && !isColumns && gBHTColumnsIntent);
     if (markedUserTabTouch) {
         gBHTUserTabTouchSelectionInProgress = YES;
-        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b68] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
+        NFBLogEvent([NSString stringWithFormat:@"tabView.userTabTouch[b69] page=%@", BHTPageOfTabView((T1TabView *)self) ?: @"-"]);
     }
     %orig(touches, event);
     if (markedUserTabTouch) {
