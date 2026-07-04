@@ -7584,7 +7584,13 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     if (gInlineColumnsEnabled && objc_getAssociatedObject(self, &kNFBInlineColumnsAppliedKey)) {
         NSNumber *targetWidth = objc_getAssociatedObject(self, &kNFBInlineColumnsTargetContentWidthKey);
         CGFloat target = targetWidth.doubleValue;
-        if (target > 1.0) { %orig(CGSizeMake(target, size.height)); return; }
+        if (target > 1.0) {
+            // b73: hoisted out of %orig(...) — current Logos rejects a comma nested inside the
+            // %orig argument list ("Invalid argument structure in %orig", CI 28691096532).
+            CGSize forcedSize = CGSizeMake(target, size.height);
+            %orig(forcedSize);
+            return;
+        }
     }
     %orig(size);
 }
