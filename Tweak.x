@@ -13,6 +13,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
 #import <WebKit/WebKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
 #import "SAMKeychain/AuthViewController.h"
 #import "Colours/Colours.h"
@@ -49,6 +50,7 @@ extern void NFBLogEvent(NSString *msg);       // operation-log recorder (no-op u
 extern void NFBLogSnapshot(NSString *reason); // compact state snapshot (no-op unless recording)
 extern void NFBAppendCrashLogRaw(const char *s); // persistent-oplog raw append (works without recording)
 extern void NFBUpdateStreamButtonVisibility(void);
+extern void NFBNoteTabSelectionChanged(void);
 extern void NFBColumnsRetapFocusAndRefresh(void);
 NSString *BHTColumnsLogFlags(void);           // columns flags + tab selectedIndex, used by the snapshot
 void BHTPresentColumnsMode(void);
@@ -62,6 +64,7 @@ static __weak UIViewController *gBHTLastTabBarController = nil;
 // dismiss sets it NO. All deferred re-enable work must check this so a quick Home tap right after
 // Communities can't be overridden by a stale "enable columns" block firing 0.4-0.9s later.
 static BOOL gBHTColumnsIntent = NO;
+static NSUInteger gBHTColumnsPresentationEpoch = 0;
 static BOOL BHTIsColumnsPageID(NSString *page);
 static NSString *BHTPageOfTabView(T1TabView *tabView);
 static NSArray<UIView *> *BHTTabViewsForController(UIViewController *controller);
@@ -964,7 +967,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     gBHTLastTabBarController = (UIViewController *)self;
     if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, nil, @"setSelectedIndex")) return;
     %orig(selectedIndex);
-    NFBUpdateStreamButtonVisibility();
+    NFBNoteTabSelectionChanged();
     NFBLogSnapshot(@"setSelectedIndex.afterOrig");
     if (!gBHTSelectingHomeForColumns) {
         BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
@@ -975,7 +978,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     gBHTLastTabBarController = (UIViewController *)self;
     if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, nil, @"setSelectedTabIndex")) return;
     %orig(selectedIndex);
-    NFBUpdateStreamButtonVisibility();
+    NFBNoteTabSelectionChanged();
     NFBLogSnapshot(@"setSelectedTabIndex.afterOrig");
     if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
 }
@@ -984,7 +987,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     gBHTLastTabBarController = (UIViewController *)self;
     if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, nil, @"selectTabAtIndex")) return;
     %orig(selectedIndex);
-    NFBUpdateStreamButtonVisibility();
+    NFBNoteTabSelectionChanged();
     NFBLogSnapshot(@"selectTabAtIndex.afterOrig");
     if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
 }
@@ -993,7 +996,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     gBHTLastTabBarController = (UIViewController *)self;
     if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, tabView, @"customTabBar")) return;
     %orig(tabBar, selectedIndex, tabView);
-    NFBUpdateStreamButtonVisibility();
+    NFBNoteTabSelectionChanged();
     NFBLogSnapshot(@"customTabBar.afterOrig");
     if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
 }
@@ -1002,7 +1005,7 @@ static void batchSwizzlingOnClass(Class cls, NSArray<NSString*>*origSelectors, I
     gBHTLastTabBarController = (UIViewController *)self;
     if (BHTHandleTabSelectionRequest((UIViewController *)self, selectedIndex, tabView, @"tabBarViewController")) return;
     %orig(tabBarController, selectedIndex, tabView);
-    NFBUpdateStreamButtonVisibility();
+    NFBNoteTabSelectionChanged();
     NFBLogSnapshot(@"tabBarViewController.afterOrig");
     if (!gBHTSelectingHomeForColumns) BHTUpdateColumnsTabSelection((UIViewController *)self, NO);
 }
@@ -4645,6 +4648,7 @@ static char kManualRefreshInProgressKey;
 static char kBHTColumnsTapGestureKey;
 static char kBHTHomeTapGestureKey;
 static NSTimeInterval gBHTLastColumnsOpen = 0;
+static NSTimeInterval gBHTLastColumnsRetap = 0;
 static __weak UIViewController *gBHTColumnsHostController = nil;
 
 static NSString *BHTColumnsTabTitle(void) {
@@ -5070,8 +5074,12 @@ void BHTDismissColumnsMode(void) {
         dispatch_async(dispatch_get_main_queue(), ^{ BHTDismissColumnsMode(); });
         return;
     }
+    BOOL wasActive = gBHTColumnsIntent || NFBInlineColumnsEnabled();
     gBHTColumnsIntent = NO;
     gBHTSelectingHomeForColumns = NO;
+    gBHTLastColumnsRetap = 0.0;
+    if (!wasActive) return;
+    gBHTColumnsPresentationEpoch++;
     NFBLogSnapshot(@"dismiss.entry");
     NFBSetInlineColumnsEnabled(NO);
     BHTRestoreAllSavedSpacesChrome();
@@ -5127,6 +5135,7 @@ void BHTPresentColumnsMode(void) {
         dispatch_async(dispatch_get_main_queue(), ^{ BHTPresentColumnsMode(); });
         return;
     }
+    NSTimeInterval now = CACurrentMediaTime();
     gBHTColumnsIntent = YES;
     NFBLogSnapshot(@"present.entry");
     if (NFBInlineColumnsEnabled()) {
@@ -5135,11 +5144,13 @@ void BHTPresentColumnsMode(void) {
         if (!tabBarController) tabBarController = BHTFindTabBarController();
         UIViewController *selectionRoot = tabBarController ?: activeWindow.rootViewController;
         if (selectionRoot) BHTUpdateColumnsTabSelection(selectionRoot, YES);
-        NFBColumnsRetapFocusAndRefresh();
-        NFBLogEvent(@"present.alreadyInline retapFocus[b73]");
+        if (now - gBHTLastColumnsRetap >= 0.35) {
+            gBHTLastColumnsRetap = now;
+            NFBColumnsRetapFocusAndRefresh();
+            NFBLogEvent(@"present.alreadyInline retapFocus[b73]");
+        }
         return;
     }
-    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (now - gBHTLastColumnsOpen < 0.20) {
         UIWindow *activeWindow = BHT_activeKeyWindow();
         UIViewController *tabBarController = BHTFindControllerOfClass(activeWindow.rootViewController, NSClassFromString(@"T1TabBarViewController"), 0);
@@ -5153,6 +5164,7 @@ void BHTPresentColumnsMode(void) {
         return;
     }
     gBHTLastColumnsOpen = now;
+    NSUInteger presentationEpoch = ++gBHTColumnsPresentationEpoch;
 
     UIWindow *window = BHT_activeKeyWindow();
     if (!window.rootViewController) return;
@@ -5170,13 +5182,13 @@ void BHTPresentColumnsMode(void) {
     BHTUpdateColumnsTabSelection(hostController, YES);
     NFBLogSnapshot(@"present.immediateInline");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (!gBHTColumnsIntent) return;
+        if (!gBHTColumnsIntent || presentationEpoch != gBHTColumnsPresentationEpoch) return;
         if (!selectedHome) selectedHome = BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
         NFBSetInlineColumnsEnabled(YES);
         BHTUpdateColumnsTabSelection(hostController, YES);
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (!gBHTColumnsIntent) { gBHTSelectingHomeForColumns = NO; NFBLogSnapshot(@"present+0.55(intent dropped)"); return; }
+        if (!gBHTColumnsIntent || presentationEpoch != gBHTColumnsPresentationEpoch) return;
         if (!NFBInlineColumnsEnabled() && !selectedHome) selectedHome = BHTSelectTabPage(tabBarController ?: window.rootViewController, @"home");
         gBHTSelectingHomeForColumns = NO;
         NFBSetInlineColumnsEnabled(YES);
@@ -5184,7 +5196,7 @@ void BHTPresentColumnsMode(void) {
         NFBLogSnapshot(@"present+0.55");
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.00 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (!gBHTColumnsIntent) return;
+        if (!gBHTColumnsIntent || presentationEpoch != gBHTColumnsPresentationEpoch) return;
         if (NFBInlineColumnsEnabled()) {
             BHTUpdateColumnsTabSelection(hostController, YES);
             return;
@@ -5397,12 +5409,10 @@ static void BHTPresentColumnsViewController(void) {
         });
     }
     if (isHome) {
-        BHTDismissColumnsMode();
-        UIWindow *window = BHT_activeKeyWindow();
-        BHTUpdateColumnsTabSelection(window.rootViewController, NO);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            BHTDismissColumnsMode();
-            BHTUpdateColumnsTabSelection(window.rootViewController, NO);
+            if (gBHTColumnsIntent) return;
+            UIWindow *activeWindow = BHT_activeKeyWindow();
+            if (activeWindow.rootViewController) BHTUpdateColumnsTabSelection(activeWindow.rootViewController, NO);
         });
     }
 }

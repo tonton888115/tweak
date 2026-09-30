@@ -6,6 +6,7 @@
 //
 
 #import "ModernSettingsViewController.h"
+#import "BHTManager.h"
 #import "BHTBundle/BHTBundle.h"
 #import "BHDimPalette.h"
 #import "Colours/Colours.h"
@@ -54,8 +55,8 @@
 extern UIColor *BHTCurrentAccentColor(void);
 // NeoFreeBird streaming/columns bridges (defined in StreamingTimeline.x / Tweak.x).
 extern BOOL NFBInlineColumnsEnabled(void);
-extern void NFBSetInlineColumnsEnabled(BOOL enabled);
 extern void BHTPresentColumnsMode(void);
+extern void BHTDismissColumnsMode(void);
 extern UIViewController *NFBMakeColumnsManageViewController(void);
 extern void NFBStreamPrefsChanged(void);
 extern NSString *BHTColumnsHostPageID(void);
@@ -3127,6 +3128,8 @@ if ([type isEqualToString:@"compactButton"]) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self refreshAllTabViews];
             });
+        } else if ([key isEqualToString:@"auto_stream_timeline"]) {
+            NFBStreamPrefsChanged();
         }
     }
 }
@@ -3177,8 +3180,7 @@ if ([type isEqualToString:@"compactButton"]) {
 }
 
 - (void)showAutoStreamIntervalPicker:(NSDictionary *)sender {
-    NSInteger current = [[NSUserDefaults standardUserDefaults] integerForKey:@"auto_stream_interval"];
-    if (current <= 0) current = 20;
+    NSInteger current = [BHTManager autoStreamInterval];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:mst_nfbLoc(@"NFB_INTERVAL_PICKER_TITLE", @"Auto-refresh interval")
         message:[NSString stringWithFormat:mst_nfbLoc(@"NFB_INTERVAL_CURRENT", @"Current: %lds"), (long)current]
         preferredStyle:UIAlertControllerStyleActionSheet];
@@ -3199,7 +3201,7 @@ if ([type isEqualToString:@"compactButton"]) {
 
 - (void)toggleColumnsModeFromSettings:(NSDictionary *)sender {
     if (NFBInlineColumnsEnabled()) {
-        NFBSetInlineColumnsEnabled(NO);
+        BHTDismissColumnsMode();
         return;
     }
     // Columns mode lives on the Columns tab; close settings first so the switch is visible.

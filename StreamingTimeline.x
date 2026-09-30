@@ -41,6 +41,7 @@ static void nfb_updateStreamStateIconForVC(UIViewController *vc);
 static NSString *nfb_currentSelectedTabPage(void);
 static BOOL nfb_homeTabSelectedOrUnknown(void);
 void NFBUpdateStreamButtonVisibility(void);
+void NFBNoteTabSelectionChanged(void);
 static void nfb_showNewTweetsPill(UIViewController *vc);
 static BOOL nfb_streamTriggerColumns(void);
 static void nfb_revealAllColumnTops(void);
@@ -115,6 +116,7 @@ static void nfb_columnsDismissAllDetailNavs(void);
 static void nfb_columnsAppendDetailControllers(NSMutableArray<UIViewController *> *controllers, BOOL refreshEligibleOnly);
 void NFBSetInlineColumnsEnabled(BOOL enabled);
 extern void BHTPresentColumnsMode(void);
+extern void BHTDismissColumnsMode(void);
 extern NSString *BHTColumnsModeDiagnostic(void);
 extern NSString *BHTColumnsHostPageID(void);   // which native tab hosts Columns (Tweak.x)
 
@@ -145,6 +147,8 @@ static __weak UIViewController *gPendingNewTweetsVC = nil;
 static __weak UIScrollView *gActiveTimelineScrollView = nil;
 static UIButton *gNewTweetsPill = nil;
 static BOOL gInlineColumnsEnabled = NO;
+static __weak UIViewController *gNFBColumnsResizeEntriesPaging = nil;
+static NSArray<NSDictionary *> *gNFBColumnsResizeEntries = nil;
 static NSString * const kNFBColumnsOrderKey = @"NFBColumnsOrderV1";
 static NSString * const kNFBColumnsHiddenKey = @"NFBColumnsHiddenV1";
 static NSString * const kNFBColumnsEnabledTabsKey = @"NFBColumnsEnabledTabsV1";
@@ -162,6 +166,8 @@ static CGFloat gActiveTimelineOffsetY = 0.0;
 static CGFloat gActiveTimelineTopY = 0.0;
 static NSTimeInterval gLastUserTimelineScrollInteraction = 0.0;
 static BOOL gRefreshStartedAtTop = NO;
+static NSString *gNFBSelectedTabPageCache = nil;
+static NSTimeInterval gNFBSelectedTabPageCacheAt = 0.0;
 static char kNFBRefreshStartedAtKey;
 static char kNFBRefreshStartedAtTopKey;
 
@@ -1029,7 +1035,9 @@ void NFBLogEvent(NSString *msg) {
     if (!gNFBLog) gNFBLog = [NSMutableArray array];
     NSString *line = [NSString stringWithFormat:@"+%7.2f %@", CACurrentMediaTime() - gNFBLogStart, msg ?: @""];
     [gNFBLog addObject:line];
-    if (gNFBLog.count > 6000) [gNFBLog removeObjectAtIndex:0];
+    if (gNFBLog.count >= 6000) {
+        [gNFBLog removeObjectsInRange:NSMakeRange(0, MIN((NSUInteger)1000, gNFBLog.count))];
+    }
     // Mirror each line to a file so the log survives an app kill or a stuck screen where the menu /
     // stop button isn't reachable — it can be copied next launch via "Copy saved log".
     @try { [gNFBLogFile writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]]; } @catch (NSException *e) {}
@@ -1431,7 +1439,7 @@ static void nfb_installCrashLoggerOnce(void) {
     }
     [ac addAction:[UIAlertAction actionWithTitle:(on ? nfb_loc(@"NFB_STREAM_OFF", @"Turn auto-refresh OFF") : nfb_loc(@"NFB_STREAM_ON", @"Turn auto-refresh ON")) style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ nfb_setStreamEnabled(!on); UIViewController *vc = gActiveItemsVC; if (vc) nfb_streamStart(vc); }]];
     [ac addAction:[UIAlertAction actionWithTitle:(gInlineColumnsEnabled ? nfb_loc(@"NFB_COLUMNS_OFF", @"Turn columns mode OFF") : nfb_loc(@"NFB_COLUMNS_ON", @"Turn columns mode ON")) style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-        if (gInlineColumnsEnabled) NFBSetInlineColumnsEnabled(NO);
+        if (gInlineColumnsEnabled) BHTDismissColumnsMode();
         else BHTPresentColumnsMode();
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_INTERVAL_CHANGE", @"⏱ Change refresh interval…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showInterval]; }]];
@@ -1870,12 +1878,33 @@ static NSString *nfb_selectedTabPageInView(UIView *view, int depth) {
 }
 
 static NSString *nfb_currentSelectedTabPage(void) {
+    NSTimeInterval now = CACurrentMediaTime();
+    NSTimeInterval cacheTTL = gNFBSelectedTabPageCache ? 0.12 : 0.03;
+    if (gNFBSelectedTabPageCacheAt > 0.0 && now - gNFBSelectedTabPageCacheAt < cacheTTL) {
+        return gNFBSelectedTabPageCache;
+    }
+    NSString *selectedPage = nil;
     for (UIWindow *window in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
         if (window.hidden || window.alpha < 0.01) continue;
         NSString *page = nfb_selectedTabPageInView(window, 0);
-        if (page.length) return page;
+        if (page.length) {
+            selectedPage = page;
+            break;
+        }
     }
-    return nil;
+    gNFBSelectedTabPageCache = [selectedPage copy];
+    gNFBSelectedTabPageCacheAt = now;
+    return gNFBSelectedTabPageCache;
+}
+
+void NFBNoteTabSelectionChanged(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ NFBNoteTabSelectionChanged(); });
+        return;
+    }
+    gNFBSelectedTabPageCache = nil;
+    gNFBSelectedTabPageCacheAt = 0.0;
+    NFBUpdateStreamButtonVisibility();
 }
 
 static BOOL nfb_homeTabSelectedOrUnknown(void) {
@@ -1891,9 +1920,12 @@ static BOOL nfb_homeTabSelectedOrUnknown(void) {
 
 #pragma mark - streaming timer
 
-static char kNFBStreamTimerKey;
-
-static NSTimeInterval gLastStreamFire = 0;   // dedup across the two home-VC timers
+// A single timer drives whichever Home timeline is currently active. The old per-controller
+// timers needed a global time-window dedupe and still repeated target discovery every interval.
+// Centralizing the timer preserves the selected-timeline logic while removing duplicate wakeups.
+static NSTimer *gNFBStreamTimer = nil;
+static __weak UIViewController *gNFBStreamTimerOwner = nil;
+static NSTimeInterval gNFBStreamTimerInterval = 0.0;
 
 static BOOL nfb_streamShouldFire(UIViewController *vc) {
     if (![BHTManager autoStreamTimeline]) return NO;
@@ -1946,34 +1978,60 @@ static BOOL nfb_streamShouldFire(UIViewController *vc) {
     return YES;
 }
 static void nfb_streamStop(UIViewController *vc) {
-    NSTimer *t = objc_getAssociatedObject(vc, &kNFBStreamTimerKey);
-    [t invalidate];
-    objc_setAssociatedObject(vc, &kNFBStreamTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (vc && gNFBStreamTimerOwner != vc) return;
+    [gNFBStreamTimer invalidate];
+    gNFBStreamTimer = nil;
+    gNFBStreamTimerOwner = nil;
+    gNFBStreamTimerInterval = 0.0;
 }
 static void nfb_streamStart(UIViewController *vc) {
-    nfb_streamStop(vc);
     BOOL on = [BHTManager autoStreamTimeline];
     NSTimeInterval interval = (NSTimeInterval)[BHTManager autoStreamInterval];
     nfb_styleButton(on);
-    nfb_updateGauge(on, interval);
-    if (!on) return;
-    __weak UIViewController *wvc = vc;
-    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:interval repeats:YES block:^(NSTimer *t) {
-        UIViewController *s = wvc;
-        if (!s) { [t invalidate]; return; }
-        if (![BHTManager autoStreamTimeline]) { nfb_streamStop(s); nfb_styleButton(NO); nfb_updateGauge(NO, 0); nfb_updateStreamStateIconForVC(s); return; }
-        if (nfb_streamShouldFire(s)) {
-            // Both the For-You and Following home VCs run a timer; dedup so the visible
-            // timeline isn't refreshed twice per interval.
-            NSTimeInterval now = CACurrentMediaTime();
-            if (now - gLastStreamFire >= interval * 0.6) {
-                gLastStreamFire = now;
-                nfb_streamTrigger(s);
-            }
+    if (!on) {
+        nfb_streamStop(nil);
+        nfb_updateGauge(NO, 0.0);
+        nfb_updateStreamStateIconForVC(vc);
+        return;
+    }
+    if (!vc) {
+        nfb_updateGauge(YES, interval);
+        return;
+    }
+
+    BOOL sameInterval = gNFBStreamTimer && gNFBStreamTimer.isValid &&
+        fabs(gNFBStreamTimerInterval - interval) < 0.01;
+    gNFBStreamTimerOwner = vc;
+    if (sameInterval) {
+        nfb_updateGauge(YES, interval);
+        nfb_updateStreamStateIconForVC(vc);
+        return;
+    }
+
+    nfb_streamStop(nil);
+    gNFBStreamTimerOwner = vc;
+    gNFBStreamTimerInterval = interval;
+    nfb_updateGauge(YES, interval);
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:interval repeats:YES block:^(__unused NSTimer *t) {
+        UIViewController *target = gNFBStreamTimerOwner ?: gActiveItemsVC;
+        if (!target) {
+            nfb_streamStop(nil);
+            return;
+        }
+        if (![BHTManager autoStreamTimeline]) {
+            nfb_streamStop(nil);
+            nfb_styleButton(NO);
+            nfb_updateGauge(NO, 0);
+            nfb_updateStreamStateIconForVC(target);
+            return;
+        }
+        if (nfb_streamShouldFire(target)) {
+            nfb_streamTrigger(target);
         }
     }];
+    timer.tolerance = MIN(1.0, MAX(0.25, interval * 0.1));
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:UITrackingRunLoopMode];
-    objc_setAssociatedObject(vc, &kNFBStreamTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gNFBStreamTimer = timer;
 }
 
 static NSString *nfb_identifierForTimelineVariantArgument(id variant) {
@@ -2105,7 +2163,7 @@ static BOOL gNFBLayoutActiveHomePagingRunning = NO; // b44: avoid trait/layout r
 static BOOL gNFBLayoutActiveHomePagingScheduled = NO;
 static BOOL gNFBColumnsSizeTransitioning = NO;
 static NSTimeInterval gNFBColumnsSizeTransitionStamp = 0.0;
-static BOOL gNFBColumnsLightLayoutScheduled = NO;
+static NSUInteger gNFBColumnsLayoutScheduleEpoch = 0;
 static NSArray<UIView *> *gNFBColumnsExpandedWidthViews = nil; // content ancestors widened after rail removal; restored on columns-off
 // Oscillation latch for nfb_expandColumnsPrimaryWidthIfNeeded: the app-split's Auto Layout settles
 // the home scroll view a few points off our computed full-width target, so each layout pass we'd
@@ -2135,6 +2193,9 @@ static char kNFBColumnScrollIndicatorInsetKey;
 static char kNFBColumnScrollAdjustmentBehaviorKey;
 static CGFloat gColumnsHiddenBarHeight = 0.0;   // height of the hidden home segment bar, for gap-closing
 static NSHashTable<UIView *> *gNFBInlineColumnsSavedChromeViews = nil;
+static char kNFBColumnsChromeScanStateKey;
+static char kNFBColumnsSegmentedChromeCandidatesKey;
+static NSUInteger gNFBColumnsChromeScanGeneration = 1;
 
 static void nfb_trackSavedColumnsChromeView(UIView *view) {
     if (!view) return;
@@ -2438,6 +2499,43 @@ static void nfb_setColumnsChromeViewHidden(UIView *view, BOOL hidden) {
     objc_setAssociatedObject(view, &kNFBInlineColumnsChromeAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBInlineColumnsChromeInteractionKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kNFBInlineColumnsChromeGesturesKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// Chrome discovery is a recursive, heuristic view-tree walk. Re-running it multiple times in a
+// single layout pass (and once per frame during live resize) is far more expensive than reapplying
+// the already-saved views. Cache discovery per root/scope, but rescan when its direct hierarchy
+// changes, after a mode transition, or after a short settling interval for Twitter's late reloads.
+static BOOL nfb_columnsChromeShouldRescan(UIView *root, NSString *scope) {
+    if (!root || !scope.length) return NO;
+    id storedState = objc_getAssociatedObject(root, &kNFBColumnsChromeScanStateKey);
+    NSMutableDictionary *state = [storedState isKindOfClass:NSMutableDictionary.class] ?
+        (NSMutableDictionary *)storedState :
+        ([storedState isKindOfClass:NSDictionary.class] ? [storedState mutableCopy] : [NSMutableDictionary dictionary]);
+    if (state != storedState) {
+        objc_setAssociatedObject(root, &kNFBColumnsChromeScanStateKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    NSDictionary *previous = state[scope];
+    NSTimeInterval now = CACurrentMediaTime();
+    NSUInteger previousGeneration = [previous[@"generation"] unsignedIntegerValue];
+    NSUInteger previousSubviews = [previous[@"subviews"] unsignedIntegerValue];
+    NSTimeInterval previousStamp = [previous[@"stamp"] doubleValue];
+    BOOL shouldRescan = previousGeneration != gNFBColumnsChromeScanGeneration ||
+        previousSubviews != root.subviews.count || previousStamp <= 0.0 || now - previousStamp >= 0.50;
+    if (shouldRescan) {
+        state[scope] = @{ @"generation": @(gNFBColumnsChromeScanGeneration),
+                          @"subviews": @(root.subviews.count),
+                          @"stamp": @(now) };
+    }
+    return shouldRescan;
+}
+
+static void nfb_reassertSavedColumnsChromeInRoot(UIView *root) {
+    if (!root || !gInlineColumnsEnabled) return;
+    for (UIView *view in gNFBInlineColumnsSavedChromeViews.allObjects) {
+        if (view == root || [view isDescendantOfView:root]) {
+            nfb_setColumnsChromeViewHidden(view, YES);
+        }
+    }
 }
 
 static BOOL nfb_columnsChromeCandidate(UIView *view, UIView *root) {
@@ -2748,10 +2846,18 @@ static void nfb_setColumnsGlobalTopChromeHidden(BOOL hidden) {
     UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
     UIViewController *container = paging ? nfb_parentControllerNamed(paging, @"HomeTimelineContainer") : nil;
     if (segmented && [segmented isViewLoaded]) {
-        nfb_setColumnsGlobalTopChromeHiddenInView(segmented.view, segmented.view, YES, 0);
+        if (nfb_columnsChromeShouldRescan(segmented.view, @"global")) {
+            nfb_setColumnsGlobalTopChromeHiddenInView(segmented.view, segmented.view, YES, 0);
+        } else {
+            nfb_reassertSavedColumnsChromeInRoot(segmented.view);
+        }
     }
     if (container && [container isViewLoaded] && container != segmented) {
-        nfb_setColumnsGlobalTopChromeHiddenInView(container.view, container.view, YES, 0);
+        if (nfb_columnsChromeShouldRescan(container.view, @"global")) {
+            nfb_setColumnsGlobalTopChromeHiddenInView(container.view, container.view, YES, 0);
+        } else {
+            nfb_reassertSavedColumnsChromeInRoot(container.view);
+        }
     }
 }
 
@@ -2761,8 +2867,20 @@ static void nfb_setColumnsSegmentedHiddenForPaging(UIViewController *paging, BOO
     UIViewController *segmented = nfb_parentControllerNamed(paging, @"Segmented");
     UIViewController *container = nfb_parentControllerNamed(paging, @"HomeTimelineContainer");
     if (hidden) {
-        if (segmented && [segmented isViewLoaded]) nfb_hideColumnsChromeInView(segmented.view, paging.view, segmented.view, 0);
-        if (container && [container isViewLoaded]) nfb_hideColumnsChromeInView(container.view, paging.view, container.view, 0);
+        if (segmented && [segmented isViewLoaded]) {
+            if (nfb_columnsChromeShouldRescan(segmented.view, @"direct")) {
+                nfb_hideColumnsChromeInView(segmented.view, paging.view, segmented.view, 0);
+            } else {
+                nfb_reassertSavedColumnsChromeInRoot(segmented.view);
+            }
+        }
+        if (container && [container isViewLoaded]) {
+            if (nfb_columnsChromeShouldRescan(container.view, @"direct")) {
+                nfb_hideColumnsChromeInView(container.view, paging.view, container.view, 0);
+            } else {
+                nfb_reassertSavedColumnsChromeInRoot(container.view);
+            }
+        }
         nfb_setColumnsGlobalTopChromeHidden(YES);
     } else {
         nfb_setColumnsGlobalTopChromeHidden(NO);
@@ -2829,6 +2947,31 @@ static BOOL nfb_segmentedControllerIsHomeTimeline(UIViewController *segmentedVC)
         nfb_viewTreeContainsHomeSegmentBar(segmentedVC.view, segmentedVC.view, 0);
 }
 
+static NSArray<UIView *> *nfb_columnsSegmentedChromeViews(UIViewController *segmentedVC) {
+    if (!segmentedVC || ![segmentedVC isViewLoaded]) return @[];
+    UIView *root = segmentedVC.view;
+    NSArray<UIView *> *cached = objc_getAssociatedObject(root, &kNFBColumnsSegmentedChromeCandidatesKey);
+    BOOL shouldRescan = nfb_columnsChromeShouldRescan(root, @"segmented");
+    if (cached && !shouldRescan) return cached;
+
+    NSMutableArray<UIView *> *bars = [NSMutableArray array];
+    NSHashTable<UIView *> *seen = [NSHashTable weakObjectsHashTable];
+    for (NSString *key in @[@"_segmentedControl", @"segmentedControl", @"_scrollingSegmentedControl",
+                            @"scrollingSegmentedControl", @"_labelBar", @"labelBar", @"_labelBarView",
+                            @"labelBarView", @"_tabBar", @"tabBar", @"_tabsView", @"tabsView",
+                            @"_headerView", @"headerView", @"_topBar", @"topBar", @"_titleBar",
+                            @"titleBar", @"_titlesView", @"titlesView"]) {
+        @try {
+            id value = [segmentedVC valueForKey:key];
+            nfb_collectSegmentedChromeViewsFromObject(value, bars, seen, root, 0);
+        } @catch (NSException *e) {}
+    }
+    nfb_collectSegmentedChromeViewsInViewTree(root, bars, seen, root, 0);
+    NSArray<UIView *> *result = [bars copy];
+    objc_setAssociatedObject(root, &kNFBColumnsSegmentedChromeCandidatesKey, result, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return result;
+}
+
 // Hide the Home segment bar (For You / Following / pinned-list tabs) while columns mode is on by
 // targeting TFNScrollingSegmentedViewController's own scrolling control directly, instead of the
 // frame/text heuristics that were latching onto the wrong full-screen view. Runs from the
@@ -2841,21 +2984,8 @@ static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC
         return;
     }
     if (!nfb_segmentedControllerIsHomeTimeline(segmentedVC)) return;
-    NSMutableArray<UIView *> *bars = [NSMutableArray array];
-    NSHashTable<UIView *> *seen = [NSHashTable weakObjectsHashTable];
     UIView *root = segmentedVC.view;
-    for (NSString *key in @[@"_segmentedControl", @"segmentedControl", @"_scrollingSegmentedControl",
-                            @"scrollingSegmentedControl", @"_labelBar", @"labelBar", @"_labelBarView",
-                            @"labelBarView", @"_tabBar", @"tabBar", @"_tabsView", @"tabsView",
-                            @"_headerView", @"headerView", @"_topBar", @"topBar", @"_titleBar",
-                            @"titleBar", @"_titlesView", @"titlesView"]) {
-        @try {
-            id value = [segmentedVC valueForKey:key];
-            nfb_collectSegmentedChromeViewsFromObject(value, bars, seen, root, 0);
-        } @catch (NSException *e) {}
-    }
-    nfb_collectSegmentedChromeViewsInViewTree(root, bars, seen, root, 0);
-    for (UIView *bar in bars) {
+    for (UIView *bar in nfb_columnsSegmentedChromeViews(segmentedVC)) {
         nfb_setColumnsChromeViewHidden(bar, YES);
         nfb_setColumnsChromeDescendantsHidden(bar, YES, 0);
         nfb_collapseColumnsChromeAncestorsForView(bar, root);
@@ -2865,21 +2995,8 @@ static void nfb_applyColumnsSegmentedControlHidden(UIViewController *segmentedVC
 static void nfb_forceColumnsSegmentedControlHeightCollapsed(UIViewController *segmentedVC) {
     if (!gInlineColumnsEnabled || !segmentedVC || ![segmentedVC isViewLoaded]) return;
     if (!nfb_segmentedControllerIsHomeTimeline(segmentedVC)) return;
-    NSMutableArray<UIView *> *bars = [NSMutableArray array];
-    NSHashTable<UIView *> *seen = [NSHashTable weakObjectsHashTable];
     UIView *root = segmentedVC.view;
-    for (NSString *key in @[@"_segmentedControl", @"segmentedControl", @"_scrollingSegmentedControl",
-                            @"scrollingSegmentedControl", @"_labelBar", @"labelBar", @"_labelBarView",
-                            @"labelBarView", @"_tabBar", @"tabBar", @"_tabsView", @"tabsView",
-                            @"_headerView", @"headerView", @"_topBar", @"topBar", @"_titleBar",
-                            @"titleBar", @"_titlesView", @"titlesView"]) {
-        @try {
-            id value = [segmentedVC valueForKey:key];
-            nfb_collectSegmentedChromeViewsFromObject(value, bars, seen, root, 0);
-        } @catch (NSException *e) {}
-    }
-    nfb_collectSegmentedChromeViewsInViewTree(root, bars, seen, root, 0);
-    for (UIView *bar in bars) {
+    for (UIView *bar in nfb_columnsSegmentedChromeViews(segmentedVC)) {
         nfb_collapseColumnsChromeView(bar);
         UIView *child = bar;
         UIView *current = bar.superview;
@@ -4052,6 +4169,10 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     UIScrollView *activeColumnsScroll = nfb_horizontalPagingScrollViewOf(paging);
     BOOL columnsScrollDragging = activeColumnsScroll && (activeColumnsScroll.isDragging || activeColumnsScroll.isTracking || activeColumnsScroll.isDecelerating);
     NSArray<NSDictionary *> *entries = nfb_currentColumnEntriesForPaging(paging);
+    if (entries.count) {
+        gNFBColumnsResizeEntriesPaging = paging;
+        gNFBColumnsResizeEntries = [entries copy];
+    }
     NSMutableArray<UIViewController *> *timelinePagesForPreload = [NSMutableArray array];
     for (NSDictionary *entry in entries) {
         if ([entry[@"kind"] isEqualToString:kNFBColumnEntryKindTimeline]) {
@@ -4637,6 +4758,8 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     // against the profile's own pager mid push-animation. Everything below belongs to the HOME
     // pager only (width constraint, stale app-tab columns, overlay, chrome).
     if (!nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    gNFBColumnsResizeEntriesPaging = nil;
+    gNFBColumnsResizeEntries = nil;
     {
         UIScrollView *sv = nfb_horizontalPagingScrollViewOf(paging);
         UIView *primaryHost = sv ? nfb_enclosingAppSplitHostView((UIView *)sv) : nil;
@@ -4665,17 +4788,6 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     if (!wasApplied) return;
 
     // (extended-content rail already restored at the top of this function, before early returns)
-    for (UIViewController *tabVC in gNFBColumnsAppTabControllers.allValues) {
-        if (!tabVC) continue;
-        @try { [paging setOverrideTraitCollection:nil forChildViewController:tabVC]; } @catch (NSException *e) {}
-        if (tabVC.parentViewController == paging) {
-            [tabVC willMoveToParentViewController:nil];
-            [tabVC removeFromParentViewController];
-        }
-        [tabVC.view removeFromSuperview];
-        objc_setAssociatedObject(tabVC, &kNFBColumnsAddedAsChildKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(tabVC, &kNFBColumnsAppTabColumnKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
     // Detach the borrowed guide (we own it) from the paging controller + remove its view; keep the
     // cached instance for reuse on the next columns-open. Reset the content-ready latch so it re-proves
     // itself (the view tree is torn down on detach).
@@ -4895,7 +5007,11 @@ static UIViewController *nfb_columnEntryViewController(NSDictionary *entry) {
 // cadence. Only this file writes these keys, so cache each read and invalidate all three caches via
 // one generation counter bumped by the writers (all main-thread UI paths).
 static NSInteger gNFBColumnsPrefsGen = 1;
-static void nfb_columnsPrefsDidChange(void) { gNFBColumnsPrefsGen++; }
+static void nfb_columnsPrefsDidChange(void) {
+    gNFBColumnsPrefsGen++;
+    gNFBColumnsResizeEntriesPaging = nil;
+    gNFBColumnsResizeEntries = nil;
+}
 
 static NSArray *nfb_columnsEnabledTabsSavedArray(void) {
     static id cache = nil;
@@ -7140,17 +7256,10 @@ static void nfb_layoutActiveHomePaging(void) {
 }
 
 static void nfb_scheduleLayoutActiveHomePagingLight(void) {
-    if (gNFBColumnsLightLayoutScheduled) {
-        nfb_requestLayoutActiveHomePagingOnNextTurn();
-        return;
-    }
-    gNFBColumnsLightLayoutScheduled = YES;
+    NSUInteger epoch = ++gNFBColumnsLayoutScheduleEpoch;
     nfb_requestLayoutActiveHomePagingOnNextTurn();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        nfb_requestLayoutActiveHomePagingOnNextTurn();
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.24 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        gNFBColumnsLightLayoutScheduled = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (epoch != gNFBColumnsLayoutScheduleEpoch) return;
         nfb_requestLayoutActiveHomePagingOnNextTurn();
     });
 }
@@ -7160,17 +7269,14 @@ static void nfb_scheduleLayoutActiveHomePaging(void) {
         nfb_scheduleLayoutActiveHomePagingLight();
         return;
     }
+    NSUInteger epoch = ++gNFBColumnsLayoutScheduleEpoch;
     nfb_requestLayoutActiveHomePagingOnNextTurn();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (epoch != gNFBColumnsLayoutScheduleEpoch) return;
         nfb_requestLayoutActiveHomePagingOnNextTurn();
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        nfb_requestLayoutActiveHomePagingOnNextTurn();
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.00 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        nfb_requestLayoutActiveHomePagingOnNextTurn();
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.80 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.90 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (epoch != gNFBColumnsLayoutScheduleEpoch) return;
         nfb_requestLayoutActiveHomePagingOnNextTurn();
     });
 }
@@ -7186,7 +7292,8 @@ static void nfb_columnsLayoutColumnFramesLightweight(void) {
     if (!paging || !nfb_inlineColumnsActiveForHomePaging(paging) || ![paging isViewLoaded]) return;
     UIScrollView *nativeScrollView = nfb_horizontalPagingScrollViewOf(paging);
     if (!nativeScrollView) return;
-    NSArray<NSDictionary *> *entries = nfb_currentColumnEntriesForPaging(paging);
+    NSArray<NSDictionary *> *entries = (gNFBColumnsResizeEntriesPaging == paging && gNFBColumnsResizeEntries.count)
+        ? gNFBColumnsResizeEntries : nfb_currentColumnEntriesForPaging(paging);
     if (!entries.count) return;
     CGRect bounds = nativeScrollView.bounds;
     if (bounds.size.width < 120.0 || bounds.size.height < 240.0) return;
@@ -7259,6 +7366,8 @@ static void nfb_columnsBeginSizeTransition(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gNFBColumnsSizeTransitioning || fabs(gNFBColumnsSizeTransitionStamp - stamp) > 0.001) return;
         gNFBColumnsSizeTransitioning = NO;
+        gNFBColumnsResizeEntriesPaging = nil;
+        gNFBColumnsResizeEntries = nil;
         if (gNFBLogRecording) NFBLogEvent(@"columnsResize[b73] timeout finalLayout");
         nfb_scheduleLayoutActiveHomePaging();
     });
@@ -7267,6 +7376,8 @@ static void nfb_columnsBeginSizeTransition(void) {
 static void nfb_columnsEndSizeTransition(void) {
     if (!gInlineColumnsEnabled) {
         gNFBColumnsSizeTransitioning = NO;
+        gNFBColumnsResizeEntriesPaging = nil;
+        gNFBColumnsResizeEntries = nil;
         return;
     }
     // b73 (Codex): all three viewWillTransitionToSize hooks register a completion for the SAME
@@ -7275,6 +7386,8 @@ static void nfb_columnsEndSizeTransition(void) {
     // gets to schedule it; the stale duplicates return here.
     if (!gNFBColumnsSizeTransitioning) return;
     gNFBColumnsSizeTransitioning = NO;
+    gNFBColumnsResizeEntriesPaging = nil;
+    gNFBColumnsResizeEntries = nil;
     if (gNFBLogRecording) NFBLogEvent(@"columnsResize[b73] end finalLayout");
     nfb_scheduleLayoutActiveHomePaging();
 }
@@ -7329,7 +7442,7 @@ void NFBStreamPrefsChanged(void) {
         dispatch_async(dispatch_get_main_queue(), ^{ NFBStreamPrefsChanged(); });
         return;
     }
-    UIViewController *vc = gActiveItemsVC;
+    UIViewController *vc = gActiveItemsVC ?: nfb_findVisibleHomePagingController();
     if (vc) nfb_streamStart(vc);   // restart the timer so a changed interval takes effect immediately
 }
 
@@ -7340,8 +7453,17 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     }
     BOOL changed = gInlineColumnsEnabled != enabled;
     if (changed) NFBLogEvent([NSString stringWithFormat:@"NFBSetInlineColumns -> %d", enabled]);
+    if (!changed) {
+        if (enabled) nfb_scheduleLayoutActiveHomePagingLight();
+        NFBUpdateStreamButtonVisibility();
+        return;
+    }
+    gNFBColumnsChromeScanGeneration++;
+    gNFBColumnsResizeEntriesPaging = nil;
+    gNFBColumnsResizeEntries = nil;
     gInlineColumnsEnabled = enabled;
     if (!enabled) {
+        gNFBColumnsLayoutScheduleEpoch++;
         nfb_columnsDismissAllDetailNavs();
         gNFBLastTouchedColumnView = nil;
         gNFBLastTouchedColumnKey = nil;
@@ -7368,13 +7490,11 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
         nfb_setColumnsEdgeMenuGesturesEnabled(NO);
         UIViewController *paging = nfb_findAnyHomePagingController();
         if (paging) {
-            if (changed) nfb_requestColumnsPagingPreload(paging, YES);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                nfb_layoutActiveHomePaging();
-            });
+            nfb_requestColumnsPagingPreload(paging, YES);
         }
     }
-    nfb_scheduleLayoutActiveHomePaging();
+    if (enabled) nfb_scheduleLayoutActiveHomePaging();
+    else nfb_requestLayoutActiveHomePagingOnNextTurn();
     NFBUpdateStreamButtonVisibility();
 }
 
