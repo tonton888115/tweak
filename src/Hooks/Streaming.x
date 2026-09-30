@@ -927,9 +927,18 @@ static NSString *nfb_logFilePath(void) {
     return [dir stringByAppendingPathComponent:@"nfb_oplog.txt"];
 }
 
+static NSMutableArray<NSString *> *gNFBRecentEvents = nil;   // last events of this session (always on)
+static NSTimeInterval gNFBSessionStart = 0.0;
+
 void NFBLogEvent(NSString *msg) {
-    if (!gNFBLogRecording) return;
     if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ NFBLogEvent(msg); }); return; }
+    if (!gNFBRecentEvents) {
+        gNFBRecentEvents = [NSMutableArray array];
+        gNFBSessionStart = CACurrentMediaTime();
+    }
+    [gNFBRecentEvents addObject:[NSString stringWithFormat:@"+%8.2f %@", CACurrentMediaTime() - gNFBSessionStart, msg ?: @""]];
+    if (gNFBRecentEvents.count > 600) [gNFBRecentEvents removeObjectsInRange:NSMakeRange(0, 100)];
+    if (!gNFBLogRecording) return;
     if (!gNFBLog) gNFBLog = [NSMutableArray array];
     NSString *line = [NSString stringWithFormat:@"+%7.2f %@", CACurrentMediaTime() - gNFBLogStart, msg ?: @""];
     [gNFBLog addObject:line];
@@ -1147,7 +1156,7 @@ static void nfb_installCrashLoggerOnce(void) {
         [self copySavedLog];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_REFRESH_NOW", @"🔄 Refresh now") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        UIViewController *vc = gActiveItemsVC;
+        UIViewController *vc = gActiveItemsVC ?: nfb_findHomeContainer();
         if (vc) nfb_streamTrigger(vc);
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:(on ? nfb_loc(@"NFB_STREAM_OFF", @"Turn auto-refresh OFF") : nfb_loc(@"NFB_STREAM_ON", @"Turn auto-refresh ON")) style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
@@ -1214,7 +1223,10 @@ static void nfb_installCrashLoggerOnce(void) {
     fmt.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *name = [NSString stringWithFormat:@"NeoFreeBird-diag-%@.txt", [fmt stringFromDate:[NSDate date]]];
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
-    NSString *text = [NSString stringWithFormat:@"%@\n\n=== saved log ===\n%@\n", nfb_buildDiagnosticReport(), nfb_logSavedFileContents()];
+    NSArray<NSString *> *saved = [nfb_logSavedFileContents() componentsSeparatedByString:@"\n"];
+    NSArray<NSString *> *savedTail = saved.count > 150 ? [saved subarrayWithRange:NSMakeRange(saved.count - 150, 150)] : saved;
+    NSString *text = [NSString stringWithFormat:@"%@\n\n=== recent events (this session) ===\n%@\n\n=== older saved log (last 150 lines; may be from previous builds) ===\n%@\n",
+        nfb_buildDiagnosticReport(), [gNFBRecentEvents componentsJoinedByString:@"\n"] ?: @"-", [savedTail componentsJoinedByString:@"\n"]];
     if (![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
         [self showDiag];
         return;
@@ -1670,6 +1682,16 @@ static void nfb_dumpTree(UIViewController *vc, int depth, NSMutableString *s) {
 }
 #endif
 
+static UIViewController *nfb_childControllerNamed(UIViewController *root, NSString *needle, int depth) {
+    if (!root || depth > 5) return nil;
+    for (UIViewController *child in root.childViewControllers) {
+        if ([NSStringFromClass(child.class) containsString:needle]) return child;
+        UIViewController *found = nfb_childControllerNamed(child, needle, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
 static NSString *nfb_buildDiagnosticReport(void) {
 #if NFB_DIAG
     NSMutableString *s = [NSMutableString string];
@@ -1694,8 +1716,13 @@ static NSString *nfb_buildDiagnosticReport(void) {
     UIViewController *search = nfb_visibleSearchAutomationController();
     [s appendFormat:@"searchLatest=%@\n", search ? NSStringFromClass(search.class) : @"nil"];
     [s appendString:NFBColumnsDiagnostic() ?: @""];
-    UIViewController *paging = active ? nfb_parentControllerNamed(active, @"Paging") : nil;
     UIViewController *segmented = active ? nfb_parentControllerNamed(active, @"Segmented") : nil;
+    if (!segmented) segmented = nfb_childControllerNamed(container, @"Segmented", 0);
+    UIViewController *paging = active ? nfb_parentControllerNamed(active, @"Paging") : nil;
+    if (!paging && nfb_resp(segmented, @selector(pagingViewController))) {
+        id candidate = ((id(*)(id, SEL))objc_msgSend)(segmented, @selector(pagingViewController));
+        if ([candidate isKindOfClass:UIViewController.class]) paging = candidate;
+    }
     [s appendFormat:@"paging=%@ segmented=%@\n", paging ? NSStringFromClass(paging.class) : @"nil",
         segmented ? NSStringFromClass(segmented.class) : @"nil"];
     // Columns-redesign probe (read-only): how the 12.x home pager is built. See

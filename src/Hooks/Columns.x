@@ -29,6 +29,8 @@
 @end
 @interface T1AppSplitViewController : UIViewController
 @end
+@interface _TtC10TFNUISwiftP33_19E25DFCBFA569FDFA3E56F314F9A42420PagingCollectionView : UICollectionView
+@end
 
 void NFBLogEvent(NSString *msg);
 void NFBStreamPrefsChanged(void);
@@ -74,7 +76,9 @@ static BOOL nfb_colsActiveNow(void) {
 }
 
 NSString *NFBColumnsHostPageID(void) {
-    NSString *page = [[NSUserDefaults standardUserDefaults] stringForKey:@"nfb_columns_host"];
+    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+    NSString *page = [defs stringForKey:@"nfb_columns_host"];
+    if (!page.length) page = [defs stringForKey:@"columns_host_page"];   // choice made in the 11.35 builds
     return page.length ? page : @"communities";
 }
 
@@ -258,6 +262,21 @@ static UIViewController *nfb_colsPageForCell(UICollectionViewCell *cell, UIViewC
     return nil;
 }
 
+// Read-only peek at a Swift stored property through its ObjC-visible ivar (diagnostics only).
+static const uint8_t *nfb_colsIvarPtr(id obj, const char *name) {
+    if (!obj) return NULL;
+    Ivar ivar = class_getInstanceVariable(object_getClass(obj), name);
+    ptrdiff_t offset = ivar ? ivar_getOffset(ivar) : 0;
+    return offset > 0 ? (const uint8_t *)(__bridge void *)obj + offset : NULL;
+}
+
+static NSString *nfb_colsIntIvarText(id obj, const char *name, BOOL optional) {
+    const uint8_t *p = nfb_colsIvarPtr(obj, name);
+    if (!p) return @"?";
+    if (optional && p[8]) return @"nil";   // Swift Int?: 8-byte payload + 1-byte "is nil" tag
+    return [NSString stringWithFormat:@"%ld", (long)*(const NSInteger *)p];
+}
+
 BOOL NFBColumnsActive(void) {
     UICollectionView *cv = gNFBColsCollectionView;
     return nfb_colsActiveNow() && cv && cv.window;
@@ -318,6 +337,43 @@ NSString *NFBColumnsDiagnostic(void) {
             UIViewController *page = entry[@"vc"];
             [s appendFormat:@"columns visible slot=%@ item=%@ title=%@ rec=%@ page=%@ loaded=%d\n", entry[@"slot"], entry[@"item"],
                 entry[@"title"], entry[@"recommended"], NSStringFromClass(page.class), [page isViewLoaded] ? 1 : 0];
+        }
+        for (UICollectionViewCell *cell in cv.visibleCells) {
+            NSIndexPath *ip = [cv indexPathForCell:cell];
+            UIViewController *page = nfb_colsPageForCell(cell, pager);
+            UIView *firstContent = cell.contentView.subviews.firstObject;
+            [s appendFormat:@"probe cell item=%ld f=(%.0f,%.0f,%.0f,%.0f) hidden=%d contentSubviews=%lu cellSubviews=%lu first=%@ page=%@\n",
+                (long)ip.item, cell.frame.origin.x, cell.frame.origin.y, cell.frame.size.width, cell.frame.size.height, cell.hidden ? 1 : 0,
+                (unsigned long)cell.contentView.subviews.count, (unsigned long)cell.subviews.count,
+                firstContent ? NSStringFromClass(firstContent.class) : @"-", page ? NSStringFromClass(page.class) : @"nil"];
+        }
+    }
+    if (pager) {
+        const uint8_t *spacing = nfb_colsIvarPtr(pager, "pageSpacing");
+        const uint8_t *hPagingIvar = nfb_colsIvarPtr(pager, "horizontalPagingEnabled");
+        [s appendFormat:@"probe pager currentIndex=%@ pageCount=%@ destinationIndex=%@ pageSpacing=%.1f hPaging=%d children=%lu\n",
+            nfb_colsIntIvarText(pager, "currentIndex", NO), nfb_colsIntIvarText(pager, "pageCount", NO),
+            nfb_colsIntIvarText(pager, "destinationIndex", YES), spacing ? *(const double *)spacing : -1.0,
+            hPagingIvar ? (int)hPagingIvar[0] : -1, (unsigned long)pager.childViewControllers.count];
+        for (UIViewController *child in pager.childViewControllers) {
+            UIView *sup = [child isViewLoaded] ? child.view.superview : nil;
+            UIView *cellAncestor = sup;
+            while (cellAncestor && ![cellAncestor isKindOfClass:UICollectionViewCell.class]) cellAncestor = cellAncestor.superview;
+            NSIndexPath *ip = [cellAncestor isKindOfClass:UICollectionViewCell.class] ? [cv indexPathForCell:(UICollectionViewCell *)cellAncestor] : nil;
+            [s appendFormat:@"probe pagerChild %@ superview=%@ inCellItem=%@ window=%d\n", NSStringFromClass(child.class),
+                sup ? NSStringFromClass(sup.class) : @"nil", ip ? @(ip.item) : @"-", ([child isViewLoaded] && child.view.window) ? 1 : 0];
+        }
+        UIViewController *segmented = nfb_colsSegmentedOfPager(pager);
+        if (segmented) {
+            NSInteger tabs = [segmented respondsToSelector:@selector(numberOfTabs)] ? ((NSInteger(*)(id, SEL))objc_msgSend)(segmented, @selector(numberOfTabs)) : -1;
+            NSInteger selected = [segmented respondsToSelector:@selector(selectedIndex)] ? ((NSInteger(*)(id, SEL))objc_msgSend)(segmented, @selector(selectedIndex)) : -1;
+            NSInteger hideMode = [segmented respondsToSelector:@selector(tabBarHideMode)] ? ((NSInteger(*)(id, SEL))objc_msgSend)(segmented, @selector(tabBarHideMode)) : -1;
+            BOOL hPaging = [segmented respondsToSelector:@selector(isHorizontalPagingEnabled)] ? ((BOOL(*)(id, SEL))objc_msgSend)(segmented, @selector(isHorizontalPagingEnabled)) : NO;
+            id tabBar = [segmented respondsToSelector:@selector(tabBarView)] ? ((id(*)(id, SEL))objc_msgSend)(segmented, @selector(tabBarView)) : nil;
+            CGRect tf = [tabBar isKindOfClass:UIView.class] ? [(UIView *)tabBar convertRect:((UIView *)tabBar).bounds toView:nil] : CGRectZero;
+            [s appendFormat:@"probe segmented tabs=%ld selected=%ld tabBarHideMode=%ld hPaging=%d tabBar=%@ window=(%.0f,%.0f,%.0f,%.0f) hidden=%d\n",
+                (long)tabs, (long)selected, (long)hideMode, hPaging ? 1 : 0, tabBar ? NSStringFromClass([tabBar class]) : @"nil",
+                tf.origin.x, tf.origin.y, tf.size.width, tf.size.height, [tabBar isKindOfClass:UIView.class] ? (((UIView *)tabBar).hidden ? 1 : 0) : -1];
         }
     }
     return s;
@@ -914,12 +970,94 @@ void NFBColumnsShowManager(UIViewController *presenter) {
 
 %end
 
-// Keep off-screen columns loaded while columns mode is on.
+// Keep off-screen columns loaded while columns mode is on, and let the pager prewarm every page
+// so each visible column has its timeline embedded (normally only the current page +-1 is kept).
 %hook _TtC10TFNUISwift29LegacySegmentedViewController
 
 - (void)unloadInvisibleViewControllers {
     if (nfb_colsActiveNow() && nfb_colsParentNamed(self, @"HomeTimelineContainer")) return;
     %orig;
+}
+
+- (BOOL)pagingViewController:(id)pager isPrewarmableAt:(NSInteger)index {
+    if (nfb_colsActiveNow() && nfb_colsParentNamed(self, @"HomeTimelineContainer")) return YES;
+    return %orig;
+}
+
+- (void)pagingViewController:(id)pager mayBeginDisplayingPageAt:(NSInteger)index viewController:(id)viewController {
+    %orig;
+    if (nfb_colsActiveNow() && nfb_colsParentNamed(self, @"HomeTimelineContainer")) {
+        NFBLogEvent([NSString stringWithFormat:@"columns mayBeginDisplaying index=%ld vc=%@", (long)index,
+            viewController ? NSStringFromClass([viewController class]) : @"nil"]);
+    }
+}
+
+%end
+
+// The pager re-centres on "its" page (index x page width) — not a column edge. Programmatic
+// offsets that are not on a column edge are moved back to the column the user left the pager on;
+// an animated jump to page N (top tab tap) goes to page N's column instead.
+static char kNFBColsAnimRangeKey;   // NSArray(minX, maxX, until) of an accepted animated scroll
+
+static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BOOL animatedCall) {
+    if (!nfb_colsActiveNow() || cv != gNFBColsCollectionView) return x;
+    if (cv.isDragging || cv.isTracking || cv.isDecelerating) return x;
+    CGFloat cw = nfb_colsColumnWidth(cv.bounds.size.width);
+    CGFloat maxX = MAX(0.0, cv.contentSize.width - cv.bounds.size.width);
+    NSTimeInterval now = CACurrentMediaTime();
+    NSNumber *desired = objc_getAssociatedObject(cv, &kNFBColsDesiredOffsetKey);
+    CGFloat fixed;
+    if (!animatedCall) {
+        // Intermediate frames of an animated scroll we accepted.
+        NSArray<NSNumber *> *range = objc_getAssociatedObject(cv, &kNFBColsAnimRangeKey);
+        if (range && now < range[2].doubleValue && x >= range[0].doubleValue - 1.0 && x <= range[1].doubleValue + 1.0) return x;
+        // Anything else without animation is the pager re-centring (page 0 is also a column edge,
+        // so edges are not trusted here): stay on the column the user chose.
+        if (!desired) return x;
+        fixed = desired.doubleValue;
+    } else {
+        CGFloat edge = round(x / cw) * cw;
+        CGFloat pageWidth = cv.bounds.size.width;
+        if (fabs(x - edge) < 1.0 || fabs(x - maxX) < 1.0) {
+            fixed = x;
+        } else if (pageWidth > 1.0 && fabs(x / pageWidth - round(x / pageWidth)) < 0.01) {
+            NFBColumnsModel *model = objc_getAssociatedObject(cv.collectionViewLayout, &kNFBColsModelKey);
+            NSNumber *slot = model.slotOfItem[@((NSInteger)round(x / pageWidth))];
+            fixed = slot ? cw * slot.doubleValue : (desired ? desired.doubleValue : edge);
+        } else {
+            fixed = desired ? desired.doubleValue : edge;
+        }
+    }
+    fixed = MIN(MAX(fixed, 0.0), maxX);
+    if (fabs(fixed - x) > 1.0) {
+        static NSTimeInterval lastLog = 0.0;
+        if (now - lastLog > 1.0) {
+            lastLog = now;
+            NFBLogEvent([NSString stringWithFormat:@"columns offsetFix from=%.0f to=%.0f animated=%d cw=%.0f max=%.0f",
+                x, fixed, animatedCall ? 1 : 0, cw, maxX]);
+        }
+    }
+    if (animatedCall) {
+        // Only deliberate (animated) moves change the remembered column; a clamp while the
+        // content size is still settling must not.
+        objc_setAssociatedObject(cv, &kNFBColsDesiredOffsetKey, @(fixed), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        CGFloat from = cv.contentOffset.x;
+        objc_setAssociatedObject(cv, &kNFBColsAnimRangeKey, @[ @(MIN(from, fixed)), @(MAX(from, fixed)), @(now + 0.6) ],
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return fixed;
+}
+
+%hook _TtC10TFNUISwiftP33_19E25DFCBFA569FDFA3E56F314F9A42420PagingCollectionView
+
+- (void)setContentOffset:(CGPoint)offset {
+    offset.x = nfb_colsFixProgrammaticOffset(self, offset.x, NO);
+    %orig(offset);
+}
+
+- (void)setContentOffset:(CGPoint)offset animated:(BOOL)animated {
+    offset.x = nfb_colsFixProgrammaticOffset(self, offset.x, animated);
+    %orig(offset, animated);
 }
 
 %end
@@ -933,6 +1071,7 @@ void NFBColumnsShowManager(UIViewController *presenter) {
         return;
     }
     NSString *page = [tabView isKindOfClass:NSClassFromString(@"T1TabView")] ? ((T1TabView *)tabView).scribePage : nil;
+    NFBLogEvent([NSString stringWithFormat:@"columns tabTap index=%ld page=%@ active=%d", (long)index, page ?: @"-", gNFBColsActive ? 1 : 0]);
     if ([page isEqualToString:NFBColumnsHostPageID()]) {
         // Never open the host's own page: show the Home surface as columns instead.
         nfb_colsSetActiveOnNav(YES, (UIViewController *)self, tabBarController);
