@@ -2041,32 +2041,15 @@ static void nfb_streamStart(UIViewController *vc) {
     gNFBStreamTimer = timer;
 }
 
-static NSString *nfb_identifierForTimelineVariantArgument(id variant) {
-    uintptr_t raw = (uintptr_t)variant;
-    if (raw < 8) {
-        if (raw == 0) return @"home";
-        if (raw == 1) return @"latest";
-        if (raw == 2) return @"creatorSubscriptions";
-        return nil;
+// selectTimelineVariant:shouldRefresh: takes an NSInteger variant (ObjC type encoding q16 in both
+// 11.35 and 12.28.1). It used to be hooked as `id`, which lets ARC try to retain the integer.
+static NSString *nfb_identifierForTimelineVariant(NSInteger variant) {
+    switch (variant) {
+        case 0: return @"home";
+        case 1: return @"latest";
+        case 2: return @"creatorSubscriptions";
+        default: return nil;
     }
-    NSString *value = nil;
-    @try {
-        if ([variant isKindOfClass:NSString.class]) {
-            value = (NSString *)variant;
-        } else if ([variant respondsToSelector:@selector(identifier)]) {
-            id identifier = ((id (*)(id, SEL))objc_msgSend)(variant, @selector(identifier));
-            if ([identifier isKindOfClass:NSString.class]) value = identifier;
-        }
-        if (!value.length) {
-            NSString *description = [variant description];
-            if ([description isKindOfClass:NSString.class]) value = description;
-        }
-    } @catch (NSException *e) {
-        value = nil;
-    }
-    if (!value.length) return nil;
-    if (nfb_homeTabIdentifierLooksRecommended(value) || nfb_homeTabIdentifierLooksChronological(value)) return value;
-    return nil;
 }
 
 static void nfb_persistHomeTimelineTabIdentifier(NSString *identifier) {
@@ -6808,8 +6791,8 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     %orig(previousTraitCollection);
     if (gInlineColumnsEnabled) nfb_scheduleLayoutActiveHomePaging();
 }
-- (void)selectTimelineVariant:(id)variant shouldRefresh:(BOOL)shouldRefresh {
-    nfb_persistHomeTimelineTabIdentifier(nfb_identifierForTimelineVariantArgument(variant));
+- (void)selectTimelineVariant:(NSInteger)variant shouldRefresh:(BOOL)shouldRefresh {
+    nfb_persistHomeTimelineTabIdentifier(nfb_identifierForTimelineVariant(variant));
     %orig(variant, shouldRefresh);
 }
 %end
