@@ -39,6 +39,7 @@
 
 void NFBLogEvent(NSString *msg);
 void NFBStreamPrefsChanged(void);
+void NFBColumnsRevealAllTops(void);   // Streaming.x
 
 static NSString * const kNFBColsEnabledKey = @"nfb_columns_enabled";
 static NSString * const kNFBColsFullWidthKey = @"nfb_columns_full_width";
@@ -61,6 +62,7 @@ static char kNFBColsDesiredOffsetKey;      // NSNumber(x) on the collection view
 static char kNFBColsKickedKey;             // one empty-content load kick per page
 
 static void nfb_colsScheduleKick(void);
+static UICollectionView *nfb_colsCollectionViewOfPager(UIViewController *pager);
 
 static NSString *nfb_colsLoc(NSString *key, NSString *fallback) {
     NSString *value = [[BHTBundle sharedBundle] localizedStringForKey:key];
@@ -296,6 +298,7 @@ static id nfb_colsObjectIvar(id obj, const char *name) {
 }
 
 static NSHashTable *gNFBColsFleetHeaders = nil;   // T1FleetLineHeaderController (Spaces bar), weak
+static CGFloat gNFBColsTopShift = 0.0;              // hidden strip height: columns are lifted by this
 
 // The vertical timeline scroll view of a column page (first table/collection view, breadth first).
 static UIScrollView *nfb_colsContentScrollViewOf(UIViewController *page) {
@@ -336,6 +339,30 @@ NSArray<NSDictionary *> *NFBColumnsVisibleEntries(void) {
     }
     [entries sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [a[@"slot"] compare:b[@"slot"]];
+    }];
+    return entries;
+}
+
+// Every column the user shows (on screen or not), in display order.
+NSArray<NSDictionary *> *NFBColumnsAllEntries(void) {
+    UICollectionView *cv = gNFBColsCollectionView;
+    UIViewController *pager = gNFBColsPager;
+    if (!NFBColumnsActive() || !pager) return @[];
+    NFBColumnsModel *model = objc_getAssociatedObject(cv.collectionViewLayout, &kNFBColsModelKey);
+    UIViewController *segmented = nfb_colsSegmentedOfPager(pager);
+    if (!model || ![segmented respondsToSelector:@selector(viewControllerAtTabIndex:)]) return NFBColumnsVisibleEntries();
+    NSMutableArray<NSDictionary *> *entries = [NSMutableArray array];
+    [model.slots enumerateObjectsUsingBlock:^(NSNumber *item, NSUInteger slot, BOOL *stop) {
+        id vc = nil;
+        @try {
+            vc = ((id(*)(id, SEL, NSInteger))objc_msgSend)(segmented, @selector(viewControllerAtTabIndex:), item.integerValue);
+        } @catch (NSException *e) {
+            vc = nil;
+        }
+        if (![vc isKindOfClass:UIViewController.class]) return;
+        NSString *title = item.integerValue < (NSInteger)model.titles.count ? model.titles[item.integerValue] : @"";
+        [entries addObject:@{ @"vc": vc, @"title": title, @"slot": @(slot), @"item": item,
+                              @"recommended": @(nfb_colsTitleLooksRecommended(title)) }];
     }];
     return entries;
 }
@@ -498,19 +525,6 @@ static void nfb_colsHideView(UIView *view, BOOL hide) {
     }
 }
 
-// Pages at (or pulled past) their top follow the inset change instead of keeping a 44pt gap /
-// sliding under the strip.
-static void nfb_colsAlignPagesToTop(UIViewController *pager, CGFloat slack) {
-    for (UIViewController *page in pager.childViewControllers) {
-        UIScrollView *sv = nfb_colsContentScrollViewOf(page);
-        if (!sv || sv.isDragging || sv.isDecelerating) continue;
-        CGFloat top = -sv.adjustedContentInset.top;
-        if (sv.contentOffset.y < top - 0.5 || sv.contentOffset.y <= top + slack) {
-            [sv setContentOffset:CGPointMake(sv.contentOffset.x, top) animated:NO];
-        }
-    }
-}
-
 static void nfb_colsUpdateFleetLines(void) {
     for (id header in gNFBColsFleetHeaders.allObjects) {
         @try {
@@ -533,11 +547,17 @@ static void nfb_colsSetTopChrome(UIViewController *pager, BOOL columns) {
     if (!columns && !applied) return;   // never touch the stock Home that we did not change
     UIView *bar = nfb_colsObjectIvar(segmented, "barContainerView");
     UIView *shadow = nfb_colsObjectIvar(segmented, "shadowView");
+    if (columns && applied) {
+        nfb_colsHideView(bar, YES);
+        nfb_colsHideView(shadow, YES);
+        return;
+    }
     NSLayoutConstraint *height = nfb_colsObjectIvar(segmented, "barContainerHeightConstraint");
     if (![height isKindOfClass:NSLayoutConstraint.class]) height = nil;
     id tabBar = [segmented respondsToSelector:@selector(tabBarView)] ? ((id(*)(id, SEL))objc_msgSend)(segmented, @selector(tabBarView)) : nil;
     BOOL canDetach = [tabBar respondsToSelector:@selector(setPagingScrollView:)] && [tabBar respondsToSelector:@selector(pagingScrollView)];
-    CGFloat barHeight = height ? height.constant : 44.0;
+    NSNumber *savedConstant = height ? objc_getAssociatedObject(height, &kNFBColsSavedConstantKey) : nil;
+    CGFloat barHeight = savedConstant ? savedConstant.doubleValue : (height ? height.constant : 44.0);
     if (columns) {
         nfb_colsHideView(bar, YES);
         nfb_colsHideView(shadow, YES);
@@ -545,6 +565,7 @@ static void nfb_colsSetTopChrome(UIViewController *pager, BOOL columns) {
         if (height && !objc_getAssociatedObject(height, &kNFBColsSavedConstantKey)) {
             objc_setAssociatedObject(height, &kNFBColsSavedConstantKey, @(height.constant), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
+        gNFBColsTopShift = MAX(0.0, MIN(barHeight, 120.0));
         height.constant = 0.0;
         if (canDetach) {
             id current = ((id(*)(id, SEL))objc_msgSend)(tabBar, @selector(pagingScrollView));
@@ -561,7 +582,6 @@ static void nfb_colsSetTopChrome(UIViewController *pager, BOOL columns) {
         NSNumber *constant = height ? objc_getAssociatedObject(height, &kNFBColsSavedConstantKey) : nil;
         if (constant) {
             height.constant = constant.doubleValue;
-            barHeight = constant.doubleValue;
             objc_setAssociatedObject(height, &kNFBColsSavedConstantKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         id savedScroll = canDetach ? objc_getAssociatedObject(tabBar, &kNFBColsSavedPagingScrollKey) : nil;
@@ -570,20 +590,20 @@ static void nfb_colsSetTopChrome(UIViewController *pager, BOOL columns) {
             objc_setAssociatedObject(tabBar, &kNFBColsSavedPagingScrollKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         objc_setAssociatedObject(segmented, &kNFBColsChromeAppliedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        gNFBColsTopShift = 0.0;
     }
     // Let the segmented re-measure its bar and re-apply the page insets.
     [segmented viewSafeAreaInsetsDidChange];
     [segmented.view setNeedsLayout];
     [segmented.view layoutIfNeeded];
     nfb_colsUpdateFleetLines();
-    nfb_colsAlignPagesToTop(pager, columns ? 1.0 : barHeight + 1.0);
-    __weak UIViewController *weakPager = pager;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        // Insets may be re-applied on the next layout pass rather than synchronously.
-        if (weakPager && nfb_colsActiveNow() == columns) nfb_colsAlignPagesToTop(weakPager, columns ? 1.0 : barHeight + 1.0);
-    });
-    NFBLogEvent([NSString stringWithFormat:@"columns topChrome on=%d bar=%@ const=%@ detach=%d", columns ? 1 : 0,
-        bar ? NSStringFromClass(bar.class) : @"nil", height ? [NSString stringWithFormat:@"%.0f", height.constant] : @"nil", canDetach ? 1 : 0]);
+    // The pages keep their stock top inset (nav bar + strip); the layout lifts the columns by the
+    // strip height instead (see layoutAttributesForItemAtIndexPath:), so no inset is rewritten.
+    UICollectionView *cv = nfb_colsCollectionViewOfPager(pager);
+    [cv.collectionViewLayout invalidateLayout];
+    NFBLogEvent([NSString stringWithFormat:@"columns topChrome on=%d bar=%@ const=%@ shift=%.0f detach=%d", columns ? 1 : 0,
+        bar ? NSStringFromClass(bar.class) : @"nil", height ? [NSString stringWithFormat:@"%.0f", height.constant] : @"nil",
+        gNFBColsTopShift, canDetach ? 1 : 0]);
 }
 
 #pragma mark - apply / restore
@@ -1084,7 +1104,10 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
     CGRect frame = orig ? orig.frame : CGRectMake(0.0, 0.0, cw, cv.bounds.size.height);
     NSNumber *slot = model.slotOfItem[@(indexPath.item)];
     if (slot) {
-        attrs.frame = CGRectMake(cw * slot.doubleValue, frame.origin.y, cw, frame.size.height);
+        // Lifted by the hidden strip height: the page keeps its stock top inset (nav bar + strip),
+        // so its first row now starts right under the navigation bar.
+        CGFloat shift = gNFBColsTopShift;
+        attrs.frame = CGRectMake(cw * slot.doubleValue, frame.origin.y - shift, cw, frame.size.height + shift);
         attrs.hidden = NO;
     } else {
         attrs.frame = CGRectMake(-cw * 4.0, frame.origin.y, cw, frame.size.height);
@@ -1095,13 +1118,11 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
 
 - (NSArray<UICollectionViewLayoutAttributes *> *)layoutAttributesForElementsInRect:(CGRect)rect {
     if (!nfb_colsActiveForLayout(self)) return %orig;
-    UICollectionView *cv = self.collectionView;
     NFBColumnsModel *model = nfb_colsModelForLayout(self);
-    CGFloat cw = nfb_colsColumnWidth(cv.bounds.size.width);
     NSMutableArray<UICollectionViewLayoutAttributes *> *out = [NSMutableArray array];
+    // Every column, not only those in `rect`: keeping all column cells alive means a page is never
+    // taken out of / put back into a cell while swiping (each re-embed re-lays out a whole timeline).
     [model.slots enumerateObjectsUsingBlock:^(NSNumber *item, NSUInteger slot, BOOL *stop) {
-        CGFloat minX = cw * (CGFloat)slot;
-        if (minX + cw <= CGRectGetMinX(rect) || minX >= CGRectGetMaxX(rect)) return;
         UICollectionViewLayoutAttributes *attrs = [self layoutAttributesForItemAtIndexPath:[NSIndexPath indexPathForItem:item.integerValue inSection:0]];
         if (attrs) [out addObject:attrs];
     }];
@@ -1344,6 +1365,11 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
     NSString *page = [tabView isKindOfClass:NSClassFromString(@"T1TabView")] ? ((T1TabView *)tabView).scribePage : nil;
     NFBLogEvent([NSString stringWithFormat:@"columns tabTap index=%ld page=%@ active=%d", (long)index, page ?: @"-", gNFBColsActive ? 1 : 0]);
     if ([page isEqualToString:NFBColumnsHostPageID()]) {
+        if (gNFBColsActive) {
+            // Re-tap on the Columns tab: every column back to its newest post (like Home's re-tap).
+            NFBColumnsRevealAllTops();
+            return;
+        }
         // Never open the host's own page: show the Home surface as columns instead.
         nfb_colsSetActiveOnNav(YES, (UIViewController *)self, tabBarController);
         return;

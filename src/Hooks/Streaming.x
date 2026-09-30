@@ -63,6 +63,7 @@ void NFBStreamPrefsChanged(void);
 // Columns.x
 BOOL NFBColumnsActive(void);
 NSArray<NSDictionary *> *NFBColumnsVisibleEntries(void);
+NSArray<NSDictionary *> *NFBColumnsAllEntries(void);
 NSInteger NFBColumnsPageRecommended(UIViewController *vc);
 void NFBColumnsSetActive(BOOL active);
 NSString *NFBColumnsHostPageID(void);
@@ -82,10 +83,22 @@ static NSString * const kNFBStreamIntervalKey = @"auto_stream_interval";
 static BOOL nfb_streamEnabled(void) {
     return [BHTSettings boolForKey:kNFBStreamEnabledKey];
 }
+static void nfb_scheduleStateIconUpdate(void);
 static NSInteger nfb_streamInterval(void) {
     // Seconds between auto-refreshes. Default 20s; floor 5s (X timeline rate limits).
     NSInteger seconds = [BHTSettings integerForKey:kNFBStreamIntervalKey];
     return seconds >= 5 ? seconds : 20;
+}
+// The timer runs at the user's interval unless the phone is hot or in Low Power Mode: each tick
+// refreshes every visible column (network + parsing + cell layout), which is what heats it up.
+static NSTimeInterval nfb_effectiveStreamInterval(void) {
+    NSTimeInterval interval = (NSTimeInterval)nfb_streamInterval();
+    NSProcessInfo *info = NSProcessInfo.processInfo;
+    NSProcessInfoThermalState thermal = info.thermalState;
+    if (thermal >= NSProcessInfoThermalStateCritical) return MAX(interval, 60.0);
+    if (thermal >= NSProcessInfoThermalStateSerious || info.isLowPowerModeEnabled) return MAX(interval, 30.0);
+    if (thermal >= NSProcessInfoThermalStateFair) return MAX(interval, 10.0);
+    return interval;
 }
 static void nfb_setStreamEnabled(BOOL on) {
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:kNFBStreamEnabledKey];
@@ -485,6 +498,8 @@ static void nfb_showNewTweetsPill(UIViewController *vc) {
     if (!nfb_homeTabSelectedOrUnknown() && !nfb_searchOrExplorePageSelected()) return;
     gPendingNewTweetsVC = vc;
     UIWindow *win = vc.view.window;
+    // Already showing: nothing to redo (the columns tick asks every interval).
+    if (gNewTweetsPill.superview == win && gNewTweetsPill.alpha > 0.99) return;
     if (!gNewTweetsPill) {
         gNewTweetsPill = [UIButton buttonWithType:UIButtonTypeCustom];
         gNewTweetsPill.translatesAutoresizingMaskIntoConstraints = NO;
@@ -646,10 +661,48 @@ static BOOL nfb_streamTriggerColumns(void) {
         });
         fired++;
     }
-    if (away && !fired) nfb_showNewTweetsPill(away);
+    // A column the user scrolled down in gets the pill ("back to the newest in every column").
+    if (away) {
+        nfb_showNewTweetsPill(away);
+    } else if (gNewTweetsPill.superview) {
+        gPendingNewTweetsVC = nil;
+        nfb_hideNewTweetsPill();
+    }
     NFBLogEvent([NSString stringWithFormat:@"streamColumns visible=%lu fired=%lu away=%@", (unsigned long)entries.count,
         (unsigned long)fired, away ? NSStringFromClass(away.class) : @"-"]);
     return YES;
+}
+
+// Every column back to its newest post (pill tap / re-tap on the Columns tab), then refresh the
+// visible ones (For You never auto-refreshes). Off-screen columns jump without animation.
+void NFBColumnsRevealAllTops(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ NFBColumnsRevealAllTops(); });
+        return;
+    }
+    gPendingNewTweetsVC = nil;
+    nfb_hideNewTweetsPill();
+    NSMutableSet<UIViewController *> *visible = [NSMutableSet set];
+    for (NSDictionary *entry in NFBColumnsVisibleEntries()) [visible addObject:entry[@"vc"]];
+    NSUInteger scrolled = 0, refreshed = 0;
+    for (NSDictionary *entry in NFBColumnsAllEntries()) {
+        UIViewController *page = entry[@"vc"];
+        if (![page isViewLoaded]) continue;
+        UIScrollView *sv = nfb_mainScrollViewOf(page);
+        if (sv && (sv.isDragging || sv.isTracking)) continue;
+        BOOL onScreen = [visible containsObject:page];
+        nfb_scrollToTop(page, onScreen);
+        scrolled++;
+        if (!onScreen || [entry[@"recommended"] boolValue] || !nfb_streamEnabled()) continue;
+        __weak UIViewController *weakPage = page;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.3 + 0.35 * refreshed) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIViewController *strongPage = weakPage;
+            if (strongPage && NFBColumnsActive()) nfb_streamTriggerTarget(strongPage);
+        });
+        refreshed++;
+    }
+    NFBLogEvent([NSString stringWithFormat:@"columns allTop scrolled=%lu refresh=%lu", (unsigned long)scrolled, (unsigned long)refreshed]);
+    nfb_scheduleStateIconUpdate();
 }
 
 static void nfb_streamTrigger(UIViewController *vc) {
@@ -1122,7 +1175,7 @@ static void nfb_installCrashLoggerOnce(void) {
     gPendingNewTweetsVC = nil;
     nfb_hideNewTweetsPill();
     if (NFBColumnsActive()) {
-        for (NSDictionary *entry in NFBColumnsVisibleEntries()) nfb_scrollToTop(entry[@"vc"], YES);
+        NFBColumnsRevealAllTops();
         return;
     }
     if (!vc) return;
@@ -1337,6 +1390,16 @@ static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
     gStreamStateIcon.hidden = NO;
 }
 
+static BOOL gNFBStateIconPending = NO;
+static void nfb_scheduleStateIconUpdate(void) {
+    if (gNFBStateIconPending) return;
+    gNFBStateIconPending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gNFBStateIconPending = NO;
+        nfb_updateStreamStateIconForVC(gActiveItemsVC);
+    });
+}
+
 static void nfb_installButton(UIWindow *win) {
     if (!win) return;
     if (!gStreamButton) {
@@ -1385,7 +1448,7 @@ static void nfb_installButton(UIWindow *win) {
     gStreamButton.userInteractionEnabled = YES;
     BOOL on = nfb_streamEnabled();
     nfb_styleButton(on);
-    nfb_updateGauge(on, (NSTimeInterval)nfb_streamInterval());
+    nfb_updateGauge(on, nfb_effectiveStreamInterval());
     NFBUpdateStreamButtonVisibility();
     nfb_updateStreamStateIconForVC(gActiveItemsVC);
 }
@@ -1417,20 +1480,43 @@ void NFBUpdateStreamButtonVisibility(void) {
     }
     if (gStreamButton) {
         gStreamButton.hidden = NO;
-        gStreamButton.userInteractionEnabled = YES;
+        gStreamButton.userInteractionEnabled = gStreamButton.alpha > 0.5;
+        UIWindow *win = gStreamButton.window;
+        if (win && win.subviews.lastObject != gStreamStateIcon) {
+            [win bringSubviewToFront:gStreamButton];
+            if (gStreamStateIcon.window == win) [win bringSubviewToFront:gStreamStateIcon];
+        }
     }
     if (gStreamStateIcon) gStreamStateIcon.hidden = NO;
 }
 
-// Fade with the header: hide while scrolling down, show at top / scrolling up.
+// Fully visible again (after a tab switch / leaving columns the fade state is stale).
+static void nfb_resetStreamButtonAlpha(void) {
+    if (!gStreamButton || gStreamButton.alpha > 0.99) return;
+    gStreamButton.alpha = 1.0;
+    if (gStreamStateIcon) gStreamStateIcon.alpha = 1.0;
+    gStreamButton.userInteractionEnabled = !gStreamButton.hidden;
+}
+
+// Fade with the header: hide while scrolling down, show at top / scrolling up. Runs on every scroll
+// frame, so only cheap work here; the stream state icon is refreshed at most ~3x/s.
 static void nfb_visibilityForScroll(UIScrollView *sv) {
     if (!gStreamButton || gStreamButton.window == nil) return;
-    NFBUpdateStreamButtonVisibility();
-    if (gStreamButton.hidden) return;
     nfb_noteActiveTimelineScroll(sv);
-    nfb_updateStreamStateIconForVC(gActiveItemsVC);
+    if (gStreamButton.hidden) return;
+    nfb_scheduleStateIconUpdate();
+    if (NFBColumnsActive()) {
+        // Several columns scroll independently: keep the button steady instead of fading.
+        nfb_resetStreamButtonAlpha();
+        return;
+    }
     static CGFloat last = 0;
+    static __weak UIScrollView *lastScrollView = nil;
     CGFloat y = sv.contentOffset.y;
+    if (lastScrollView != sv) {
+        lastScrollView = sv;
+        last = y;
+    }
     CGFloat topY = -sv.adjustedContentInset.top;
     BOOL atTop = (y <= topY + 4.0);
     if (atTop && gNewTweetsPill) {
@@ -1453,12 +1539,19 @@ static void nfb_visibilityForScroll(UIScrollView *sv) {
 
 #pragma mark - selected tab (scribePage of the selected T1TabView)
 
+// The view holding the tab buttons, remembered so later lookups scan a few views instead of
+// every view in every window.
+static __weak UIView *gNFBTabContainer = nil;
+
 static NSString *nfb_selectedTabPageInView(UIView *view, int depth) {
     if (!view || view.hidden || view.alpha < 0.01 || depth > 12) return nil;
     Class tabClass = NSClassFromString(@"T1TabView");
     if (tabClass && [view isKindOfClass:tabClass]) {
         T1TabView *tabView = (T1TabView *)view;
-        if (tabView.isSelected && tabView.scribePage.length) return tabView.scribePage;
+        if (tabView.isSelected && tabView.scribePage.length) {
+            gNFBTabContainer = tabView.superview;
+            return tabView.scribePage;
+        }
     }
     for (UIView *subview in view.subviews.reverseObjectEnumerator) {
         NSString *page = nfb_selectedTabPageInView(subview, depth + 1);
@@ -1474,7 +1567,10 @@ static NSString *nfb_currentSelectedTabPage(void) {
         return gNFBSelectedTabPageCache;
     }
     NSString *selectedPage = nil;
+    UIView *container = gNFBTabContainer;
+    if (container.window) selectedPage = nfb_selectedTabPageInView(container, 10);   // depth 10..12: the tab row only
     for (UIWindow *window in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
+        if (selectedPage.length) break;
         if (window.hidden || window.alpha < 0.01) continue;
         NSString *page = nfb_selectedTabPageInView(window, 0);
         if (page.length) {
@@ -1494,7 +1590,15 @@ void NFBNoteTabSelectionChanged(void) {
     }
     gNFBSelectedTabPageCache = nil;
     gNFBSelectedTabPageCacheAt = 0.0;
+    nfb_resetStreamButtonAlpha();
     NFBUpdateStreamButtonVisibility();
+    // Tab views update their selected state after this call returns; check once more.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gNFBSelectedTabPageCache = nil;
+        gNFBSelectedTabPageCacheAt = 0.0;
+        NFBUpdateStreamButtonVisibility();
+        nfb_scheduleStateIconUpdate();
+    });
 }
 
 static BOOL nfb_homeTabSelectedOrUnknown(void) {
@@ -1558,9 +1662,25 @@ static void nfb_streamStop(UIViewController *vc) {
     gNFBStreamTimerInterval = 0.0;
 }
 
+static void nfb_observePowerStateOnce(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void (^changed)(NSNotification *) = ^(__unused NSNotification *n) {
+            NSProcessInfo *info = NSProcessInfo.processInfo;
+            NFBLogEvent([NSString stringWithFormat:@"stream power thermal=%ld lowPower=%d effective=%.0fs", (long)info.thermalState,
+                info.isLowPowerModeEnabled ? 1 : 0, nfb_effectiveStreamInterval()]);
+            NFBStreamPrefsChanged();   // restart the timer at the new effective interval
+        };
+        NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+        [nc addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:changed];
+        [nc addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:changed];
+    });
+}
+
 static void nfb_streamStart(UIViewController *vc) {
     BOOL on = nfb_streamEnabled();
-    NSTimeInterval interval = (NSTimeInterval)nfb_streamInterval();
+    nfb_observePowerStateOnce();
+    NSTimeInterval interval = nfb_effectiveStreamInterval();
     nfb_styleButton(on);
     if (!on) {
         nfb_streamStop(nil);
@@ -1701,8 +1821,16 @@ static NSString *nfb_buildDiagnosticReport(void) {
     UIViewController *containerActive = nfb_containerActiveContent(container);
     BOOL homeSelected = nfb_resp(container, @selector(isHomeSelected)) ?
         ((BOOL(*)(id, SEL))objc_msgSend)(container, @selector(isHomeSelected)) : NO;
-    [s appendFormat:@"streaming on=%d interval=%ld page=%@ button=%d/%d\n", nfb_streamEnabled() ? 1 : 0, (long)nfb_streamInterval(),
-        nfb_currentSelectedTabPage() ?: @"(nil)", gStreamButton ? 1 : 0, (gStreamButton && !gStreamButton.hidden) ? 1 : 0];
+    CGRect bf = gStreamButton.window ? [gStreamButton convertRect:gStreamButton.bounds toView:nil] : CGRectZero;
+    NSProcessInfo *info = NSProcessInfo.processInfo;
+    NSArray *winSubviews = gStreamButton.window.subviews;
+    NSUInteger buttonIndex = winSubviews ? [winSubviews indexOfObject:gStreamButton] : NSNotFound;
+    [s appendFormat:@"streaming on=%d interval=%ld effective=%.0f thermal=%ld lowPower=%d page=%@ button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",
+        nfb_streamEnabled() ? 1 : 0, (long)nfb_streamInterval(), nfb_effectiveStreamInterval(), (long)info.thermalState,
+        info.isLowPowerModeEnabled ? 1 : 0, nfb_currentSelectedTabPage() ?: @"(nil)", gStreamButton ? 1 : 0,
+        (gStreamButton && !gStreamButton.hidden) ? 1 : 0, gStreamButton ? gStreamButton.alpha : -1.0, gStreamButton.window ? 1 : 0,
+        bf.origin.x, bf.origin.y, bf.size.width, bf.size.height,
+        buttonIndex == NSNotFound ? -1L : (long)buttonIndex, (unsigned long)winSubviews.count];
     [s appendFormat:@"container=%@ containerActive=%@ isHomeSelected=%d\n",
         container ? NSStringFromClass(container.class) : @"nil",
         containerActive ? NSStringFromClass(containerActive.class) : @"nil", homeSelected ? 1 : 0];
@@ -1833,8 +1961,7 @@ static NSString *nfb_buildDiagnosticReport(void) {
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
     %orig;
     if (!nfb_homeContainerOf((UIViewController *)self)) return;
-    nfb_noteActiveTimelineScroll(scrollView);
-    nfb_updateStreamStateIconForVC(gActiveItemsVC);
+    nfb_visibilityForScroll(scrollView);
 }
 
 %end
