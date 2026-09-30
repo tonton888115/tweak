@@ -112,7 +112,15 @@ static NSDictionary<NSString*, NSDictionary*>* BHTSettingsPages(void) {
                         @"action": @"showAutoStreamIntervalPicker:"
                     },
                     @{@"key": @"nfb_columns_enabled",
-                      @"default": @NO},
+                      @"default": @YES},
+                    @{
+                        @"type": @"compactButton",
+                        @"parentKey": @"nfb_columns_enabled",
+                        @"key": @"nfb_columns_host",
+                        @"default": @"communities",
+                        @"titleKey": @"NFB_COLUMNS_HOST_ROW",
+                        @"action": @"showColumnsHostPicker:"
+                    },
                     @{
                         @"type": @"compactButton",
                         @"parentKey": @"nfb_columns_enabled",

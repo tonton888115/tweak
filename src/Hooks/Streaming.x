@@ -64,7 +64,8 @@ void NFBStreamPrefsChanged(void);
 BOOL NFBColumnsActive(void);
 NSArray<NSDictionary *> *NFBColumnsVisibleEntries(void);
 NSInteger NFBColumnsPageRecommended(UIViewController *vc);
-void NFBColumnsSetEnabled(BOOL enabled);
+void NFBColumnsSetActive(BOOL active);
+NSString *NFBColumnsHostPageID(void);
 void NFBColumnsShowManager(UIViewController *presenter);
 NSString *NFBColumnsDiagnostic(void);
 
@@ -1156,11 +1157,14 @@ static void nfb_installCrashLoggerOnce(void) {
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_INTERVAL_CHANGE", @"⏱ Change refresh interval…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self showInterval];
     }]];
-    BOOL columnsOn = [BHTSettings boolForKey:@"nfb_columns_enabled"];
-    [ac addAction:[UIAlertAction actionWithTitle:(columnsOn ? nfb_loc(@"NFB_COLUMNS_OFF", @"Turn columns mode OFF") : nfb_loc(@"NFB_COLUMNS_ON", @"Turn columns mode ON")) style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NFBColumnsSetEnabled(!columnsOn);
-    }]];
-    if (columnsOn) {
+    BOOL columnsTab = [BHTSettings boolForKey:@"nfb_columns_enabled"];
+    BOOL columnsOn = NFBColumnsActive();
+    if (columnsTab) {
+        [ac addAction:[UIAlertAction actionWithTitle:(columnsOn ? nfb_loc(@"NFB_COLUMNS_OFF", @"Back to Home (leave columns)") : nfb_loc(@"NFB_COLUMNS_ON", @"Open the Columns tab")) style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            NFBColumnsSetActive(!columnsOn);
+        }]];
+    }
+    if (columnsTab) {
         [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_COLUMNS_MANAGE", @"📐 Manage columns (reorder / show)…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             NFBColumnsShowManager([self topVC]);
         }]];
@@ -1483,7 +1487,11 @@ void NFBNoteTabSelectionChanged(void) {
 
 static BOOL nfb_homeTabSelectedOrUnknown(void) {
     NSString *page = nfb_currentSelectedTabPage();
-    if (page.length) return [page isEqualToString:@"home"];
+    if (page.length) {
+        if ([page isEqualToString:@"home"]) return YES;
+        // The Columns tab shows the Home surface while its (host) tab is highlighted.
+        return NFBColumnsActive() && [page isEqualToString:NFBColumnsHostPageID()];
+    }
     return gActiveItemsVC && [gActiveItemsVC isViewLoaded] && gActiveItemsVC.view.window;
 }
 

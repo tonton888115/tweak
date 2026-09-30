@@ -9,6 +9,7 @@
 #import "Core/BHTBundle.h"
 #import "Core/BHTSettings.h"
 #import "Headers/TWHeaders.h"
+#import "CustomTabBar/CustomTabBarUtility.h"
 
 extern void applyHideCustomTimelinesSetting(void);
 extern void NFBStreamPrefsChanged(void);
@@ -35,6 +36,34 @@ extern void NFBColumnsShowManager(UIViewController* presenter);
 
 - (void)showColumnsManager:(NSDictionary*)sender {
     NFBColumnsShowManager(self);
+}
+
+// Which bottom tab becomes the Columns tab. Offers every tab the app has built (as recorded by
+// the custom tab bar), except Home and the "more" dash.
+- (void)showColumnsHostPicker:(NSDictionary*)sender {
+    BHTBundle* bundle = [BHTBundle sharedBundle];
+    NSString* current = [[NSUserDefaults standardUserDefaults] stringForKey:@"nfb_columns_host"] ?: @"communities";
+    UIAlertController* alert = [UIAlertController
+        alertControllerWithTitle:[bundle localizedStringForKey:@"NFB_COLUMNS_HOST_PICKER_TITLE"]
+                         message:nil
+                  preferredStyle:UIAlertControllerStyleAlert];
+    for (NSDictionary* tab in [CustomTabBarUtility availableTabs]) {
+        NSString* page = tab[TabPageKey];
+        if (!page.length || [page isEqualToString:CustomTabBarHomePageID] || [page isEqualToString:@"dash"]) continue;
+        NSString* title = [tab[TabTitleKey] length] ? tab[TabTitleKey] : page;
+        if ([page isEqualToString:current]) title = [@"✓ " stringByAppendingString:title];
+        [alert addAction:[UIAlertAction actionWithTitle:title
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction* action) {
+                                                    [[NSUserDefaults standardUserDefaults] setObject:page forKey:@"nfb_columns_host"];
+                                                    NFBColumnsPrefsChanged();
+                                                    [self.tableView reloadData];
+                                                }]];
+    }
+    [alert addAction:[UIAlertAction actionWithTitle:[bundle localizedStringForKey:@"CANCEL_ACTION_LABEL"]
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 // Same choices as the stream button's long-press menu; applies immediately.
