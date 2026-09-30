@@ -471,3 +471,18 @@
 "NFB_STREAM_STATE_PAUSED" = "Streaming paused";
 "NFB_INTERVAL_PICKER_TITLE" = "Auto-refresh interval";
 "NFB_INTERVAL_CURRENT" = "Current: %lds";
+
+/* Columns mode (X 12.x) */
+"NFB_COLUMNS_ENABLED_TITLE" = "Columns mode (TweetDeck-style)";
+"NFB_COLUMNS_ENABLED_DETAIL" = "Show Home timelines (Following, pinned lists, For You) side by side as 340pt columns.";
+"NFB_COLUMNS_MANAGE_ROW" = "Manage columns (reorder / show)…";
+"NFB_COLUMNS_FULL_WIDTH_TITLE" = "Hide the right trends pane (iPad)";
+"NFB_COLUMNS_FULL_WIDTH_DETAIL" = "Gives the columns the full width while columns mode is on.";
+"NFB_COLUMNS_ON" = "Turn columns mode ON";
+"NFB_COLUMNS_OFF" = "Turn columns mode OFF";
+"NFB_COLUMNS_MANAGE" = "📐 Manage columns (reorder / show)…";
+"NFB_COLUMNS_MANAGE_TITLE" = "Manage columns";
+"NFB_COLUMNS_MANAGE_EMPTY" = "Open Home once with columns mode on to list its timelines here.";
+"NFB_COLUMNS_AUTO_DISABLED" = "Columns mode was turned off because the app quit unexpectedly twice while it was on.";
+"NFB_RESET" = "Reset";
+"NFB_DIAG_SHARE" = "📤 Save diagnostics as a file (e.g. to iCloud Drive)";

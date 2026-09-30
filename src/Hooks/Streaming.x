@@ -60,6 +60,13 @@ void NFBNoteTabSelectionChanged(void);
 void NFBLogEvent(NSString *msg);
 void NFBLogSnapshot(NSString *reason);
 void NFBStreamPrefsChanged(void);
+// Columns.x
+BOOL NFBColumnsActive(void);
+NSArray<NSDictionary *> *NFBColumnsVisibleEntries(void);
+NSInteger NFBColumnsPageRecommended(UIViewController *vc);
+void NFBColumnsSetEnabled(BOOL enabled);
+void NFBColumnsShowManager(UIViewController *presenter);
+NSString *NFBColumnsDiagnostic(void);
 
 // UI strings: BHTBundle key with an inline English fallback (BHTBundle returns the KEY for
 // unknown keys, e.g. when a sideload ships a stale bundle next to a fresh dylib).
@@ -249,6 +256,10 @@ static BOOL nfb_vcIsOrContains(UIViewController *outer, UIViewController *inner)
 // isHomeSelected ("home" = For You) for its activeContentViewController.
 static BOOL nfb_isRecommendedHomeTimeline(UIViewController *vc) {
     if (!vc) return NO;
+    if (NFBColumnsActive()) {
+        NSInteger columnState = NFBColumnsPageRecommended(vc);
+        if (columnState >= 0) return columnState == 1;
+    }
     UIViewController *container = nfb_homeContainerOf(vc);
     if (container && nfb_resp(container, @selector(homeTimelineViewController))) {
         // Pre-12 containers: compare by identity.
@@ -426,7 +437,7 @@ static BOOL nfb_canRevealRefreshStartedAtTop(UIViewController *vc) {
     if (now - startedAt > 12.0) return NO;
     if (gLastUserTimelineScrollInteraction > startedAt + 0.05) return NO;
     UIViewController *active = gActiveItemsVC;
-    if (active && vc != active) {
+    if (!NFBColumnsActive() && active && vc != active) {
         UIViewController *selected = nfb_selectedTimelineVC(active);
         if (selected && vc != selected) return NO;
     }
@@ -449,7 +460,7 @@ static void nfb_revealTopAfterRefresh(UIViewController *vc) {
         UIViewController *s = wvc;
         if (!s || ![s isViewLoaded] || s.view.window == nil) return;
         UIViewController *active = gActiveItemsVC;
-        if (active && s != active) {
+        if (!NFBColumnsActive() && active && s != active) {
             UIViewController *selected = nfb_selectedTimelineVC(active);
             if (s != selected) return;
         }
@@ -611,7 +622,37 @@ static BOOL nfb_streamTriggerTarget(UIViewController *target) {
     return did;
 }
 
+// Columns: refresh every visible column that sits at the very top (For You excluded), staggered
+// so the requests do not all leave at once; a column the user is reading gets the pill instead.
+static BOOL nfb_streamTriggerColumns(void) {
+    NSArray<NSDictionary *> *entries = NFBColumnsVisibleEntries();
+    if (!entries.count) return NO;
+    UIViewController *away = nil;
+    NSUInteger fired = 0;
+    for (NSDictionary *entry in entries) {
+        UIViewController *page = entry[@"vc"];
+        if ([entry[@"recommended"] boolValue] || ![page isViewLoaded] || !page.view.window) continue;
+        UIScrollView *sv = nfb_mainScrollViewOf(page);
+        if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) continue;
+        if (!nfb_timelineStrictlyAtTop(page)) {
+            if (!away) away = page;
+            continue;
+        }
+        __weak UIViewController *weakPage = page;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * fired * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIViewController *strongPage = weakPage;
+            if (strongPage && NFBColumnsActive()) nfb_streamTriggerTarget(strongPage);
+        });
+        fired++;
+    }
+    if (away && !fired) nfb_showNewTweetsPill(away);
+    NFBLogEvent([NSString stringWithFormat:@"streamColumns visible=%lu fired=%lu away=%@", (unsigned long)entries.count,
+        (unsigned long)fired, away ? NSStringFromClass(away.class) : @"-"]);
+    return YES;
+}
+
 static void nfb_streamTrigger(UIViewController *vc) {
+    if (NFBColumnsActive() && nfb_streamTriggerColumns()) return;
     UIViewController *searchTarget = nfb_visibleSearchAutomationController();
     if (searchTarget) {
         nfb_streamTriggerTarget(searchTarget);
@@ -1070,6 +1111,10 @@ static void nfb_installCrashLoggerOnce(void) {
     UIViewController *vc = gPendingNewTweetsVC ?: gActiveItemsVC;
     gPendingNewTweetsVC = nil;
     nfb_hideNewTweetsPill();
+    if (NFBColumnsActive()) {
+        for (NSDictionary *entry in NFBColumnsVisibleEntries()) nfb_scrollToTop(entry[@"vc"], YES);
+        return;
+    }
     if (!vc) return;
     // Explicit user tap = jump to the top now.
     UIViewController *target = nfb_selectedTimelineVC(vc) ?: vc;
@@ -1111,8 +1156,20 @@ static void nfb_installCrashLoggerOnce(void) {
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_INTERVAL_CHANGE", @"⏱ Change refresh interval…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self showInterval];
     }]];
+    BOOL columnsOn = [BHTSettings boolForKey:@"nfb_columns_enabled"];
+    [ac addAction:[UIAlertAction actionWithTitle:(columnsOn ? nfb_loc(@"NFB_COLUMNS_OFF", @"Turn columns mode OFF") : nfb_loc(@"NFB_COLUMNS_ON", @"Turn columns mode ON")) style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NFBColumnsSetEnabled(!columnsOn);
+    }]];
+    if (columnsOn) {
+        [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_COLUMNS_MANAGE", @"📐 Manage columns (reorder / show)…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            NFBColumnsShowManager([self topVC]);
+        }]];
+    }
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_DIAG_SHOW", @"🔍 Diagnostics (copy & send)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self showDiag];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_DIAG_SHARE", @"📤 Save diagnostics as a file (e.g. to iCloud Drive)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self shareDiagFile];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"CANCEL_ACTION_LABEL", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
@@ -1144,6 +1201,26 @@ static void nfb_installCrashLoggerOnce(void) {
 
 - (void)showDiag {
     [self showText:nfb_buildDiagnosticReport() title:nfb_loc(@"NFB_DIAG_TITLE", @"Diagnostics")];
+}
+
+// Diagnostics + the saved operation log as one .txt, handed to the share sheet so it can go
+// straight to Files -> iCloud Drive (readable from a PC without copy/paste).
+- (void)shareDiagFile {
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *name = [NSString stringWithFormat:@"NeoFreeBird-diag-%@.txt", [fmt stringFromDate:[NSDate date]]];
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
+    NSString *text = [NSString stringWithFormat:@"%@\n\n=== saved log ===\n%@\n", nfb_buildDiagnosticReport(), nfb_logSavedFileContents()];
+    if (![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+        [self showDiag];
+        return;
+    }
+    UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
+    if (share.popoverPresentationController) {
+        share.popoverPresentationController.sourceView = gStreamButton;
+        share.popoverPresentationController.sourceRect = gStreamButton.bounds;
+    }
+    [[self topVC] presentViewController:share animated:YES completion:nil];
 }
 
 - (void)showInterval {
@@ -1204,6 +1281,16 @@ static BOOL nfb_streamCanRunForTarget(UIViewController *target) {
         return nfb_visibleTimelineAtTop(searchTarget) || nfb_canRevealRefreshStartedAtTop(searchTarget);
     }
     if (!nfb_homeTabSelectedOrUnknown()) return NO;
+    if (NFBColumnsActive()) {
+        for (NSDictionary *entry in NFBColumnsVisibleEntries()) {
+            UIViewController *page = entry[@"vc"];
+            if ([entry[@"recommended"] boolValue]) continue;
+            UIScrollView *sv = nfb_mainScrollViewOf(page);
+            if (sv && (sv.isDragging || sv.isDecelerating || sv.isTracking)) continue;
+            if (nfb_visibleTimelineAtTop(page)) return YES;
+        }
+        return NO;
+    }
     if (!target || ![target isViewLoaded] || target.view.window == nil) return NO;
     if (nfb_isRecommendedHomeTimeline(target)) return NO;
     UIScrollView *sv = nfb_mainScrollViewOf(target);
@@ -1421,6 +1508,10 @@ static BOOL nfb_streamShouldFire(UIViewController *vc) {
         return YES;
     }
     if (!nfb_homeTabSelectedOrUnknown()) return NO;
+    if (NFBColumnsActive()) {
+        nfb_updateStreamStateIconForVC(vc);
+        return NFBColumnsVisibleEntries().count > 0;   // per-column gating happens in the trigger
+    }
     // Gate on the timeline actually on screen (Following / pinned list), not the timer's owner.
     UIViewController *target = nfb_selectedTimelineVC(vc) ?: vc;
     if (![target isViewLoaded] || target.view.window == nil) return NO;
@@ -1594,6 +1685,7 @@ static NSString *nfb_buildDiagnosticReport(void) {
         nfb_streamCanRunForTarget(selected) ? 1 : 0];
     UIViewController *search = nfb_visibleSearchAutomationController();
     [s appendFormat:@"searchLatest=%@\n", search ? NSStringFromClass(search.class) : @"nil"];
+    [s appendString:NFBColumnsDiagnostic() ?: @""];
     UIViewController *paging = active ? nfb_parentControllerNamed(active, @"Paging") : nil;
     UIViewController *segmented = active ? nfb_parentControllerNamed(active, @"Segmented") : nil;
     [s appendFormat:@"paging=%@ segmented=%@\n", paging ? NSStringFromClass(paging.class) : @"nil",

@@ -12,6 +12,8 @@
 
 extern void applyHideCustomTimelinesSetting(void);
 extern void NFBStreamPrefsChanged(void);
+extern void NFBColumnsPrefsChanged(void);
+extern void NFBColumnsShowManager(UIViewController* presenter);
 
 @implementation TimelinesSettingsViewController
 
@@ -26,7 +28,13 @@ extern void NFBStreamPrefsChanged(void);
         applyHideCustomTimelinesSetting();
     } else if ([key isEqualToString:@"auto_stream_timeline"]) {
         NFBStreamPrefsChanged();
+    } else if ([key isEqualToString:@"nfb_columns_enabled"] || [key isEqualToString:@"nfb_columns_full_width"]) {
+        NFBColumnsPrefsChanged();
     }
+}
+
+- (void)showColumnsManager:(NSDictionary*)sender {
+    NFBColumnsShowManager(self);
 }
 
 // Same choices as the stream button's long-press menu; applies immediately.

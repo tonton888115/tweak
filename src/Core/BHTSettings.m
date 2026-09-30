@@ -110,7 +110,19 @@ static NSDictionary<NSString*, NSDictionary*>* BHTSettingsPages(void) {
                         @"default": @20,
                         @"titleKey": @"AUTO_STREAM_INTERVAL_TITLE",
                         @"action": @"showAutoStreamIntervalPicker:"
-                    }
+                    },
+                    @{@"key": @"nfb_columns_enabled",
+                      @"default": @NO},
+                    @{
+                        @"type": @"compactButton",
+                        @"parentKey": @"nfb_columns_enabled",
+                        @"key": @"nfb_columns_manage",
+                        @"titleKey": @"NFB_COLUMNS_MANAGE_ROW",
+                        @"action": @"showColumnsManager:"
+                    },
+                    @{@"key": @"nfb_columns_full_width",
+                      @"parentKey": @"nfb_columns_enabled",
+                      @"default": @YES}
                 ]
             },
             @"grok": @{

@@ -467,3 +467,18 @@
 "NFB_STREAM_STATE_PAUSED" = "ストリーミング一時停止";
 "NFB_INTERVAL_PICKER_TITLE" = "自動更新の間隔";
 "NFB_INTERVAL_CURRENT" = "現在: %ld秒";
+
+/* Columns mode (X 12.x) */
+"NFB_COLUMNS_ENABLED_TITLE" = "カラムモード（TweetDeck風）";
+"NFB_COLUMNS_ENABLED_DETAIL" = "ホームのタイムライン（フォロー中・ピン留めリスト・おすすめ）を幅340ptの列として横に並べます。";
+"NFB_COLUMNS_MANAGE_ROW" = "カラムの管理（並べ替え・表示）…";
+"NFB_COLUMNS_FULL_WIDTH_TITLE" = "右のトレンド欄を隠す（iPad）";
+"NFB_COLUMNS_FULL_WIDTH_DETAIL" = "カラムモード中は画面幅いっぱいを列に使います。";
+"NFB_COLUMNS_ON" = "カラムモードを ON にする";
+"NFB_COLUMNS_OFF" = "カラムモードを OFF にする";
+"NFB_COLUMNS_MANAGE" = "📐 カラムの管理（並べ替え・表示）…";
+"NFB_COLUMNS_MANAGE_TITLE" = "カラムの管理";
+"NFB_COLUMNS_MANAGE_EMPTY" = "カラムモードをONにしてホームを一度開くと、ここにタイムラインが並びます。";
+"NFB_COLUMNS_AUTO_DISABLED" = "カラムモード中にアプリが2回続けて異常終了したため、カラムモードをOFFにしました。";
+"NFB_RESET" = "リセット";
+"NFB_DIAG_SHARE" = "📤 診断情報をファイルで保存（iCloud Drive など）";
