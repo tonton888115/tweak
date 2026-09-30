@@ -100,7 +100,17 @@ static NSDictionary<NSString*, NSDictionary*>* BHTSettingsPages(void) {
                     @{@"key": @"hide_verified_tweets",
                       @"default": @NO},
                     @{@"key": @"restore_refresh_sounds",
-                      @"default": @YES}
+                      @"default": @YES},
+                    @{@"key": @"auto_stream_timeline",
+                      @"default": @NO},
+                    @{
+                        @"type": @"compactButton",
+                        @"parentKey": @"auto_stream_timeline",
+                        @"key": @"auto_stream_interval",
+                        @"default": @20,
+                        @"titleKey": @"AUTO_STREAM_INTERVAL_TITLE",
+                        @"action": @"showAutoStreamIntervalPicker:"
+                    }
                 ]
             },
             @"grok": @{

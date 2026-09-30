@@ -436,3 +436,34 @@
 /* Undo Duration Labels (Added for TweetsSettingsViewController) */
 "GENERIC_OFF_LABEL" = "オフ";
 "SUBSCRIPTION_UNDO_SEND_DURATION_LABEL" = "%ld秒";
+
+/* Streaming timeline (auto-refresh), ported from the 11.35 fork */
+"AUTO_STREAM_TIMELINE_TITLE" = "TL自動更新（垂れ流し）";
+"AUTO_STREAM_TIMELINE_DETAIL" = "タイムラインの先頭にいる間、新着ツイートを自動で読み込み続けます。フォロー中タブで最も効果的です。";
+"AUTO_STREAM_INTERVAL_TITLE" = "自動更新の間隔を変更…";
+"NFB_CLOSE" = "閉じる";
+"NFB_DIAG_SHOW" = "🔍 診断情報（コピーして送って）";
+"NFB_DIAG_TITLE" = "診断情報";
+"NFB_INTERVAL_CHANGE" = "⏱ 更新間隔を変更…";
+"NFB_INTERVAL_TITLE" = "更新間隔";
+"NFB_LOG_COPIED_TITLE" = "録画ログ（コピー済み）";
+"NFB_LOG_COPY_SAVED" = "📄 保存済みログをコピー（停止不要・kill後も可）";
+"NFB_LOG_EMPTY" = "(ログなし)";
+"NFB_LOG_START" = "⏺ ログ録画を開始（既存ログ消去）";
+"NFB_LOG_START_TOAST" = "録画開始。再現操作をしてから、もう一度長押し→「停止してコピー」。詰まって停止できない時は、起動し直して「保存済みログをコピー」。";
+"NFB_LOG_STOP_AND_COPY" = "⏹ ログ録画を停止してコピー";
+"NFB_NEW_TWEETS_PILL" = "新しいツイートがあります";
+"NFB_RECOPY" = "再コピー";
+"NFB_REFRESH_NOW" = "🔄 今すぐ更新";
+"NFB_SAVED_LOG_COPIED_TITLE" = "保存ログ（コピー済み）";
+"NFB_SAVED_LOG_EMPTY" = "(保存ログなし)";
+"NFB_SECONDS_FMT" = "%ld秒";
+"NFB_STREAM_BUTTON_A11Y" = "TL自動更新";
+"NFB_STREAM_MENU_STATUS" = "状態: %@ ／ 間隔: %ld秒";
+"NFB_STREAM_MENU_TITLE" = "TL自動更新（垂れ流し）";
+"NFB_STREAM_OFF" = "自動更新を OFF にする";
+"NFB_STREAM_ON" = "自動更新を ON にする";
+"NFB_STREAM_STATE_ON" = "ストリーミング有効";
+"NFB_STREAM_STATE_PAUSED" = "ストリーミング一時停止";
+"NFB_INTERVAL_PICKER_TITLE" = "自動更新の間隔";
+"NFB_INTERVAL_CURRENT" = "現在: %ld秒";

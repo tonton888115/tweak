@@ -1,0 +1,112 @@
+name: Port build (sideload dylib + bundle)
+
+# Compile check + sideload-ready dylib for the v7 port branch. Runs on push to port-v7 only
+# (a new workflow file cannot be dispatched until it exists on the default branch).
+# Output: BHTwitter.dylib with Cephei/CydiaSubstrate install names rewritten to @rpath and an
+# ad-hoc signature, plus the resource bundle, for swapping into an existing X 12.28.1 IPA.
+
+on:
+  push:
+    branches: [port-v7]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: main
+          submodules: recursive
+
+      - name: Install dependencies
+        run: brew install make dpkg ldid
+
+      - name: Add GNU Make to PATH
+        run: echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Download Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          ref: master
+          path: theos
+          submodules: recursive
+
+      - name: iOS SDK cache
+        id: SDK
+        uses: actions/cache@v4
+        with:
+          path: theos/sdks/
+          key: iOS-16.5-SDK
+
+      - name: Download iOS SDK
+        if: steps.SDK.outputs.cache-hit != 'true'
+        run: |
+          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks/
+          cd sdks
+          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
+          git checkout
+          mv ./*.sdk "${THEOS}/sdks"
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Compute ffmpeg cache key
+        id: ffmpeg-key
+        run: |
+          echo "key=ffmpeg-stack-sdk$(xcrun --sdk iphoneos --show-sdk-version)-$(git -C main rev-parse --short HEAD:deps/ffmpeg-kit-next/upstream)-${{ hashFiles('main/deps/ffmpeg-kit-next/build-ffmpeg.sh') }}" >> "$GITHUB_OUTPUT"
+
+      - name: ffmpeg cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ffmpeg-build
+            main/deps/ffmpeg-kit-next/build
+          key: ${{ steps.ffmpeg-key.outputs.key }}
+
+      - name: Build ffmpeg stack (first run only)
+        run: |
+          cd main
+          if [ ! -f deps/ffmpeg-kit-next/build/lib/libffmpegkit.a ]; then
+            ./deps/ffmpeg-kit-next/build-ffmpeg.sh
+          fi
+        env:
+          THEOS: ${{ github.workspace }}/theos
+          BUILD_DIR: ${{ github.workspace }}/ffmpeg-build
+
+      - name: Build tweak
+        run: |
+          cd main
+          sed -i '' "s/^TARGET.*$/TARGET := iphone:clang:16.5:15.0/" Makefile
+          make clean || true
+          make
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Rewrite install names to @rpath and re-sign
+        run: |
+          cd main
+          DYLIB=$(find .theos -name 'BHTwitter.dylib' -path '*obj*' | head -n1)
+          echo "dylib: $DYLIB"
+          for fw in Cephei CepheiPrefs CepheiUI CydiaSubstrate; do
+            install_name_tool -change "/Library/Frameworks/$fw.framework/$fw" "@rpath/$fw.framework/$fw" "$DYLIB"
+          done
+          ldid -S "$DYLIB"
+          otool -L "$DYLIB" | grep -Ei 'cephei|cydia' || true
+          mkdir -p ../out
+          cp "$DYLIB" ../out/BHTwitter.dylib
+          (cd "layout/Library/Application Support/BHT" && zip -qr "$GITHUB_WORKSPACE/out/BHTwitter.bundle.zip" BHTwitter.bundle)
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: port-v7-sideload
+          path: |
+            out/BHTwitter.dylib
+            out/BHTwitter.bundle.zip
+          if-no-files-found: error

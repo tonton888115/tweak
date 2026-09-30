@@ -440,3 +440,34 @@
 /* Undo Duration Labels (Added for TweetsSettingsViewController) */
 "GENERIC_OFF_LABEL" = "Off";
 "SUBSCRIPTION_UNDO_SEND_DURATION_LABEL" = "%ld seconds";
+
+/* Streaming timeline (auto-refresh), ported from the 11.35 fork */
+"AUTO_STREAM_TIMELINE_TITLE" = "Auto-refresh timeline (streaming)";
+"AUTO_STREAM_TIMELINE_DETAIL" = "Automatically loads new Tweets while you stay at the top of the timeline, like a live stream. Works best on the Following tab.";
+"AUTO_STREAM_INTERVAL_TITLE" = "Change auto-refresh interval…";
+"NFB_CLOSE" = "Close";
+"NFB_DIAG_SHOW" = "🔍 Diagnostics (copy & send)";
+"NFB_DIAG_TITLE" = "Diagnostics";
+"NFB_INTERVAL_CHANGE" = "⏱ Change refresh interval…";
+"NFB_INTERVAL_TITLE" = "Refresh interval";
+"NFB_LOG_COPIED_TITLE" = "Recorded log (copied)";
+"NFB_LOG_COPY_SAVED" = "📄 Copy saved log (no stop needed, survives a kill)";
+"NFB_LOG_EMPTY" = "(no log)";
+"NFB_LOG_START" = "⏺ Start log recording (clears the previous log)";
+"NFB_LOG_START_TOAST" = "Recording started. Reproduce the issue, then long-press again → \"Stop and copy\". If the app gets stuck, relaunch and use \"Copy saved log\".";
+"NFB_LOG_STOP_AND_COPY" = "⏹ Stop log recording and copy";
+"NFB_NEW_TWEETS_PILL" = "New Tweets";
+"NFB_RECOPY" = "Copy again";
+"NFB_REFRESH_NOW" = "🔄 Refresh now";
+"NFB_SAVED_LOG_COPIED_TITLE" = "Saved log (copied)";
+"NFB_SAVED_LOG_EMPTY" = "(no saved log)";
+"NFB_SECONDS_FMT" = "%lds";
+"NFB_STREAM_BUTTON_A11Y" = "Timeline auto-refresh";
+"NFB_STREAM_MENU_STATUS" = "Status: %@ / interval: %lds";
+"NFB_STREAM_MENU_TITLE" = "Auto-refresh timeline (streaming)";
+"NFB_STREAM_OFF" = "Turn auto-refresh OFF";
+"NFB_STREAM_ON" = "Turn auto-refresh ON";
+"NFB_STREAM_STATE_ON" = "Streaming active";
+"NFB_STREAM_STATE_PAUSED" = "Streaming paused";
+"NFB_INTERVAL_PICKER_TITLE" = "Auto-refresh interval";
+"NFB_INTERVAL_CURRENT" = "Current: %lds";
