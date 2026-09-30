@@ -78,8 +78,14 @@ static BOOL nfb_colsActiveNow(void) {
 NSString *NFBColumnsHostPageID(void) {
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
     NSString *page = [defs stringForKey:@"nfb_columns_host"];
-    if (!page.length) page = [defs stringForKey:@"columns_host_page"];   // choice made in the 11.35 builds
-    return page.length ? page : @"communities";
+    if (page.length) return page;
+    // Carry over the host chosen in the 11.35 builds once this X version is known to have that tab.
+    NSString *old = [defs stringForKey:@"columns_host_page"];
+    if (old.length && ![old isEqualToString:CustomTabBarHomePageID] && [CustomTabBarUtility metadataForPage:old]) {
+        [defs setObject:old forKey:@"nfb_columns_host"];
+        return old;
+    }
+    return @"communities";
 }
 
 static CGFloat nfb_colsColumnWidth(CGFloat viewportWidth) {
