@@ -1114,7 +1114,8 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
     // scroll step (origin change), which re-lays out all columns while swiping.
     CGSize old = self.collectionView.bounds.size;
     BOOL resized = fabs(old.width - newBounds.size.width) > 0.5 || fabs(old.height - newBounds.size.height) > 0.5;
-    if (%orig && !resized) gNFBColsScroll.invalidations++;   // stock invalidations we suppressed
+    BOOL stock = %orig;
+    if (stock && !resized) gNFBColsScroll.invalidations++;   // stock invalidations we suppressed
     return resized;
 }
 
