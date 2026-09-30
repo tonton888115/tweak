@@ -6332,8 +6332,7 @@ static void nfb_appendColumnsDiag(NSMutableString *s, UIViewController *active) 
     if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         UIViewController *fwPaging = nfb_findVisibleHomePagingController();
         UIViewController *split = fwPaging ? nfb_columnsAppSplitForPaging(fwPaging) : nil;
-        [s appendFormat:@"nativeSplitDiag[b74] split=%@ suppressed=%d storedLive=%d
-",
+        [s appendFormat:@"nativeSplitDiag[b74] split=%@ suppressed=%d storedLive=%d\n",
             split ? NSStringFromClass(split.class) : @"nil",
             gNFBNativeSplitTierSuppressed ? 1 : 0,
             (gNFBNativeSplitTierSplit && gNFBNativeSplitTierSplit.viewIfLoaded.window) ? 1 : 0];
