@@ -1501,23 +1501,15 @@ void NFBStreamPrefsChanged(void) {
     nfb_streamStart(vc);   // restart the timer so a changed switch / interval applies immediately
 }
 
-static NSString *nfb_identifierForTimelineVariantArgument(id variant) {
-    uintptr_t raw = (uintptr_t)variant;
-    if (raw < 8) {
-        if (raw == 0) return @"home";
-        if (raw == 1) return @"latest";
-        if (raw == 2) return @"creatorSubscriptions";
-        return nil;
+// selectTimelineVariant:shouldRefresh: takes an NSInteger variant (type encoding q16) — it must
+// never be declared as an object, or ARC would try to retain the integer.
+static NSString *nfb_identifierForTimelineVariant(NSInteger variant) {
+    switch (variant) {
+        case 0: return @"home";
+        case 1: return @"latest";
+        case 2: return @"creatorSubscriptions";
+        default: return nil;
     }
-    NSString *value = nil;
-    if ([variant isKindOfClass:NSString.class]) {
-        value = (NSString *)variant;
-    } else if ([variant respondsToSelector:@selector(identifier)]) {
-        id identifier = ((id(*)(id, SEL))objc_msgSend)(variant, @selector(identifier));
-        if ([identifier isKindOfClass:NSString.class]) value = identifier;
-    }
-    if (nfb_homeTabIdentifierLooksRecommended(value) || nfb_homeTabIdentifierLooksChronological(value)) return value;
-    return nil;
 }
 
 #pragma mark - diagnostics
@@ -1606,6 +1598,54 @@ static NSString *nfb_buildDiagnosticReport(void) {
     UIViewController *segmented = active ? nfb_parentControllerNamed(active, @"Segmented") : nil;
     [s appendFormat:@"paging=%@ segmented=%@\n", paging ? NSStringFromClass(paging.class) : @"nil",
         segmented ? NSStringFromClass(segmented.class) : @"nil"];
+    // Columns-redesign probe (read-only): how the 12.x home pager is built. See
+    // goals/port-v7-columns-redesign.md (S0).
+    if (segmented) {
+        NSInteger tabs = nfb_resp(segmented, @selector(numberOfTabs)) ? ((NSInteger(*)(id, SEL))objc_msgSend)(segmented, @selector(numberOfTabs)) : -1;
+        NSInteger selectedIndex = nfb_resp(segmented, @selector(selectedIndex)) ? ((NSInteger(*)(id, SEL))objc_msgSend)(segmented, @selector(selectedIndex)) : -1;
+        NSInteger hideMode = nfb_resp(segmented, @selector(tabBarHideMode)) ? ((NSInteger(*)(id, SEL))objc_msgSend)(segmented, @selector(tabBarHideMode)) : -1;
+        BOOL hPaging = nfb_resp(segmented, @selector(isHorizontalPagingEnabled)) ? ((BOOL(*)(id, SEL))objc_msgSend)(segmented, @selector(isHorizontalPagingEnabled)) : NO;
+        id pagingVC = nfb_resp(segmented, @selector(pagingViewController)) ? ((id(*)(id, SEL))objc_msgSend)(segmented, @selector(pagingViewController)) : nil;
+        id tabBar = nfb_resp(segmented, @selector(tabBarView)) ? ((id(*)(id, SEL))objc_msgSend)(segmented, @selector(tabBarView)) : nil;
+        CGRect tabBarFrame = [tabBar isKindOfClass:UIView.class] ? ((UIView *)tabBar).frame : CGRectZero;
+        [s appendFormat:@"probe segmented tabs=%ld selected=%ld tabBarHideMode=%ld hPaging=%d pagingVC=%@ tabBar=%@ f=(%.0f,%.0f,%.0f,%.0f)\n",
+            (long)tabs, (long)selectedIndex, (long)hideMode, hPaging ? 1 : 0,
+            pagingVC ? NSStringFromClass([pagingVC class]) : @"nil", tabBar ? NSStringFromClass([tabBar class]) : @"nil",
+            tabBarFrame.origin.x, tabBarFrame.origin.y, tabBarFrame.size.width, tabBarFrame.size.height];
+    }
+    UIScrollView *pager = paging ? nfb_horizontalPagingScrollViewOf(paging) : nil;
+    if ([pager isKindOfClass:UICollectionView.class]) {
+        UICollectionView *cv = (UICollectionView *)pager;
+        UICollectionViewLayout *layout = cv.collectionViewLayout;
+        NSInteger items = cv.numberOfSections > 0 ? [cv numberOfItemsInSection:0] : -1;
+        [s appendFormat:@"probe cv=%@ layout=%@ sections=%ld items=%ld paging=%d bounces=%d bounds=(%.0f,%.0f) content=(%.0f,%.0f) off=%.0f\n",
+            NSStringFromClass(cv.class), NSStringFromClass(layout.class), (long)cv.numberOfSections, (long)items,
+            cv.pagingEnabled ? 1 : 0, cv.alwaysBounceHorizontal ? 1 : 0, cv.bounds.size.width, cv.bounds.size.height,
+            cv.contentSize.width, cv.contentSize.height, cv.contentOffset.x];
+        if ([layout isKindOfClass:UICollectionViewFlowLayout.class]) {
+            UICollectionViewFlowLayout *flow = (UICollectionViewFlowLayout *)layout;
+            [s appendFormat:@"probe flow itemSize=(%.0f,%.0f) dir=%ld line=%.1f inter=%.1f\n", flow.itemSize.width, flow.itemSize.height,
+                (long)flow.scrollDirection, flow.minimumLineSpacing, flow.minimumInteritemSpacing];
+        }
+        for (UICollectionViewCell *cell in cv.visibleCells) {
+            NSIndexPath *ip = [cv indexPathForCell:cell];
+            UIView *content = cell.contentView.subviews.firstObject;
+            UIResponder *r = content;
+            while (r && ![r isKindOfClass:UIViewController.class]) r = r.nextResponder;
+            [s appendFormat:@"probe cell %ld class=%@ f=(%.0f,%.0f,%.0f,%.0f) page=%@ pageParent=%@\n", (long)ip.item,
+                NSStringFromClass(cell.class), cell.frame.origin.x, cell.frame.origin.y, cell.frame.size.width, cell.frame.size.height,
+                r ? NSStringFromClass(r.class) : @"nil",
+                (r && ((UIViewController *)r).parentViewController) ? NSStringFromClass(((UIViewController *)r).parentViewController.class) : @"nil"];
+        }
+    } else if (pager) {
+        [s appendFormat:@"probe pager=%@ (not a collection view)\n", NSStringFromClass(pager.class)];
+    }
+    if (paging) {
+        for (UIViewController *child in paging.childViewControllers) {
+            [s appendFormat:@"probe pagingChild %@ loaded=%d superview=%@\n", NSStringFromClass(child.class), [child isViewLoaded] ? 1 : 0,
+                ([child isViewLoaded] && child.view.superview) ? NSStringFromClass(child.view.superview.class) : @"nil"];
+        }
+    }
     nfb_dumpTree(container ?: active, 0, s);
     return s;
 #else
@@ -1631,8 +1671,8 @@ static NSString *nfb_buildDiagnosticReport(void) {
     nfb_removeButton();
 }
 
-- (void)selectTimelineVariant:(id)variant shouldRefresh:(BOOL)shouldRefresh {
-    NSString *identifier = nfb_identifierForTimelineVariantArgument(variant);
+- (void)selectTimelineVariant:(NSInteger)variant shouldRefresh:(BOOL)shouldRefresh {
+    NSString *identifier = nfb_identifierForTimelineVariant(variant);
     if (identifier.length) {
         [[NSUserDefaults standardUserDefaults] setObject:identifier forKey:@"nfb_lastSelectedTimelineTabIdentifier"];
     }
