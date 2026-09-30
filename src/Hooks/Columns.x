@@ -12,6 +12,7 @@
 //  Like the 11.35 fork, columns live on their own bottom tab: one native tab (the "host",
 //  Communities by default) is relabelled "Columns". Tapping it shows the Home surface in columns;
 //  Home itself always stays the normal Home, and any other tab turns columns off again.
+//  While columns are shown, the Home segment strip and the Spaces bar are hidden (restored on leave).
 //
 //  Prefs: nfb_columns_enabled (the Columns tab), nfb_columns_host (page ID of the replaced tab),
 //  nfb_columns_full_width (iPad: drop the right trends pane via T1AppSplitViewController's own
@@ -30,6 +31,10 @@
 @interface T1AppSplitViewController : UIViewController
 @end
 @interface _TtC10TFNUISwiftP33_19E25DFCBFA569FDFA3E56F314F9A42420PagingCollectionView : UICollectionView
+@end
+@interface _TtC32TwitterHomeFeatureImplementation35HomeTimelineContainerViewController : UIViewController
+@end
+@interface T1FleetLineHeaderController : NSObject
 @end
 
 void NFBLogEvent(NSString *msg);
@@ -283,6 +288,29 @@ static NSString *nfb_colsIntIvarText(id obj, const char *name, BOOL optional) {
     return [NSString stringWithFormat:@"%ld", (long)*(const NSInteger *)p];
 }
 
+// Strong object-typed Swift stored property (e.g. barContainerView); never use for weak ones.
+static id nfb_colsObjectIvar(id obj, const char *name) {
+    if (!obj) return nil;
+    Ivar ivar = class_getInstanceVariable(object_getClass(obj), name);
+    return ivar ? object_getIvar(obj, ivar) : nil;
+}
+
+static NSHashTable *gNFBColsFleetHeaders = nil;   // T1FleetLineHeaderController (Spaces bar), weak
+
+// The vertical timeline scroll view of a column page (first table/collection view, breadth first).
+static UIScrollView *nfb_colsContentScrollViewOf(UIViewController *page) {
+    if (![page isViewLoaded]) return nil;
+    NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:page.view];
+    NSUInteger hops = 0;
+    while (queue.count && hops++ < 200) {
+        UIView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        if ([v isKindOfClass:UITableView.class] || [v isKindOfClass:UICollectionView.class]) return (UIScrollView *)v;
+        [queue addObjectsFromArray:v.subviews];
+    }
+    return nil;
+}
+
 BOOL NFBColumnsActive(void) {
     UICollectionView *cv = gNFBColsCollectionView;
     return nfb_colsActiveNow() && cv && cv.window;
@@ -380,9 +408,182 @@ NSString *NFBColumnsDiagnostic(void) {
             [s appendFormat:@"probe segmented tabs=%ld selected=%ld tabBarHideMode=%ld hPaging=%d tabBar=%@ window=(%.0f,%.0f,%.0f,%.0f) hidden=%d\n",
                 (long)tabs, (long)selected, (long)hideMode, hPaging ? 1 : 0, tabBar ? NSStringFromClass([tabBar class]) : @"nil",
                 tf.origin.x, tf.origin.y, tf.size.width, tf.size.height, [tabBar isKindOfClass:UIView.class] ? (((UIView *)tabBar).hidden ? 1 : 0) : -1];
+            // Top strip: container view, its height constraint, the bar inset the segmented adds to pages.
+            UIView *bar = nfb_colsObjectIvar(segmented, "barContainerView");
+            NSLayoutConstraint *height = nfb_colsObjectIvar(segmented, "barContainerHeightConstraint");
+            const uint8_t *adj = nfb_colsIvarPtr(segmented, "cachedBarInsetAdjustment");
+            CGRect bf = [bar isKindOfClass:UIView.class] ? [bar convertRect:bar.bounds toView:nil] : CGRectZero;
+            double barH = [segmented respondsToSelector:@selector(barHeight)] ? ((double(*)(id, SEL))objc_msgSend)(segmented, @selector(barHeight)) : -1.0;
+            double maxBarH = [segmented respondsToSelector:@selector(maximumBarHeight)] ? ((double(*)(id, SEL))objc_msgSend)(segmented, @selector(maximumBarHeight)) : -1.0;
+            id pagingScroll = [tabBar respondsToSelector:@selector(pagingScrollView)] ? ((id(*)(id, SEL))objc_msgSend)(tabBar, @selector(pagingScrollView)) : nil;
+            [s appendFormat:@"probe bar container=%@ super=%@ window=(%.0f,%.0f,%.0f,%.0f) hidden=%d heightConst=%@ barHeight=%.1f maxBarHeight=%.1f insetAdj=%.1f tabBarScroll=%@\n",
+                [bar isKindOfClass:UIView.class] ? NSStringFromClass(bar.class) : @"nil",
+                [bar isKindOfClass:UIView.class] && bar.superview ? NSStringFromClass(bar.superview.class) : @"nil",
+                bf.origin.x, bf.origin.y, bf.size.width, bf.size.height, [bar isKindOfClass:UIView.class] ? (bar.hidden ? 1 : 0) : -1,
+                [height isKindOfClass:NSLayoutConstraint.class] ? [NSString stringWithFormat:@"%.1f", height.constant] : @"nil",
+                barH, maxBarH, adj ? *(const double *)adj : -1.0, pagingScroll ? NSStringFromClass([pagingScroll class]) : @"nil"];
+            UINavigationController *nav = segmented.navigationController;
+            if (nav) {
+                UINavigationBar *navBar = nav.navigationBar;
+                CGRect nf = [navBar convertRect:navBar.bounds toView:nil];
+                [s appendFormat:@"probe nav %@ bar=%@ window=(%.0f,%.0f,%.0f,%.0f) hidden=%d navHidden=%d\n", NSStringFromClass(nav.class),
+                    NSStringFromClass(navBar.class), nf.origin.x, nf.origin.y, nf.size.width, nf.size.height, navBar.hidden ? 1 : 0,
+                    nav.navigationBarHidden ? 1 : 0];
+                // Everything drawn in the top band of the navigation controller's view (depth <= 3).
+                NSMutableArray<NSArray *> *queue = [NSMutableArray arrayWithObject:@[nav.view, @0]];
+                NSUInteger lines = 0;
+                while (queue.count && lines < 24) {
+                    UIView *v = queue.firstObject[0];
+                    NSInteger depth = [queue.firstObject[1] integerValue];
+                    [queue removeObjectAtIndex:0];
+                    CGRect wf = [v convertRect:v.bounds toView:nil];
+                    if (v != nav.view && CGRectGetMinY(wf) < 260.0 && wf.size.height > 0.5 && wf.size.height <= 260.0 && !v.hidden && v.alpha > 0.01) {
+                        [s appendFormat:@"probe top d=%ld %@ window=(%.0f,%.0f,%.0f,%.0f) alpha=%.2f\n", (long)depth, NSStringFromClass(v.class),
+                            wf.origin.x, wf.origin.y, wf.size.width, wf.size.height, v.alpha];
+                        lines++;
+                    }
+                    if (depth < 3 && !v.hidden && ![v isKindOfClass:UIScrollView.class]) {
+                        for (UIView *sub in v.subviews) [queue addObject:@[sub, @(depth + 1)]];
+                    }
+                }
+            }
+        }
+        for (NSDictionary *entry in NFBColumnsVisibleEntries()) {
+            UIScrollView *sv = nfb_colsContentScrollViewOf(entry[@"vc"]);
+            if (!sv) continue;
+            CGRect wf = [sv convertRect:sv.bounds toView:nil];
+            [s appendFormat:@"probe pageScroll item=%@ %@ window=(%.0f,%.0f,%.0f,%.0f) inset=%.0f adjusted=%.0f offY=%.0f\n", entry[@"item"],
+                NSStringFromClass(sv.class), wf.origin.x, wf.origin.y, wf.size.width, wf.size.height, sv.contentInset.top,
+                sv.adjustedContentInset.top, sv.contentOffset.y];
         }
     }
+    for (id header in gNFBColsFleetHeaders) {
+        BOOL (^b)(NSString *) = ^BOOL(NSString *name) {
+            SEL sel = NSSelectorFromString(name);
+            return [header respondsToSelector:sel] ? ((BOOL(*)(id, SEL))objc_msgSend)(header, sel) : NO;
+        };
+        double inset = [header respondsToSelector:@selector(fleetLineInset)] ? ((double(*)(id, SEL))objc_msgSend)(header, @selector(fleetLineInset)) : -1.0;
+        id parent = [header respondsToSelector:@selector(parentViewController)] ? ((id(*)(id, SEL))objc_msgSend)(header, @selector(parentViewController)) : nil;
+        [s appendFormat:@"probe spacesBar hidden=%d shouldBeHidden=%d inset=%.0f parent=%@\n", b(@"isHidden") ? 1 : 0,
+            b(@"shouldBeHidden") ? 1 : 0, inset, parent ? NSStringFromClass([parent class]) : @"nil"];
+    }
     return s;
+}
+
+#pragma mark - top chrome (segment strip, Spaces bar)
+
+// The Home segment strip (For You / Following / lists) sits in the segmented controller's
+// barContainerView, and the segmented adds its height to every page's top inset. In columns mode
+// the strip is useless (all pages are on screen) and its tab bar tracks the pager's scroll offset,
+// so: height 0 (barHeight / maximumBarHeight hooks + the container constraint), hidden, and
+// detached from the pager scroll view. Everything is saved once and restored on leave.
+static char kNFBColsSavedHiddenKey;        // NSNumber(hidden) on bar / tab bar / shadow view
+static char kNFBColsSavedConstantKey;      // NSNumber(constant) on the bar height constraint
+static char kNFBColsSavedPagingScrollKey;  // the tab bar's original pagingScrollView
+static char kNFBColsChromeAppliedKey;      // NSNumber(YES) on the segmented while applied
+
+static BOOL nfb_colsSegmentedIsHome(UIViewController *segmented) {
+    return segmented && nfb_colsParentNamed(segmented, @"HomeTimelineContainer") != nil;
+}
+
+static void nfb_colsHideView(UIView *view, BOOL hide) {
+    if (![view isKindOfClass:UIView.class]) return;
+    NSNumber *saved = objc_getAssociatedObject(view, &kNFBColsSavedHiddenKey);
+    if (hide) {
+        if (!saved) objc_setAssociatedObject(view, &kNFBColsSavedHiddenKey, @(view.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        view.hidden = YES;
+    } else if (saved) {
+        view.hidden = saved.boolValue;
+        objc_setAssociatedObject(view, &kNFBColsSavedHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+// Pages at (or pulled past) their top follow the inset change instead of keeping a 44pt gap /
+// sliding under the strip.
+static void nfb_colsAlignPagesToTop(UIViewController *pager, CGFloat slack) {
+    for (UIViewController *page in pager.childViewControllers) {
+        UIScrollView *sv = nfb_colsContentScrollViewOf(page);
+        if (!sv || sv.isDragging || sv.isDecelerating) continue;
+        CGFloat top = -sv.adjustedContentInset.top;
+        if (sv.contentOffset.y < top - 0.5 || sv.contentOffset.y <= top + slack) {
+            [sv setContentOffset:CGPointMake(sv.contentOffset.x, top) animated:NO];
+        }
+    }
+}
+
+static void nfb_colsUpdateFleetLines(void) {
+    for (id header in gNFBColsFleetHeaders.allObjects) {
+        @try {
+            if ([header respondsToSelector:@selector(_t1_updateFleetLineVisibility)]) {
+                ((void(*)(id, SEL))objc_msgSend)(header, @selector(_t1_updateFleetLineVisibility));
+            }
+            if ([header respondsToSelector:@selector(_t1_updateTopInsetIfNeeded)]) {
+                ((void(*)(id, SEL))objc_msgSend)(header, @selector(_t1_updateTopInsetIfNeeded));
+            }
+        } @catch (NSException *e) {
+            NFBLogEvent([NSString stringWithFormat:@"columns spacesBar update threw %@", e.name]);
+        }
+    }
+}
+
+static void nfb_colsSetTopChrome(UIViewController *pager, BOOL columns) {
+    UIViewController *segmented = nfb_colsSegmentedOfPager(pager);
+    if (!nfb_colsSegmentedIsHome(segmented) || ![segmented isViewLoaded]) return;
+    BOOL applied = objc_getAssociatedObject(segmented, &kNFBColsChromeAppliedKey) != nil;
+    if (!columns && !applied) return;   // never touch the stock Home that we did not change
+    UIView *bar = nfb_colsObjectIvar(segmented, "barContainerView");
+    UIView *shadow = nfb_colsObjectIvar(segmented, "shadowView");
+    NSLayoutConstraint *height = nfb_colsObjectIvar(segmented, "barContainerHeightConstraint");
+    if (![height isKindOfClass:NSLayoutConstraint.class]) height = nil;
+    id tabBar = [segmented respondsToSelector:@selector(tabBarView)] ? ((id(*)(id, SEL))objc_msgSend)(segmented, @selector(tabBarView)) : nil;
+    BOOL canDetach = [tabBar respondsToSelector:@selector(setPagingScrollView:)] && [tabBar respondsToSelector:@selector(pagingScrollView)];
+    CGFloat barHeight = height ? height.constant : 44.0;
+    if (columns) {
+        nfb_colsHideView(bar, YES);
+        nfb_colsHideView(shadow, YES);
+        nfb_colsHideView(tabBar, YES);
+        if (height && !objc_getAssociatedObject(height, &kNFBColsSavedConstantKey)) {
+            objc_setAssociatedObject(height, &kNFBColsSavedConstantKey, @(height.constant), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        height.constant = 0.0;
+        if (canDetach) {
+            id current = ((id(*)(id, SEL))objc_msgSend)(tabBar, @selector(pagingScrollView));
+            if (current && !objc_getAssociatedObject(tabBar, &kNFBColsSavedPagingScrollKey)) {
+                objc_setAssociatedObject(tabBar, &kNFBColsSavedPagingScrollKey, current, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            ((void(*)(id, SEL, id))objc_msgSend)(tabBar, @selector(setPagingScrollView:), nil);
+        }
+        objc_setAssociatedObject(segmented, &kNFBColsChromeAppliedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else {
+        nfb_colsHideView(bar, NO);
+        nfb_colsHideView(shadow, NO);
+        nfb_colsHideView(tabBar, NO);
+        NSNumber *constant = height ? objc_getAssociatedObject(height, &kNFBColsSavedConstantKey) : nil;
+        if (constant) {
+            height.constant = constant.doubleValue;
+            barHeight = constant.doubleValue;
+            objc_setAssociatedObject(height, &kNFBColsSavedConstantKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        id savedScroll = canDetach ? objc_getAssociatedObject(tabBar, &kNFBColsSavedPagingScrollKey) : nil;
+        if (savedScroll) {
+            ((void(*)(id, SEL, id))objc_msgSend)(tabBar, @selector(setPagingScrollView:), savedScroll);
+            objc_setAssociatedObject(tabBar, &kNFBColsSavedPagingScrollKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        objc_setAssociatedObject(segmented, &kNFBColsChromeAppliedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // Let the segmented re-measure its bar and re-apply the page insets.
+    [segmented viewSafeAreaInsetsDidChange];
+    [segmented.view setNeedsLayout];
+    [segmented.view layoutIfNeeded];
+    nfb_colsUpdateFleetLines();
+    nfb_colsAlignPagesToTop(pager, columns ? 1.0 : barHeight + 1.0);
+    __weak UIViewController *weakPager = pager;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Insets may be re-applied on the next layout pass rather than synchronously.
+        if (weakPager && nfb_colsActiveNow() == columns) nfb_colsAlignPagesToTop(weakPager, columns ? 1.0 : barHeight + 1.0);
+    });
+    NFBLogEvent([NSString stringWithFormat:@"columns topChrome on=%d bar=%@ const=%@ detach=%d", columns ? 1 : 0,
+        bar ? NSStringFromClass(bar.class) : @"nil", height ? [NSString stringWithFormat:@"%.0f", height.constant] : @"nil", canDetach ? 1 : 0]);
 }
 
 #pragma mark - apply / restore
@@ -496,6 +697,7 @@ static void nfb_colsApplyToPager(UIViewController *pager) {
         if (pageWidth > 1.0) [cv setContentOffset:CGPointMake(pageWidth * MAX(selected, 0), cv.contentOffset.y) animated:NO];
     }
     nfb_colsRefreshSplit(nfb_colsParentNamed(pager, @"HomeTimelineContainer"));
+    nfb_colsSetTopChrome(pager, on);
     NFBLogEvent([NSString stringWithFormat:@"columns apply on=%d cv=%@ items=%ld", on ? 1 : 0, NSStringFromClass(cv.class),
         (long)(cv.numberOfSections > 0 ? [cv numberOfItemsInSection:0] : -1)]);
 }
@@ -837,6 +1039,25 @@ void NFBColumnsShowManager(UIViewController *presenter) {
     [presenter presentViewController:nav animated:YES completion:nil];
 }
 
+#pragma mark - horizontal scroll stats (diagnostics)
+
+// One summary line per horizontal drag in columns mode: frame gaps (hitches), time spent in the
+// pager's own scrollViewDidScroll, layout invalidations/prepares and Home tab selections it caused.
+static struct {
+    NSUInteger frames, slow, invalidations, prepares, selects;
+    double lastT, maxGap, origMax, origTotal;
+} gNFBColsScroll;
+
+static void nfb_colsScrollStatsFlush(NSString *why) {
+    if (gNFBColsScroll.frames) {
+        NFBLogEvent([NSString stringWithFormat:@"columns scroll[%@] frames=%lu maxGapMs=%.0f slow(>25ms)=%lu didScrollMaxMs=%.1f didScrollTotalMs=%.0f suppressedInvalidations=%lu prepares=%lu selects=%lu",
+            why, (unsigned long)gNFBColsScroll.frames, gNFBColsScroll.maxGap * 1000.0, (unsigned long)gNFBColsScroll.slow,
+            gNFBColsScroll.origMax * 1000.0, gNFBColsScroll.origTotal * 1000.0, (unsigned long)gNFBColsScroll.invalidations,
+            (unsigned long)gNFBColsScroll.prepares, (unsigned long)gNFBColsScroll.selects]);
+    }
+    memset(&gNFBColsScroll, 0, sizeof(gNFBColsScroll));
+}
+
 #pragma mark - Hooks
 
 // Geometry: only for the Home pager's layout while columns mode is on; %orig otherwise.
@@ -888,10 +1109,18 @@ void NFBColumnsShowManager(UIViewController *presenter) {
 }
 
 - (BOOL)shouldInvalidateLayoutForBoundsChange:(CGRect)newBounds {
-    BOOL orig = %orig;
-    if (!nfb_colsActiveForLayout(self)) return orig;
+    if (!nfb_colsActiveForLayout(self)) return %orig;
+    // Column geometry depends only on the size; the stock paging layout also invalidates on every
+    // scroll step (origin change), which re-lays out all columns while swiping.
     CGSize old = self.collectionView.bounds.size;
-    return orig || fabs(old.width - newBounds.size.width) > 0.5 || fabs(old.height - newBounds.size.height) > 0.5;
+    BOOL resized = fabs(old.width - newBounds.size.width) > 0.5 || fabs(old.height - newBounds.size.height) > 0.5;
+    if (%orig && !resized) gNFBColsScroll.invalidations++;   // stock invalidations we suppressed
+    return resized;
+}
+
+- (void)prepareLayout {
+    %orig;
+    if (nfb_colsActiveForLayout(self)) gNFBColsScroll.prepares++;
 }
 
 - (CGPoint)targetContentOffsetForProposedContentOffset:(CGPoint)proposed withScrollingVelocity:(CGPoint)velocity {
@@ -954,9 +1183,32 @@ void NFBColumnsShowManager(UIViewController *presenter) {
     objc_setAssociatedObject(scrollView, &kNFBColsDesiredOffsetKey, @(snapped), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView {
+    if (!nfb_colsActiveNow() || scrollView != gNFBColsCollectionView ||
+        !(scrollView.isDragging || scrollView.isDecelerating || scrollView.isTracking)) {
+        %orig;
+        return;
+    }
+    CFTimeInterval t0 = CACurrentMediaTime();
+    if (gNFBColsScroll.lastT > 0.0) {
+        double gap = t0 - gNFBColsScroll.lastT;
+        if (gap < 1.0) {
+            if (gap > gNFBColsScroll.maxGap) gNFBColsScroll.maxGap = gap;
+            if (gap > 0.025) gNFBColsScroll.slow++;
+        }
+    }
+    %orig;
+    CFTimeInterval t1 = CACurrentMediaTime();
+    gNFBColsScroll.frames++;
+    gNFBColsScroll.origTotal += t1 - t0;
+    if (t1 - t0 > gNFBColsScroll.origMax) gNFBColsScroll.origMax = t1 - t0;
+    gNFBColsScroll.lastT = t1;
+}
+
 - (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
     %orig;
     if (!nfb_colsActiveNow() || !nfb_colsPagerIsHome(self)) return;
+    nfb_colsScrollStatsFlush(@"decel");
     NSNumber *desired = objc_getAssociatedObject(scrollView, &kNFBColsDesiredOffsetKey);
     if (desired && fabs(scrollView.contentOffset.x - desired.doubleValue) > 1.0) {
         [scrollView setContentOffset:CGPointMake(desired.doubleValue, scrollView.contentOffset.y) animated:YES];
@@ -967,6 +1219,7 @@ void NFBColumnsShowManager(UIViewController *presenter) {
 - (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
     %orig;
     if (decelerate || !nfb_colsActiveNow() || !nfb_colsPagerIsHome(self)) return;
+    nfb_colsScrollStatsFlush(@"drag");
     NSNumber *desired = objc_getAssociatedObject(scrollView, &kNFBColsDesiredOffsetKey);
     if (desired && fabs(scrollView.contentOffset.x - desired.doubleValue) > 1.0) {
         [scrollView setContentOffset:CGPointMake(desired.doubleValue, scrollView.contentOffset.y) animated:YES];
@@ -983,6 +1236,17 @@ void NFBColumnsShowManager(UIViewController *presenter) {
 - (void)unloadInvisibleViewControllers {
     if (nfb_colsActiveNow() && nfb_colsParentNamed(self, @"HomeTimelineContainer")) return;
     %orig;
+}
+
+// No segment strip in columns mode: the segmented sizes its bar (and the page top inset) from these.
+- (CGFloat)barHeight {
+    if (nfb_colsActiveNow() && objc_getAssociatedObject(self, &kNFBColsChromeAppliedKey)) return 0.0;
+    return %orig;
+}
+
+- (CGFloat)maximumBarHeight {
+    if (nfb_colsActiveNow() && objc_getAssociatedObject(self, &kNFBColsChromeAppliedKey)) return 0.0;
+    return %orig;
 }
 
 - (BOOL)pagingViewController:(id)pager isPrewarmableAt:(NSInteger)index {
@@ -1141,6 +1405,41 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
 %end
 
 // iPad full width (see nfb_colsWantNativeSplitTier).
+// Spaces bar (fleet line) above the Home timelines: hidden while columns are shown.
+static BOOL nfb_colsFleetHeaderIsHome(id header) {
+    id parent = [header respondsToSelector:@selector(parentViewController)] ?
+        ((id(*)(id, SEL))objc_msgSend)(header, @selector(parentViewController)) : nil;
+    return [parent isKindOfClass:UIViewController.class] && nfb_colsParentNamed(parent, @"HomeTimelineContainer") != nil;
+}
+
+%hook T1FleetLineHeaderController
+
+- (void)attachToViewController:(id)viewController {
+    %orig;
+    if (!gNFBColsFleetHeaders) gNFBColsFleetHeaders = [NSHashTable weakObjectsHashTable];
+    [gNFBColsFleetHeaders addObject:self];
+}
+
+- (BOOL)_t1_shouldShowFleetLine {
+    if (nfb_colsActiveNow() && nfb_colsFleetHeaderIsHome(self)) return NO;
+    return %orig;
+}
+
+%end
+
+// Which Home tab the pager reports as selected while columns are shown (diagnostics).
+%hook _TtC32TwitterHomeFeatureImplementation35HomeTimelineContainerViewController
+
+- (void)segmentedViewController:(id)segmented didSelectViewController:(id)viewController atIndex:(NSInteger)index previousIndex:(NSInteger)previousIndex trigger:(NSInteger)trigger {
+    %orig;
+    if (!nfb_colsActiveNow()) return;
+    gNFBColsScroll.selects++;
+    NFBLogEvent([NSString stringWithFormat:@"columns homeSelect index=%ld prev=%ld trigger=%ld vc=%@", (long)index, (long)previousIndex,
+        (long)trigger, viewController ? NSStringFromClass([viewController class]) : @"nil"]);
+}
+
+%end
+
 %hook T1AppSplitViewController
 
 - (BOOL)displayExtendedContent {
