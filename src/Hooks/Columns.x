@@ -36,6 +36,8 @@
 @end
 @interface T1FleetLineHeaderController : NSObject
 @end
+@interface TFNTableView : UITableView
+@end
 
 void NFBLogEvent(NSString *msg);
 void NFBStreamPrefsChanged(void);
@@ -298,7 +300,6 @@ static id nfb_colsObjectIvar(id obj, const char *name) {
 }
 
 static NSHashTable *gNFBColsFleetHeaders = nil;   // T1FleetLineHeaderController (Spaces bar), weak
-static CGFloat gNFBColsTopShift = 0.0;              // hidden strip height: columns are lifted by this
 
 // The vertical timeline scroll view of a column page (first table/collection view, breadth first).
 static UIScrollView *nfb_colsContentScrollViewOf(UIViewController *page) {
@@ -312,6 +313,10 @@ static UIScrollView *nfb_colsContentScrollViewOf(UIViewController *page) {
         [queue addObjectsFromArray:v.subviews];
     }
     return nil;
+}
+
+BOOL NFBColumnsTabEnabled(void) {
+    return nfb_colsEnabled();
 }
 
 BOOL NFBColumnsActive(void) {
@@ -400,6 +405,68 @@ static void nfb_colsSyncPageAppearance(BOOL columns) {
     if (changed) {
         NFBLogEvent([NSString stringWithFormat:@"columns pagesAppear on=%d changed=%lu current=%@", columns ? 1 : 0,
             (unsigned long)changed, current ? NSStringFromClass([current class]) : @"nil"]);
+    }
+}
+
+// Column timelines keep X's top inset minus the space of the rows we hide (segment strip, Spaces
+// bar): their first post starts right under the navigation bar. X sets the inset itself (also
+// later, e.g. when the Spaces bar changes), so TFNTableView's setContentInset: applies the fit and
+// remembers X's value to restore on leave. Insets are read/written with UIScrollView's own
+// accessors (TFNTableView overrides the getter).
+static char kNFBColsFittedTableKey;        // NSNumber(YES) on a column timeline while fitted
+static char kNFBColsTableStockTopKey;      // NSNumber: the top inset X asked for
+static NSHashTable<UIScrollView *> *gNFBColsFittedTables = nil;
+static BOOL gNFBColsSettingInset = NO;
+
+static UIEdgeInsets nfb_colsStoredInset(UIScrollView *sv) {
+    static UIEdgeInsets (*getter)(id, SEL) = NULL;
+    if (!getter) getter = (UIEdgeInsets(*)(id, SEL))class_getMethodImplementation(UIScrollView.class, @selector(contentInset));
+    return getter(sv, @selector(contentInset));
+}
+
+static CGFloat nfb_colsFittedTop(UIScrollView *sv, CGFloat stockTop) {
+    UINavigationBar *bar = nfb_colsSegmentedOfPager(gNFBColsPager).navigationController.navigationBar;
+    if (!bar.window || bar.hidden || !sv.window) return stockTop;
+    CGFloat navBottom = CGRectGetMaxY([bar convertRect:bar.bounds toView:nil]);
+    CGFloat tableTop = [sv.superview convertPoint:sv.frame.origin toView:nil].y;
+    return MIN(stockTop, MAX(0.0, navBottom - tableTop));   // only ever removes space
+}
+
+static void nfb_colsFitTable(UIScrollView *sv, BOOL columns) {
+    if (!sv) return;
+    UIEdgeInsets inset = nfb_colsStoredInset(sv);
+    BOOL atTop = sv.contentOffset.y <= -sv.adjustedContentInset.top + 1.0;
+    if (columns) {
+        if (!objc_getAssociatedObject(sv, &kNFBColsFittedTableKey)) {
+            objc_setAssociatedObject(sv, &kNFBColsFittedTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(sv, &kNFBColsTableStockTopKey, @(inset.top), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (!gNFBColsFittedTables) gNFBColsFittedTables = [NSHashTable weakObjectsHashTable];
+            [gNFBColsFittedTables addObject:sv];
+        }
+        NSNumber *stock = objc_getAssociatedObject(sv, &kNFBColsTableStockTopKey);
+        inset.top = nfb_colsFittedTop(sv, stock.doubleValue);
+    } else {
+        NSNumber *stock = objc_getAssociatedObject(sv, &kNFBColsTableStockTopKey);
+        objc_setAssociatedObject(sv, &kNFBColsFittedTableKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(sv, &kNFBColsTableStockTopKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!stock) return;
+        inset.top = stock.doubleValue;
+    }
+    if (fabs(inset.top - nfb_colsStoredInset(sv).top) < 0.5) return;
+    gNFBColsSettingInset = YES;
+    sv.contentInset = inset;
+    gNFBColsSettingInset = NO;
+    if (atTop && !sv.isDragging && !sv.isDecelerating) {
+        [sv setContentOffset:CGPointMake(sv.contentOffset.x, -sv.adjustedContentInset.top) animated:NO];
+    }
+}
+
+static void nfb_colsFitColumnTables(BOOL columns) {
+    if (columns) {
+        for (NSDictionary *entry in NFBColumnsAllEntries()) nfb_colsFitTable(nfb_colsContentScrollViewOf(entry[@"vc"]), YES);
+    } else {
+        for (UIScrollView *sv in gNFBColsFittedTables.allObjects) nfb_colsFitTable(sv, NO);
+        [gNFBColsFittedTables removeAllObjects];
     }
 }
 
@@ -561,14 +628,31 @@ static void nfb_colsHideView(UIView *view, BOOL hide) {
     }
 }
 
-static void nfb_colsUpdateFleetLines(void) {
+static BOOL nfb_colsFleetHeaderIsHome(id header) {
+    id parent = [header respondsToSelector:@selector(parentViewController)] ?
+        ((id(*)(id, SEL))objc_msgSend)(header, @selector(parentViewController)) : nil;
+    return [parent isKindOfClass:UIViewController.class] && nfb_colsParentNamed(parent, @"HomeTimelineContainer") != nil;
+}
+
+static UIView *nfb_colsFleetContainer(id header) {
+    id view = [header respondsToSelector:@selector(fleetLineContainerView)] ?
+        ((id(*)(id, SEL))objc_msgSend)(header, @selector(fleetLineContainerView)) : nil;
+    return [view isKindOfClass:UIView.class] ? view : nil;
+}
+
+// Spaces bar (fleet line, a row in the same stack view as the segment strip). X re-shows it when
+// live Spaces arrive, so while columns are shown its container stays hidden (see the hooks below).
+static void nfb_colsUpdateFleetLines(BOOL columns) {
     for (id header in gNFBColsFleetHeaders.allObjects) {
+        if (!nfb_colsFleetHeaderIsHome(header)) continue;
         @try {
-            if ([header respondsToSelector:@selector(_t1_updateFleetLineVisibility)]) {
-                ((void(*)(id, SEL))objc_msgSend)(header, @selector(_t1_updateFleetLineVisibility));
-            }
-            if ([header respondsToSelector:@selector(_t1_updateTopInsetIfNeeded)]) {
-                ((void(*)(id, SEL))objc_msgSend)(header, @selector(_t1_updateTopInsetIfNeeded));
+            if (columns) {
+                nfb_colsHideView(nfb_colsFleetContainer(header), YES);
+            } else {
+                nfb_colsHideView(nfb_colsFleetContainer(header), NO);
+                if ([header respondsToSelector:@selector(_t1_updateFleetLineVisibility)]) {
+                    ((void(*)(id, SEL))objc_msgSend)(header, @selector(_t1_updateFleetLineVisibility));
+                }
             }
         } @catch (NSException *e) {
             NFBLogEvent([NSString stringWithFormat:@"columns spacesBar update threw %@", e.name]);
@@ -586,14 +670,13 @@ static void nfb_colsSetTopChrome(UIViewController *pager, BOOL columns) {
     if (columns && applied) {
         nfb_colsHideView(bar, YES);
         nfb_colsHideView(shadow, YES);
+        nfb_colsUpdateFleetLines(YES);
         return;
     }
     NSLayoutConstraint *height = nfb_colsObjectIvar(segmented, "barContainerHeightConstraint");
     if (![height isKindOfClass:NSLayoutConstraint.class]) height = nil;
     id tabBar = [segmented respondsToSelector:@selector(tabBarView)] ? ((id(*)(id, SEL))objc_msgSend)(segmented, @selector(tabBarView)) : nil;
     BOOL canDetach = [tabBar respondsToSelector:@selector(setPagingScrollView:)] && [tabBar respondsToSelector:@selector(pagingScrollView)];
-    NSNumber *savedConstant = height ? objc_getAssociatedObject(height, &kNFBColsSavedConstantKey) : nil;
-    CGFloat barHeight = savedConstant ? savedConstant.doubleValue : (height ? height.constant : 44.0);
     if (columns) {
         nfb_colsHideView(bar, YES);
         nfb_colsHideView(shadow, YES);
@@ -601,7 +684,6 @@ static void nfb_colsSetTopChrome(UIViewController *pager, BOOL columns) {
         if (height && !objc_getAssociatedObject(height, &kNFBColsSavedConstantKey)) {
             objc_setAssociatedObject(height, &kNFBColsSavedConstantKey, @(height.constant), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-        gNFBColsTopShift = MAX(0.0, MIN(barHeight, 120.0));
         height.constant = 0.0;
         if (canDetach) {
             id current = ((id(*)(id, SEL))objc_msgSend)(tabBar, @selector(pagingScrollView));
@@ -626,20 +708,15 @@ static void nfb_colsSetTopChrome(UIViewController *pager, BOOL columns) {
             objc_setAssociatedObject(tabBar, &kNFBColsSavedPagingScrollKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         objc_setAssociatedObject(segmented, &kNFBColsChromeAppliedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        gNFBColsTopShift = 0.0;
     }
     // Let the segmented re-measure its bar and re-apply the page insets.
     [segmented viewSafeAreaInsetsDidChange];
     [segmented.view setNeedsLayout];
     [segmented.view layoutIfNeeded];
-    nfb_colsUpdateFleetLines();
-    // The pages keep their stock top inset (nav bar + strip); the layout lifts the columns by the
-    // strip height instead (see layoutAttributesForItemAtIndexPath:), so no inset is rewritten.
-    UICollectionView *cv = nfb_colsCollectionViewOfPager(pager);
-    [cv.collectionViewLayout invalidateLayout];
-    NFBLogEvent([NSString stringWithFormat:@"columns topChrome on=%d bar=%@ const=%@ shift=%.0f detach=%d", columns ? 1 : 0,
+    nfb_colsUpdateFleetLines(columns);
+    NFBLogEvent([NSString stringWithFormat:@"columns topChrome on=%d bar=%@ const=%@ detach=%d", columns ? 1 : 0,
         bar ? NSStringFromClass(bar.class) : @"nil", height ? [NSString stringWithFormat:@"%.0f", height.constant] : @"nil",
-        gNFBColsTopShift, canDetach ? 1 : 0]);
+        canDetach ? 1 : 0]);
 }
 
 #pragma mark - apply / restore
@@ -812,12 +889,18 @@ static NSString *nfb_colsTabTitle(void) {
 }
 
 // Re-apply label + selection highlight on every tab view (our hooks do the actual forcing).
-static void nfb_colsRefreshTabViews(UIViewController *tabBarController) {
-    for (T1TabView *tabView in nfb_colsTabViews(tabBarController)) {
-        if (![tabView isKindOfClass:NSClassFromString(@"T1TabView")]) continue;
+// Re-applies each tab's highlight: while columns are shown the setSelected: hook marks the host;
+// otherwise the tab the navigation controller really has selected (leaving columns used to keep
+// Home un-highlighted, which also hid the stream button on Home).
+static void nfb_colsRefreshTabViews(UIViewController *nav, UIViewController *tabBarController) {
+    NSInteger selected = [nav respondsToSelector:@selector(selectedIndex)] ?
+        ((NSInteger(*)(id, SEL))objc_msgSend)(nav, @selector(selectedIndex)) : NSNotFound;
+    [nfb_colsTabViews(tabBarController) enumerateObjectsUsingBlock:^(T1TabView *tabView, NSUInteger idx, BOOL *stop) {
+        if (![tabView isKindOfClass:NSClassFromString(@"T1TabView")]) return;
         if ([tabView respondsToSelector:@selector(_t1_updateTitleLabel)]) [tabView _t1_updateTitleLabel];
-        ((void(*)(id, SEL, BOOL))objc_msgSend)(tabView, @selector(setSelected:), tabView.isSelected);
-    }
+        BOOL isSelected = selected != NSNotFound ? (NSInteger)idx == selected : tabView.isSelected;
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(tabView, @selector(setSelected:), isSelected);
+    }];
 }
 
 // The host tab has to be in the tab bar: add it to the custom tab selection if it is missing.
@@ -853,7 +936,10 @@ static void nfb_colsSetActiveOnNav(BOOL active, UIViewController *nav, UIViewCon
         }
     }
     BOOL changed = gNFBColsActive != active;
-    if (!active && changed) nfb_colsSyncPageAppearance(NO);
+    if (!active && changed) {
+        nfb_colsSyncPageAppearance(NO);
+        nfb_colsFitColumnTables(NO);
+    }
     gNFBColsActive = active;
     [NSUserDefaults.standardUserDefaults setBool:active forKey:@"nfb_columns_session"];
     nfb_colsApplyToHome();
@@ -863,12 +949,13 @@ static void nfb_colsSetActiveOnNav(BOOL active, UIViewController *nav, UIViewCon
             if (!nfb_colsActiveNow()) return;
             nfb_colsApplyToHome();
             nfb_colsSyncPageAppearance(YES);
+            nfb_colsFitColumnTables(YES);
         });
         nfb_colsScheduleKick();
     } else if ([nav respondsToSelector:@selector(_t1_syncTabBarSelectionWithSelectedController)]) {
         ((void(*)(id, SEL))objc_msgSend)(nav, @selector(_t1_syncTabBarSelectionWithSelectedController));
     }
-    nfb_colsRefreshTabViews(tabBarController);
+    nfb_colsRefreshTabViews(nav, tabBarController);
     NFBNoteTabSelectionChanged();
     NFBStreamPrefsChanged();
     if (changed) NFBLogEvent([NSString stringWithFormat:@"columns tab active=%d", active ? 1 : 0]);
@@ -887,13 +974,14 @@ void NFBColumnsPrefsChanged(void) {
     if (!gNFBColsEnabled && gNFBColsActive) nfb_colsSetActiveOnNav(NO, nav, tabBarController);
     nfb_colsEnsureHostVisible(nav);
     nfb_colsApplyToHome();
-    nfb_colsRefreshTabViews(tabBarController);
+    nfb_colsRefreshTabViews(nav, tabBarController);
     NFBNoteTabSelectionChanged();
     NFBStreamPrefsChanged();
 }
 
 // Empty columns: pages that were never "current" may not have fetched yet. Nudge each once.
 static void nfb_colsKickEmptyPages(void) {
+    if (nfb_colsActiveNow()) nfb_colsFitColumnTables(YES);
     for (NSDictionary *entry in NFBColumnsVisibleEntries()) {
         UIViewController *page = entry[@"vc"];
         if (![page isViewLoaded] || objc_getAssociatedObject(page, &kNFBColsKickedKey)) continue;
@@ -1147,10 +1235,7 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
     CGRect frame = orig ? orig.frame : CGRectMake(0.0, 0.0, cw, cv.bounds.size.height);
     NSNumber *slot = model.slotOfItem[@(indexPath.item)];
     if (slot) {
-        // Lifted by the hidden strip height: the page keeps its stock top inset (nav bar + strip),
-        // so its first row now starts right under the navigation bar.
-        CGFloat shift = gNFBColsTopShift;
-        attrs.frame = CGRectMake(cw * slot.doubleValue, frame.origin.y - shift, cw, frame.size.height + shift);
+        attrs.frame = CGRectMake(cw * slot.doubleValue, frame.origin.y, cw, frame.size.height);
         attrs.hidden = NO;
     } else {
         attrs.frame = CGRectMake(-cw * 4.0, frame.origin.y, cw, frame.size.height);
@@ -1402,7 +1487,39 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
     return fixed;
 }
 
+%hook TFNTableView
+
+- (void)setContentInset:(UIEdgeInsets)inset {
+    if (gNFBColsActive && objc_getAssociatedObject(self, &kNFBColsFittedTableKey)) {
+        if (!gNFBColsSettingInset) {
+            objc_setAssociatedObject(self, &kNFBColsTableStockTopKey, @(inset.top), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        NSNumber *stock = objc_getAssociatedObject(self, &kNFBColsTableStockTopKey);
+        inset.top = nfb_colsFittedTop(self, stock ? stock.doubleValue : inset.top);
+    }
+    %orig(inset);
+}
+
+%end
+
 %hook _TtC10TFNUISwiftP33_19E25DFCBFA569FDFA3E56F314F9A42420PagingCollectionView
+
+// Columns: a horizontal swipe moves columns, a vertical one scrolls the timeline under the finger,
+// never both at once (X lets the pager pan run together with the page's vertical pan and then
+// locks the axis in its own scroll callbacks, which columns mode skips).
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gesture {
+    if (nfb_colsActiveNow() && self == gNFBColsCollectionView && gesture == self.panGestureRecognizer) {
+        CGPoint v = [self.panGestureRecognizer velocityInView:self];
+        if (fabs(v.y) > fabs(v.x)) return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    if (nfb_colsActiveNow() && self == gNFBColsCollectionView && gesture == self.panGestureRecognizer &&
+        [other.view isKindOfClass:UIScrollView.class] && other.view != self) return NO;
+    return %orig;
+}
 
 - (void)setContentOffset:(CGPoint)offset {
     offset.x = nfb_colsFixProgrammaticOffset(self, offset.x, NO);
@@ -1495,12 +1612,6 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
 
 // iPad full width (see nfb_colsWantNativeSplitTier).
 // Spaces bar (fleet line) above the Home timelines: hidden while columns are shown.
-static BOOL nfb_colsFleetHeaderIsHome(id header) {
-    id parent = [header respondsToSelector:@selector(parentViewController)] ?
-        ((id(*)(id, SEL))objc_msgSend)(header, @selector(parentViewController)) : nil;
-    return [parent isKindOfClass:UIViewController.class] && nfb_colsParentNamed(parent, @"HomeTimelineContainer") != nil;
-}
-
 %hook T1FleetLineHeaderController
 
 - (void)attachToViewController:(id)viewController {
@@ -1512,6 +1623,16 @@ static BOOL nfb_colsFleetHeaderIsHome(id header) {
 - (BOOL)_t1_shouldShowFleetLine {
     if (nfb_colsActiveNow() && nfb_colsFleetHeaderIsHome(self)) return NO;
     return %orig;
+}
+
+- (void)showAnimated {
+    if (nfb_colsActiveNow() && nfb_colsFleetHeaderIsHome(self)) return;
+    %orig;
+}
+
+- (void)_t1_updateFleetLineVisibility {
+    %orig;
+    if (nfb_colsActiveNow() && nfb_colsFleetHeaderIsHome(self)) nfb_colsHideView(nfb_colsFleetContainer(self), YES);
 }
 
 %end

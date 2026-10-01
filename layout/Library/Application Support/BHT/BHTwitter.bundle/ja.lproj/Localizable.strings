@@ -460,7 +460,6 @@
 "NFB_SECONDS_FMT" = "%ld秒";
 "NFB_STREAM_BUTTON_A11Y" = "TL自動更新";
 "NFB_STREAM_MENU_STATUS" = "状態: %@ ／ 間隔: %ld秒";
-"NFB_STREAM_THROTTLED" = "本体が熱いため、いまは %ld 秒ごとに更新しています";
 "NFB_STREAM_MENU_TITLE" = "TL自動更新（垂れ流し）";
 "NFB_STREAM_OFF" = "自動更新を OFF にする";
 "NFB_STREAM_ON" = "自動更新を ON にする";

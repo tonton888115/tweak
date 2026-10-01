@@ -23,6 +23,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <stdio.h>
+#include <mach/mach.h>
+#include <pthread.h>
 
 // Diagnostics report (long-press → 🔍). ON unless the build defines NFB_DIAG=0.
 #ifndef NFB_DIAG
@@ -42,7 +44,6 @@ static void nfb_streamStop(UIViewController *vc);
 static UIViewController *nfb_selectedTimelineVC(UIViewController *vc);
 static void nfb_streamTrigger(UIViewController *vc);
 static void nfb_styleButton(BOOL on);
-static BOOL nfb_streamThrottled(void);
 static void nfb_updateGauge(BOOL on, NSTimeInterval interval);
 static void nfb_updateStreamStateIconForVC(UIViewController *vc);
 static NSString *nfb_currentSelectedTabPage(void);
@@ -63,6 +64,7 @@ void NFBLogSnapshot(NSString *reason);
 void NFBStreamPrefsChanged(void);
 // Columns.x
 BOOL NFBColumnsActive(void);
+BOOL NFBColumnsTabEnabled(void);
 NSArray<NSDictionary *> *NFBColumnsVisibleEntries(void);
 NSArray<NSDictionary *> *NFBColumnsAllEntries(void);
 NSInteger NFBColumnsPageRecommended(UIViewController *vc);
@@ -89,17 +91,6 @@ static NSInteger nfb_streamInterval(void) {
     // Seconds between auto-refreshes. Default 20s; floor 5s (X timeline rate limits).
     NSInteger seconds = [BHTSettings integerForKey:kNFBStreamIntervalKey];
     return seconds >= 5 ? seconds : 20;
-}
-// The timer runs at the user's interval unless the phone is hot or in Low Power Mode: each tick
-// refreshes every visible column (network + parsing + cell layout), which is what heats it up.
-static NSTimeInterval nfb_effectiveStreamInterval(void) {
-    NSTimeInterval interval = (NSTimeInterval)nfb_streamInterval();
-    NSProcessInfo *info = NSProcessInfo.processInfo;
-    NSProcessInfoThermalState thermal = info.thermalState;
-    if (thermal >= NSProcessInfoThermalStateCritical) return MAX(interval, 60.0);
-    if (thermal >= NSProcessInfoThermalStateSerious || info.isLowPowerModeEnabled) return MAX(interval, 30.0);
-    if (thermal >= NSProcessInfoThermalStateFair) return MAX(interval, 10.0);
-    return interval;
 }
 static void nfb_setStreamEnabled(BOOL on) {
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:kNFBStreamEnabledKey];
@@ -1194,10 +1185,6 @@ static void nfb_installCrashLoggerOnce(void) {
     BOOL on = nfb_streamEnabled();
     NSInteger iv = nfb_streamInterval();
     NSString *status = [NSString stringWithFormat:nfb_loc(@"NFB_STREAM_MENU_STATUS", @"Status: %@ / interval: %lds"), on ? @"ON" : @"OFF", (long)iv];
-    if (on && nfb_streamThrottled()) {
-        status = [status stringByAppendingFormat:@"\n%@", [NSString stringWithFormat:nfb_loc(@"NFB_STREAM_THROTTLED",
-            @"Phone is warm: refreshing every %lds for now"), (long)nfb_effectiveStreamInterval()]];
-    }
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:nfb_loc(@"NFB_STREAM_MENU_TITLE", @"Auto-refresh timeline (streaming)")
         message:status
         preferredStyle:UIAlertControllerStyleActionSheet];
@@ -1314,19 +1301,13 @@ static void nfb_installCrashLoggerOnce(void) {
 
 #pragma mark - button visuals + lifecycle
 
-static BOOL nfb_streamThrottled(void) {
-    return nfb_effectiveStreamInterval() > (NSTimeInterval)nfb_streamInterval() + 0.5;
-}
-
-// On: the ring depletes over the interval in use and the centre shows its seconds (orange while the
-// interval is stretched because the phone is hot / in Low Power Mode). Off: a grey refresh arrow.
+// On: the ring depletes over the interval and the centre shows its seconds. Off: a grey refresh arrow.
 static void nfb_styleButton(BOOL on) {
     if (!gStreamButton) return;
-    BOOL throttled = on && nfb_streamThrottled();
-    UIColor *accent = throttled ? UIColor.systemOrangeColor : UIColor.systemBlueColor;
+    UIColor *accent = UIColor.systemBlueColor;
     if (on) {
         [gStreamButton setImage:nil forState:UIControlStateNormal];
-        NSString *seconds = [NSString stringWithFormat:@"%.0f", nfb_effectiveStreamInterval()];
+        NSString *seconds = [NSString stringWithFormat:@"%ld", (long)nfb_streamInterval()];
         UIFont *font = [UIFont monospacedDigitSystemFontOfSize:(seconds.length > 2 ? 12.0 : 15.0) weight:UIFontWeightBold];
         [gStreamButton setAttributedTitle:[[NSAttributedString alloc] initWithString:seconds
             attributes:@{ NSFontAttributeName: font, NSForegroundColorAttributeName: accent }] forState:UIControlStateNormal];
@@ -1400,18 +1381,16 @@ static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
     UIViewController *target = vc ? (nfb_selectedTimelineVC(vc) ?: vc) : nil;
     BOOL globalOn = nfb_streamEnabled();
     BOOL active = nfb_streamCanRunForTarget(target);
-    BOOL throttled = globalOn && nfb_streamThrottled();
-    NSInteger state = active ? (throttled ? 3 : 2) : (globalOn ? 1 : 0);
+    NSInteger state = active ? 2 : (globalOn ? 1 : 0);
     // Only touch UIKit when the state actually changes (this runs from scroll callbacks).
     static NSInteger lastState = -1;
     if (state == lastState && gStreamStateIcon.image && !gStreamStateIcon.hidden) return;
     lastState = state;
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightSemibold];
-    NSString *name = state == 3 ? @"thermometer.medium" : (active ? @"bolt.circle.fill" : (globalOn ? @"pause.circle.fill" : @"power.circle"));
-    UIImage *image = [UIImage systemImageNamed:name withConfiguration:cfg] ?: [UIImage systemImageNamed:@"bolt.circle.fill" withConfiguration:cfg];
+    NSString *name = active ? @"bolt.circle.fill" : (globalOn ? @"pause.circle.fill" : @"power.circle");
+    UIImage *image = [UIImage systemImageNamed:name withConfiguration:cfg];
     gStreamStateIcon.image = [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
-    gStreamStateIcon.tintColor = state == 3 ? [UIColor systemOrangeColor] :
-        (active ? [UIColor systemGreenColor] : (globalOn ? [UIColor systemOrangeColor] : [UIColor systemGrayColor]));
+    gStreamStateIcon.tintColor = active ? [UIColor systemGreenColor] : (globalOn ? [UIColor systemOrangeColor] : [UIColor systemGrayColor]);
     gStreamStateIcon.accessibilityLabel = active ? nfb_loc(@"NFB_STREAM_STATE_ON", @"Streaming active") : nfb_loc(@"NFB_STREAM_STATE_PAUSED", @"Streaming paused");
     gStreamStateIcon.hidden = NO;
 }
@@ -1474,7 +1453,7 @@ static void nfb_installButton(UIWindow *win) {
     gStreamButton.userInteractionEnabled = YES;
     BOOL on = nfb_streamEnabled();
     nfb_styleButton(on);
-    nfb_updateGauge(on, nfb_effectiveStreamInterval());
+    nfb_updateGauge(on, (NSTimeInterval)nfb_streamInterval());
     NFBUpdateStreamButtonVisibility();
     nfb_updateStreamStateIconForVC(gActiveItemsVC);
 }
@@ -1631,8 +1610,9 @@ static BOOL nfb_homeTabSelectedOrUnknown(void) {
     NSString *page = nfb_currentSelectedTabPage();
     if (page.length) {
         if ([page isEqualToString:@"home"]) return YES;
-        // The Columns tab shows the Home surface while its (host) tab is highlighted.
-        return NFBColumnsActive() && [page isEqualToString:NFBColumnsHostPageID()];
+        // The host tab never opens its own page: whenever it reads as selected, the Home surface is
+        // underneath (columns, or a highlight that has not caught up after leaving columns yet).
+        return NFBColumnsTabEnabled() && [page isEqualToString:NFBColumnsHostPageID()];
     }
     return gActiveItemsVC && [gActiveItemsVC isViewLoaded] && gActiveItemsVC.view.window;
 }
@@ -1688,25 +1668,83 @@ static void nfb_streamStop(UIViewController *vc) {
     gNFBStreamTimerInterval = 0.0;
 }
 
-static void nfb_observePowerStateOnce(void) {
+// Process health for the heat question: iOS does not let an app see other processes, but if X's
+// own CPU stays low while the phone is hot, the heat comes from elsewhere (charging, other apps,
+// background system work). cpu = current (sum of thread usage), avg = since launch.
+static CFTimeInterval gNFBLaunchTime = 0.0;
+__attribute__((constructor)) static void nfb_noteLaunchTime(void) { gNFBLaunchTime = CACurrentMediaTime(); }
+
+static NSString *nfb_healthLine(void) {
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t count = 0;
+    double now = 0.0;
+    double best[3] = {0.0, 0.0, 0.0};
+    NSString *names[3] = {@"-", @"-", @"-"};
+    if (task_threads(mach_task_self(), &threads, &count) == KERN_SUCCESS) {
+        for (mach_msg_type_number_t i = 0; i < count; i++) {
+            thread_basic_info_data_t info;
+            mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&info, &n) == KERN_SUCCESS && !(info.flags & TH_FLAGS_IDLE)) {
+                double usage = info.cpu_usage / (double)TH_USAGE_SCALE * 100.0;
+                now += usage;
+                for (int k = 0; k < 3; k++) {
+                    if (usage <= best[k]) continue;
+                    for (int m = 2; m > k; m--) { best[m] = best[m - 1]; names[m] = names[m - 1]; }
+                    best[k] = usage;
+                    char name[64] = {0};
+                    pthread_t pt = pthread_from_mach_thread_np(threads[i]);
+                    if (pt) pthread_getname_np(pt, name, sizeof(name));
+                    names[k] = (pt && pthread_main_np() && pt == pthread_self() && [NSThread isMainThread]) ? @"main" :
+                        (name[0] ? [NSString stringWithUTF8String:name] : [NSString stringWithFormat:@"t%u", i]);
+                    break;
+                }
+            }
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
+    }
+    double cpuSeconds = 0.0;
+    struct mach_task_basic_info basic;   // user/system time of threads that already exited
+    mach_msg_type_number_t bn = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&basic, &bn) == KERN_SUCCESS) {
+        cpuSeconds += basic.user_time.seconds + basic.user_time.microseconds / 1e6 + basic.system_time.seconds + basic.system_time.microseconds / 1e6;
+    }
+    task_thread_times_info_data_t live;
+    mach_msg_type_number_t ln = TASK_THREAD_TIMES_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO, (task_info_t)&live, &ln) == KERN_SUCCESS) {
+        cpuSeconds += live.user_time.seconds + live.user_time.microseconds / 1e6 + live.system_time.seconds + live.system_time.microseconds / 1e6;
+    }
+    task_vm_info_data_t vm;
+    mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
+    double footprintMB = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &vn) == KERN_SUCCESS ? vm.phys_footprint / 1048576.0 : -1.0;
+    double wall = gNFBLaunchTime > 0.0 ? CACurrentMediaTime() - gNFBLaunchTime : 0.0;
+    NSProcessInfo *info = NSProcessInfo.processInfo;
+    return [NSString stringWithFormat:@"health cpu=%.0f%% avg=%.0f%% (over %.0fs) top=%@ %.0f%%, %@ %.0f%%, %@ %.0f%% threads=%u mem=%.0fMB thermal=%ld lowPower=%d",
+        now, wall > 1.0 ? cpuSeconds / wall * 100.0 : -1.0, wall, names[0], best[0], names[1], best[1], names[2], best[2],
+        count, footprintMB, (long)info.thermalState, info.isLowPowerModeEnabled ? 1 : 0];
+}
+
+// One line every 30s into the session log (cheap: a thread list walk) plus every thermal change.
+static void nfb_startHealthLogOnce(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        void (^changed)(NSNotification *) = ^(__unused NSNotification *n) {
-            NSProcessInfo *info = NSProcessInfo.processInfo;
-            NFBLogEvent([NSString stringWithFormat:@"stream power thermal=%ld lowPower=%d effective=%.0fs", (long)info.thermalState,
-                info.isLowPowerModeEnabled ? 1 : 0, nfb_effectiveStreamInterval()]);
-            NFBStreamPrefsChanged();   // restart the timer at the new effective interval
-        };
-        NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-        [nc addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:changed];
-        [nc addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:changed];
+        if (gNFBLaunchTime <= 0.0) gNFBLaunchTime = CACurrentMediaTime();
+        NSTimer *timer = [NSTimer timerWithTimeInterval:30.0 repeats:YES block:^(__unused NSTimer *t) {
+            NFBLogEvent(nfb_healthLine());
+        }];
+        timer.tolerance = 5.0;
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+        [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil
+            queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n) {
+            NFBLogEvent([@"thermal changed: " stringByAppendingString:nfb_healthLine()]);
+        }];
     });
 }
 
 static void nfb_streamStart(UIViewController *vc) {
     BOOL on = nfb_streamEnabled();
-    nfb_observePowerStateOnce();
-    NSTimeInterval interval = nfb_effectiveStreamInterval();
+    nfb_startHealthLogOnce();
+    NSTimeInterval interval = (NSTimeInterval)nfb_streamInterval();
     nfb_styleButton(on);
     if (!on) {
         nfb_streamStop(nil);
@@ -1848,12 +1886,11 @@ static NSString *nfb_buildDiagnosticReport(void) {
     BOOL homeSelected = nfb_resp(container, @selector(isHomeSelected)) ?
         ((BOOL(*)(id, SEL))objc_msgSend)(container, @selector(isHomeSelected)) : NO;
     CGRect bf = gStreamButton.window ? [gStreamButton convertRect:gStreamButton.bounds toView:nil] : CGRectZero;
-    NSProcessInfo *info = NSProcessInfo.processInfo;
     NSArray *winSubviews = gStreamButton.window.subviews;
     NSUInteger buttonIndex = winSubviews ? [winSubviews indexOfObject:gStreamButton] : NSNotFound;
-    [s appendFormat:@"streaming on=%d interval=%ld effective=%.0f thermal=%ld lowPower=%d page=%@ button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",
-        nfb_streamEnabled() ? 1 : 0, (long)nfb_streamInterval(), nfb_effectiveStreamInterval(), (long)info.thermalState,
-        info.isLowPowerModeEnabled ? 1 : 0, nfb_currentSelectedTabPage() ?: @"(nil)", gStreamButton ? 1 : 0,
+    [s appendFormat:@"%@\n", nfb_healthLine()];
+    [s appendFormat:@"streaming on=%d interval=%ld page=%@ button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",
+        nfb_streamEnabled() ? 1 : 0, (long)nfb_streamInterval(), nfb_currentSelectedTabPage() ?: @"(nil)", gStreamButton ? 1 : 0,
         (gStreamButton && !gStreamButton.hidden) ? 1 : 0, gStreamButton ? gStreamButton.alpha : -1.0, gStreamButton.window ? 1 : 0,
         bf.origin.x, bf.origin.y, bf.size.width, bf.size.height,
         buttonIndex == NSNotFound ? -1L : (long)buttonIndex, (unsigned long)winSubviews.count];

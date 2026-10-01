@@ -464,7 +464,6 @@
 "NFB_SECONDS_FMT" = "%lds";
 "NFB_STREAM_BUTTON_A11Y" = "Timeline auto-refresh";
 "NFB_STREAM_MENU_STATUS" = "Status: %@ / interval: %lds";
-"NFB_STREAM_THROTTLED" = "Phone is warm: refreshing every %lds for now";
 "NFB_STREAM_MENU_TITLE" = "Auto-refresh timeline (streaming)";
 "NFB_STREAM_OFF" = "Turn auto-refresh OFF";
 "NFB_STREAM_ON" = "Turn auto-refresh ON";
