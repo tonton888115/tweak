@@ -36,8 +36,6 @@
 @end
 @interface T1FleetLineHeaderController : NSObject
 @end
-@interface TFNTableView : UITableView
-@end
 
 void NFBLogEvent(NSString *msg);
 void NFBStreamPrefsChanged(void);
