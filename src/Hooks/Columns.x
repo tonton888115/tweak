@@ -367,6 +367,42 @@ NSArray<NSDictionary *> *NFBColumnsAllEntries(void) {
     return entries;
 }
 
+// The pager only tells its *current* page that it appeared; a timeline that never "appeared" does
+// not load (why a list first opened on Home showed fine in columns, and others stayed stale).
+// While columns are shown every column page gets an appearance transition; leaving undoes it for
+// all but the pager's current page, so appearance stays balanced.
+static NSHashTable<UIViewController *> *gNFBColsAppeared = nil;
+
+static void nfb_colsSyncPageAppearance(BOOL columns) {
+    UIViewController *segmented = nfb_colsSegmentedOfPager(gNFBColsPager);
+    id current = [segmented respondsToSelector:@selector(selectedViewController)] ?
+        ((id(*)(id, SEL))objc_msgSend)(segmented, @selector(selectedViewController)) : nil;
+    NSUInteger changed = 0;
+    if (columns) {
+        if (!gNFBColsAppeared) gNFBColsAppeared = [NSHashTable weakObjectsHashTable];
+        for (NSDictionary *entry in NFBColumnsAllEntries()) {
+            UIViewController *page = entry[@"vc"];
+            if (page == current || ![page isViewLoaded] || [gNFBColsAppeared containsObject:page]) continue;
+            [page beginAppearanceTransition:YES animated:NO];
+            [page endAppearanceTransition];
+            [gNFBColsAppeared addObject:page];
+            changed++;
+        }
+    } else {
+        for (UIViewController *page in gNFBColsAppeared.allObjects) {
+            if (page == current) continue;
+            [page beginAppearanceTransition:NO animated:NO];
+            [page endAppearanceTransition];
+            changed++;
+        }
+        [gNFBColsAppeared removeAllObjects];
+    }
+    if (changed) {
+        NFBLogEvent([NSString stringWithFormat:@"columns pagesAppear on=%d changed=%lu current=%@", columns ? 1 : 0,
+            (unsigned long)changed, current ? NSStringFromClass([current class]) : @"nil"]);
+    }
+}
+
 // 1 = For You, 0 = not, -1 = not a visible column page.
 NSInteger NFBColumnsPageRecommended(UIViewController *vc) {
     if (!vc) return -1;
@@ -689,7 +725,8 @@ static void nfb_colsApplyToPager(UIViewController *pager) {
         }
         if (cv.pagingEnabled) cv.pagingEnabled = NO;
         if (!cv.scrollEnabled) cv.scrollEnabled = YES;
-        cv.decelerationRate = UIScrollViewDecelerationRateFast;
+        // Normal deceleration: a strong flick crosses several columns (snapped at the landing point).
+        cv.decelerationRate = UIScrollViewDecelerationRateNormal;
         objc_setAssociatedObject(cv, &kNFBColsDesiredOffsetKey, @0, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     } else {
         NSNumber *saved = objc_getAssociatedObject(cv, &kNFBColsSavedPagingKey);
@@ -816,13 +853,16 @@ static void nfb_colsSetActiveOnNav(BOOL active, UIViewController *nav, UIViewCon
         }
     }
     BOOL changed = gNFBColsActive != active;
+    if (!active && changed) nfb_colsSyncPageAppearance(NO);
     gNFBColsActive = active;
     [NSUserDefaults.standardUserDefaults setBool:active forKey:@"nfb_columns_session"];
     nfb_colsApplyToHome();
     if (active) {
         // The Home pager may only now be laid out for the first time.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (nfb_colsActiveNow()) nfb_colsApplyToHome();
+            if (!nfb_colsActiveNow()) return;
+            nfb_colsApplyToHome();
+            nfb_colsSyncPageAppearance(YES);
         });
         nfb_colsScheduleKick();
     } else if ([nav respondsToSelector:@selector(_t1_syncTabBarSelectionWithSelectedController)]) {
@@ -1059,21 +1099,24 @@ void NFBColumnsShowManager(UIViewController *presenter) {
     [presenter presentViewController:nav animated:YES completion:nil];
 }
 
+static BOOL nfb_colsOwnsScroll(UIScrollView *scrollView) {
+    return scrollView && scrollView == gNFBColsCollectionView && nfb_colsActiveNow();
+}
+
 #pragma mark - horizontal scroll stats (diagnostics)
 
 // One summary line per horizontal drag in columns mode: frame gaps (hitches), time spent in the
 // pager's own scrollViewDidScroll, layout invalidations/prepares and Home tab selections it caused.
 static struct {
     NSUInteger frames, slow, invalidations, prepares, selects;
-    double lastT, maxGap, origMax, origTotal;
+    double lastT, maxGap;
 } gNFBColsScroll;
 
 static void nfb_colsScrollStatsFlush(NSString *why) {
     if (gNFBColsScroll.frames) {
-        NFBLogEvent([NSString stringWithFormat:@"columns scroll[%@] frames=%lu maxGapMs=%.0f slow(>25ms)=%lu didScrollMaxMs=%.1f didScrollTotalMs=%.0f suppressedInvalidations=%lu prepares=%lu selects=%lu",
+        NFBLogEvent([NSString stringWithFormat:@"columns scroll[%@] frames=%lu maxGapMs=%.0f slow(>25ms)=%lu suppressedInvalidations=%lu prepares=%lu selects=%lu",
             why, (unsigned long)gNFBColsScroll.frames, gNFBColsScroll.maxGap * 1000.0, (unsigned long)gNFBColsScroll.slow,
-            gNFBColsScroll.origMax * 1000.0, gNFBColsScroll.origTotal * 1000.0, (unsigned long)gNFBColsScroll.invalidations,
-            (unsigned long)gNFBColsScroll.prepares, (unsigned long)gNFBColsScroll.selects]);
+            (unsigned long)gNFBColsScroll.invalidations, (unsigned long)gNFBColsScroll.prepares, (unsigned long)gNFBColsScroll.selects]);
     }
     memset(&gNFBColsScroll, 0, sizeof(gNFBColsScroll));
 }
@@ -1195,41 +1238,57 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
     }
 }
 
-- (void)scrollViewWillEndDragging:(UIScrollView *)scrollView withVelocity:(CGPoint)velocity targetContentOffset:(CGPoint *)targetContentOffset {
-    CGFloat startX = scrollView.contentOffset.x;
+// Columns mode owns the Home collection view's horizontal scrolling. The pager's own handling
+// (page transitions, appearance forwarding, selecting the Home tab under the finger) is skipped:
+// columns are not pages, and every one of those transitions re-laid out a whole timeline mid-swipe.
+- (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    if (nfb_colsOwnsScroll(scrollView)) return;
     %orig;
-    if (!targetContentOffset || !nfb_colsActiveNow() || !nfb_colsPagerIsHome(self) ||
-        ![scrollView isKindOfClass:UICollectionView.class]) return;
-    CGFloat snapped = nfb_colsSnap((UICollectionView *)scrollView, targetContentOffset->x, velocity.x, startX);
+}
+
+- (void)scrollViewWillBeginDecelerating:(UIScrollView *)scrollView {
+    if (nfb_colsOwnsScroll(scrollView)) return;
+    %orig;
+}
+
+- (void)scrollViewDidEndScrollingAnimation:(UIScrollView *)scrollView {
+    if (nfb_colsOwnsScroll(scrollView)) return;
+    %orig;
+}
+
+- (void)scrollViewWillEndDragging:(UIScrollView *)scrollView withVelocity:(CGPoint)velocity targetContentOffset:(CGPoint *)targetContentOffset {
+    if (!targetContentOffset || !nfb_colsOwnsScroll(scrollView) || ![scrollView isKindOfClass:UICollectionView.class]) {
+        %orig;
+        return;
+    }
+    CGFloat snapped = nfb_colsSnap((UICollectionView *)scrollView, targetContentOffset->x, velocity.x, scrollView.contentOffset.x);
     targetContentOffset->x = snapped;
     objc_setAssociatedObject(scrollView, &kNFBColsDesiredOffsetKey, @(snapped), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
-    if (!nfb_colsActiveNow() || scrollView != gNFBColsCollectionView ||
-        !(scrollView.isDragging || scrollView.isDecelerating || scrollView.isTracking)) {
+    if (!nfb_colsOwnsScroll(scrollView)) {
         %orig;
         return;
     }
-    CFTimeInterval t0 = CACurrentMediaTime();
+    if (!(scrollView.isDragging || scrollView.isDecelerating || scrollView.isTracking)) return;
+    CFTimeInterval now = CACurrentMediaTime();
     if (gNFBColsScroll.lastT > 0.0) {
-        double gap = t0 - gNFBColsScroll.lastT;
+        double gap = now - gNFBColsScroll.lastT;
         if (gap < 1.0) {
             if (gap > gNFBColsScroll.maxGap) gNFBColsScroll.maxGap = gap;
             if (gap > 0.025) gNFBColsScroll.slow++;
         }
     }
-    %orig;
-    CFTimeInterval t1 = CACurrentMediaTime();
     gNFBColsScroll.frames++;
-    gNFBColsScroll.origTotal += t1 - t0;
-    if (t1 - t0 > gNFBColsScroll.origMax) gNFBColsScroll.origMax = t1 - t0;
-    gNFBColsScroll.lastT = t1;
+    gNFBColsScroll.lastT = now;
 }
 
 - (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
-    %orig;
-    if (!nfb_colsActiveNow() || !nfb_colsPagerIsHome(self)) return;
+    if (!nfb_colsOwnsScroll(scrollView)) {
+        %orig;
+        return;
+    }
     nfb_colsScrollStatsFlush(@"decel");
     NSNumber *desired = objc_getAssociatedObject(scrollView, &kNFBColsDesiredOffsetKey);
     if (desired && fabs(scrollView.contentOffset.x - desired.doubleValue) > 1.0) {
@@ -1239,8 +1298,11 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
 }
 
 - (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
-    %orig;
-    if (decelerate || !nfb_colsActiveNow() || !nfb_colsPagerIsHome(self)) return;
+    if (!nfb_colsOwnsScroll(scrollView)) {
+        %orig;
+        return;
+    }
+    if (decelerate) return;
     nfb_colsScrollStatsFlush(@"drag");
     NSNumber *desired = objc_getAssociatedObject(scrollView, &kNFBColsDesiredOffsetKey);
     if (desired && fabs(scrollView.contentOffset.x - desired.doubleValue) > 1.0) {

@@ -42,6 +42,7 @@ static void nfb_streamStop(UIViewController *vc);
 static UIViewController *nfb_selectedTimelineVC(UIViewController *vc);
 static void nfb_streamTrigger(UIViewController *vc);
 static void nfb_styleButton(BOOL on);
+static BOOL nfb_streamThrottled(void);
 static void nfb_updateGauge(BOOL on, NSTimeInterval interval);
 static void nfb_updateStreamStateIconForVC(UIViewController *vc);
 static NSString *nfb_currentSelectedTabPage(void);
@@ -1192,8 +1193,13 @@ static void nfb_installCrashLoggerOnce(void) {
 - (void)showMain {
     BOOL on = nfb_streamEnabled();
     NSInteger iv = nfb_streamInterval();
+    NSString *status = [NSString stringWithFormat:nfb_loc(@"NFB_STREAM_MENU_STATUS", @"Status: %@ / interval: %lds"), on ? @"ON" : @"OFF", (long)iv];
+    if (on && nfb_streamThrottled()) {
+        status = [status stringByAppendingFormat:@"\n%@", [NSString stringWithFormat:nfb_loc(@"NFB_STREAM_THROTTLED",
+            @"Phone is warm: refreshing every %lds for now"), (long)nfb_effectiveStreamInterval()]];
+    }
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:nfb_loc(@"NFB_STREAM_MENU_TITLE", @"Auto-refresh timeline (streaming)")
-        message:[NSString stringWithFormat:nfb_loc(@"NFB_STREAM_MENU_STATUS", @"Status: %@ / interval: %lds"), on ? @"ON" : @"OFF", (long)iv]
+        message:status
         preferredStyle:UIAlertControllerStyleActionSheet];
     if (gNFBLogRecording) {
         [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_LOG_STOP_AND_COPY", @"⏹ Stop log recording and copy") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
@@ -1308,12 +1314,30 @@ static void nfb_installCrashLoggerOnce(void) {
 
 #pragma mark - button visuals + lifecycle
 
+static BOOL nfb_streamThrottled(void) {
+    return nfb_effectiveStreamInterval() > (NSTimeInterval)nfb_streamInterval() + 0.5;
+}
+
+// On: the ring depletes over the interval in use and the centre shows its seconds (orange while the
+// interval is stretched because the phone is hot / in Low Power Mode). Off: a grey refresh arrow.
 static void nfb_styleButton(BOOL on) {
     if (!gStreamButton) return;
-    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightSemibold];
-    NSString *name = on ? @"arrow.clockwise.circle.fill" : @"arrow.clockwise.circle";
-    [gStreamButton setImage:[[UIImage systemImageNamed:name withConfiguration:cfg] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
-    gStreamButton.tintColor = on ? nil : [UIColor systemGrayColor];
+    BOOL throttled = on && nfb_streamThrottled();
+    UIColor *accent = throttled ? UIColor.systemOrangeColor : UIColor.systemBlueColor;
+    if (on) {
+        [gStreamButton setImage:nil forState:UIControlStateNormal];
+        NSString *seconds = [NSString stringWithFormat:@"%.0f", nfb_effectiveStreamInterval()];
+        UIFont *font = [UIFont monospacedDigitSystemFontOfSize:(seconds.length > 2 ? 12.0 : 15.0) weight:UIFontWeightBold];
+        [gStreamButton setAttributedTitle:[[NSAttributedString alloc] initWithString:seconds
+            attributes:@{ NSFontAttributeName: font, NSForegroundColorAttributeName: accent }] forState:UIControlStateNormal];
+    } else {
+        [gStreamButton setAttributedTitle:nil forState:UIControlStateNormal];
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightSemibold];
+        [gStreamButton setImage:[[UIImage systemImageNamed:@"arrow.clockwise.circle" withConfiguration:cfg]
+            imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    }
+    gStreamButton.tintColor = on ? accent : [UIColor systemGrayColor];
+    gStreamButton.gauge.strokeColor = accent.CGColor;
     gStreamButton.gauge.hidden = !on;
     nfb_updateStreamStateIconForVC(gActiveItemsVC);
 }
@@ -1376,16 +1400,18 @@ static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
     UIViewController *target = vc ? (nfb_selectedTimelineVC(vc) ?: vc) : nil;
     BOOL globalOn = nfb_streamEnabled();
     BOOL active = nfb_streamCanRunForTarget(target);
-    NSInteger state = active ? 2 : (globalOn ? 1 : 0);
+    BOOL throttled = globalOn && nfb_streamThrottled();
+    NSInteger state = active ? (throttled ? 3 : 2) : (globalOn ? 1 : 0);
     // Only touch UIKit when the state actually changes (this runs from scroll callbacks).
     static NSInteger lastState = -1;
     if (state == lastState && gStreamStateIcon.image && !gStreamStateIcon.hidden) return;
     lastState = state;
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightSemibold];
-    NSString *name = active ? @"bolt.circle.fill" : (globalOn ? @"pause.circle.fill" : @"power.circle");
-    UIImage *image = [UIImage systemImageNamed:name withConfiguration:cfg];
+    NSString *name = state == 3 ? @"thermometer.medium" : (active ? @"bolt.circle.fill" : (globalOn ? @"pause.circle.fill" : @"power.circle"));
+    UIImage *image = [UIImage systemImageNamed:name withConfiguration:cfg] ?: [UIImage systemImageNamed:@"bolt.circle.fill" withConfiguration:cfg];
     gStreamStateIcon.image = [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
-    gStreamStateIcon.tintColor = active ? [UIColor systemGreenColor] : (globalOn ? [UIColor systemOrangeColor] : [UIColor systemGrayColor]);
+    gStreamStateIcon.tintColor = state == 3 ? [UIColor systemOrangeColor] :
+        (active ? [UIColor systemGreenColor] : (globalOn ? [UIColor systemOrangeColor] : [UIColor systemGrayColor]));
     gStreamStateIcon.accessibilityLabel = active ? nfb_loc(@"NFB_STREAM_STATE_ON", @"Streaming active") : nfb_loc(@"NFB_STREAM_STATE_PAUSED", @"Streaming paused");
     gStreamStateIcon.hidden = NO;
 }

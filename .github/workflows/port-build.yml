@@ -84,7 +84,8 @@ jobs:
           cd main
           sed -i '' "s/^TARGET.*$/TARGET := iphone:clang:16.5:15.0/" Makefile
           make clean || true
-          make
+          # Optimised build (-Os). The Makefile's default is a DEBUG build (-O0) for every hook.
+          make DEBUG=0
         env:
           THEOS: ${{ github.workspace }}/theos
 
