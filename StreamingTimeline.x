@@ -177,6 +177,32 @@ static BOOL nfb_resp(id o, SEL s) { return o && [o respondsToSelector:s]; }
 static id   nfb_timelineOf(id vc) { return nfb_resp(vc, @selector(timeline)) ? ((id(*)(id,SEL))objc_msgSend)(vc, @selector(timeline)) : nil; }
 static UIScrollView *nfb_scrollOf(id vc) { return nfb_resp(vc, @selector(scrollView)) ? ((id(*)(id,SEL))objc_msgSend)(vc, @selector(scrollView)) : nil; }
 
+// valueForKey: for probe keys an object usually does NOT have. A missing key makes KVC raise
+// NSUndefinedKeyException (caught below), and these probes run inside view-tree walks, so the
+// throw/unwind cost added up. Same lookup order as KVC: getters, then instance variables.
+static id nfb_kvcValue(id obj, NSString *key) {
+    if (!obj || !key.length) return nil;
+    NSString *cap = [[key substringToIndex:1].uppercaseString stringByAppendingString:[key substringFromIndex:1]];
+    BOOL found = [obj respondsToSelector:NSSelectorFromString(key)] ||
+        [obj respondsToSelector:NSSelectorFromString([@"get" stringByAppendingString:cap])] ||
+        [obj respondsToSelector:NSSelectorFromString([@"is" stringByAppendingString:cap])] ||
+        [obj respondsToSelector:NSSelectorFromString([@"_" stringByAppendingString:key])];
+    if (!found && [[obj class] accessInstanceVariablesDirectly]) {
+        Class cls = object_getClass(obj);
+        NSArray<NSString *> *ivars = @[[@"_" stringByAppendingString:key], [@"_is" stringByAppendingString:cap], key,
+                                       [@"is" stringByAppendingString:cap]];
+        for (NSString *name in ivars) {
+            if (class_getInstanceVariable(cls, name.UTF8String)) { found = YES; break; }
+        }
+    }
+    if (!found) return nil;
+    @try {
+        return [obj valueForKey:key];
+    } @catch (NSException *e) {
+        return nil;
+    }
+}
+
 static NSString *nfb_textOfView(UIView *view) {
     if (!view) return nil;
     NSString *text = nil;
@@ -184,7 +210,7 @@ static NSString *nfb_textOfView(UIView *view) {
         if ([view isKindOfClass:UILabel.class]) text = ((UILabel *)view).text;
         else if ([view isKindOfClass:UIButton.class]) text = [((UIButton *)view) titleForState:UIControlStateNormal];
         if (!text.length) {
-            id value = [view valueForKey:@"text"];
+            id value = nfb_kvcValue(view, @"text");
             if ([value isKindOfClass:NSString.class]) text = value;
         }
         if (!text.length) text = view.accessibilityLabel;
@@ -198,11 +224,8 @@ static BOOL nfb_viewOrAncestorSelected(UIView *view) {
     UIView *current = view;
     for (int i = 0; current && i < 4; i++, current = current.superview) {
         if ((current.accessibilityTraits & UIAccessibilityTraitSelected) == UIAccessibilityTraitSelected) return YES;
-        @try {
-            id selected = [current valueForKey:@"selected"];
-            if ([selected respondsToSelector:@selector(boolValue)] && [selected boolValue]) return YES;
-        } @catch (NSException *e) {
-        }
+        id selected = nfb_kvcValue(current, @"selected");
+        if ([selected respondsToSelector:@selector(boolValue)] && [selected boolValue]) return YES;
     }
     return NO;
 }
@@ -286,12 +309,9 @@ static BOOL nfb_textLooksNotificationTweetTimeline(NSString *text) {
 
 static NSString *nfb_stringValueForKey(id obj, NSString *key) {
     if (!obj || !key.length) return nil;
-    @try {
-        id value = [obj valueForKey:key];
-        if ([value isKindOfClass:NSString.class]) return value;
-        if ([value respondsToSelector:@selector(stringValue)]) return [value stringValue];
-    } @catch (NSException *e) {
-    }
+    id value = nfb_kvcValue(obj, key);
+    if ([value isKindOfClass:NSString.class]) return value;
+    if ([value respondsToSelector:@selector(stringValue)]) return [value stringValue];
     return nil;
 }
 
@@ -1272,6 +1292,17 @@ static void *nfb_hangSamplerMain(void *arg) {
     uint64_t nextSampleAtMs = 0;
     int samplesTaken = 0;
     for (;;) {
+        if (!gNFBLogRecording) {
+            // Diagnostics only: idle (one wake every 3s, no main-queue pings) unless the log is recording.
+            usleep(3000000);
+            uint64_t idleNow = nfb_uptimeMs();
+            lastLoopMs = idleNow;
+            atomic_store(&gNFBMainBeatMs, idleNow);
+            atomic_store(&gNFBMainPingPending, 0);
+            stallStartMs = 0;
+            samplesTaken = 0;
+            continue;
+        }
         usleep(500000);
         uint64_t now = nfb_uptimeMs();
         BOOL processWasSuspended = (now - lastLoopMs) > 2500;   // our own loop stalled => app was suspended, not hung
@@ -1718,6 +1749,11 @@ static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
     UIViewController *target = vc ? (nfb_selectedTimelineVC(vc) ?: vc) : nil;
     BOOL globalOn = [BHTManager autoStreamTimeline];
     BOOL active = nfb_streamCanRunForTarget(target);
+    // Only touch UIKit (symbol lookup, image, tint) when the state actually changes.
+    NSInteger state = active ? 2 : (globalOn ? 1 : 0);
+    static NSInteger lastState = -1;
+    if (state == lastState && gStreamStateIcon.image && !gStreamStateIcon.hidden) return;
+    lastState = state;
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightSemibold];
     NSString *name = active ? @"bolt.circle.fill" : (globalOn ? @"pause.circle.fill" : @"power.circle");
     UIImage *image = [UIImage systemImageNamed:name withConfiguration:cfg];
@@ -1726,6 +1762,18 @@ static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
     gStreamStateIcon.tintColor = active ? [UIColor systemGreenColor] : (globalOn ? [UIColor systemOrangeColor] : [UIColor systemGrayColor]);
     gStreamStateIcon.accessibilityLabel = active ? nfb_loc(@"NFB_STREAM_STATE_ON", @"Streaming active") : nfb_loc(@"NFB_STREAM_STATE_PAUSED", @"Streaming paused");
     gStreamStateIcon.hidden = NO;
+}
+
+// Scroll callbacks fire every frame; the stream state behind the icon (columns, scroll views, tab)
+// is re-evaluated at most ~3x per second instead.
+static BOOL gNFBStateIconPending = NO;
+static void nfb_scheduleStateIconUpdate(void) {
+    if (gNFBStateIconPending) return;
+    gNFBStateIconPending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gNFBStateIconPending = NO;
+        nfb_updateStreamStateIconForVC(gActiveItemsVC);
+    });
 }
 
 static void nfb_installButton(UIWindow *win) {
@@ -1823,10 +1871,10 @@ void NFBUpdateStreamButtonVisibility(void) {
 // Fade with the header: hide while scrolling down, show at top / scrolling up.
 static void nfb_visibilityForScroll(UIScrollView *sv) {
     if (!gStreamButton || gStreamButton.window == nil) return;
-    NFBUpdateStreamButtonVisibility();
+    // Visibility follows tab changes (NFBNoteTabSelectionChanged), not every scroll frame.
     if (gStreamButton.hidden) return;
     nfb_noteActiveTimelineScroll(sv);
-    nfb_updateStreamStateIconForVC(gActiveItemsVC);
+    nfb_scheduleStateIconUpdate();
     static CGFloat last = 0;
     CGFloat y = sv.contentOffset.y;
     CGFloat topY = -sv.adjustedContentInset.top;
@@ -1851,24 +1899,17 @@ static void nfb_visibilityForScroll(UIScrollView *sv) {
 
 static NSString *nfb_scribePageOfTabView(UIView *view) {
     NSString *page = nil;
-    @try {
-        id value = [view valueForKey:@"scribePage"];
-        if ([value isKindOfClass:NSString.class]) page = value;
-    } @catch (NSException *e) {
-        page = nil;
-    }
+    id value = nfb_kvcValue(view, @"scribePage");
+    if ([value isKindOfClass:NSString.class]) page = value;
     return page;
 }
 
 static BOOL nfb_tabViewSelected(UIView *view, BOOL *known) {
     if (known) *known = NO;
-    @try {
-        id value = [view valueForKey:@"selected"];
-        if ([value respondsToSelector:@selector(boolValue)]) {
-            if (known) *known = YES;
-            return [value boolValue];
-        }
-    } @catch (NSException *e) {
+    id value = nfb_kvcValue(view, @"selected");
+    if ([value respondsToSelector:@selector(boolValue)]) {
+        if (known) *known = YES;
+        return [value boolValue];
     }
     return NO;
 }
@@ -1918,6 +1959,12 @@ void NFBNoteTabSelectionChanged(void) {
     gNFBSelectedTabPageCache = nil;
     gNFBSelectedTabPageCacheAt = 0.0;
     NFBUpdateStreamButtonVisibility();
+    // Tab views finish updating their selected state after this call; check once more.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gNFBSelectedTabPageCache = nil;
+        gNFBSelectedTabPageCacheAt = 0.0;
+        NFBUpdateStreamButtonVisibility();
+    });
 }
 
 static BOOL nfb_homeTabSelectedOrUnknown(void) {
@@ -2140,8 +2187,13 @@ static char kNFBColumnsChromeScanStateKey;
 static char kNFBColumnsSegmentedChromeCandidatesKey;
 static NSUInteger gNFBColumnsChromeScanGeneration = 1;
 
+// P2: set when columns touched the Home pager or hid chrome; until then (and again once a restore
+// found nothing left to undo) the columns-off restore path skips its window walks.
+static BOOL gNFBColumnsNeedsRestore = NO;
+
 static void nfb_trackSavedColumnsChromeView(UIView *view) {
     if (!view) return;
+    gNFBColumnsNeedsRestore = YES;
     if (!gNFBInlineColumnsSavedChromeViews) {
         gNFBInlineColumnsSavedChromeViews = [NSHashTable weakObjectsHashTable];
     }
@@ -2231,7 +2283,9 @@ static NSInteger nfb_setColumnsEdgeMenuGesturesEnabled(BOOL enabled) {
     static NSInteger lastLoggedMatched = -1;
     static NSInteger lastLoggedEnabledCount = -1;
     NSTimeInterval now = CACurrentMediaTime();
-    if (gColumnsEdgeMenuStateKnown && gColumnsEdgeMenuLastEnabled == enabled && now - lastSameStateScan < 0.25) return 0;
+    // Same state: the UIGestureRecognizer -setEnabled: hook already keeps re-enables out, so only
+    // re-assert occasionally instead of walking every window 4x a second while swiping.
+    if (gColumnsEdgeMenuStateKnown && gColumnsEdgeMenuLastEnabled == enabled && now - lastSameStateScan < 2.0) return 0;
     gColumnsEdgeMenuStateKnown = YES;
     gColumnsEdgeMenuLastEnabled = enabled;
     lastSameStateScan = now;
@@ -2276,12 +2330,8 @@ static BOOL nfb_inlineColumnsActiveForHomePaging(UIViewController *paging) {
 }
 
 static BOOL nfb_viewContainsDescendant(UIView *root, UIView *descendant) {
-    if (!root || !descendant) return NO;
-    if (root == descendant) return YES;
-    for (UIView *subview in root.subviews) {
-        if (nfb_viewContainsDescendant(subview, descendant)) return YES;
-    }
-    return NO;
+    // Same answer as walking root's subtree, but walks descendant's superview chain (O(depth)).
+    return root && descendant && [descendant isDescendantOfView:root];
 }
 
 static BOOL nfb_constraintLooksLikeChromeHeight(NSLayoutConstraint *constraint, UIView *view) {
@@ -2903,10 +2953,8 @@ static NSArray<UIView *> *nfb_columnsSegmentedChromeViews(UIViewController *segm
                             @"labelBarView", @"_tabBar", @"tabBar", @"_tabsView", @"tabsView",
                             @"_headerView", @"headerView", @"_topBar", @"topBar", @"_titleBar",
                             @"titleBar", @"_titlesView", @"titlesView"]) {
-        @try {
-            id value = [segmentedVC valueForKey:key];
-            nfb_collectSegmentedChromeViewsFromObject(value, bars, seen, root, 0);
-        } @catch (NSException *e) {}
+        id value = nfb_kvcValue(segmentedVC, key);
+        nfb_collectSegmentedChromeViewsFromObject(value, bars, seen, root, 0);
     }
     nfb_collectSegmentedChromeViewsInViewTree(root, bars, seen, root, 0);
     NSArray<UIView *> *result = [bars copy];
@@ -3284,7 +3332,17 @@ static CGFloat nfb_columnsTopContentInsetForPageView(UIView *pageView) {
     UIWindow *window = pageView.window;
     if (!pageView || !window) return 0.0;
     CGRect pageFrame = [pageView.superview convertRect:pageView.frame toView:window];
-    CGFloat navBottom = nfb_visibleNavigationBottomInView(window, window, 0);
+    // One window walk per layout pass, not one per column page.
+    static __weak UIWindow *cachedWindow = nil;
+    static CGFloat cachedBottom = 0.0;
+    static CFTimeInterval cachedAt = 0.0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (cachedWindow != window || now - cachedAt > 0.05) {
+        cachedBottom = nfb_visibleNavigationBottomInView(window, window, 0);
+        cachedWindow = window;
+        cachedAt = now;
+    }
+    CGFloat navBottom = cachedBottom;
     if (navBottom < 1.0) {
         navBottom = window.safeAreaInsets.top + 54.0;
     }
@@ -3835,7 +3893,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b74] %@ off=%.0f", key, nativeScrollView.contentOffset.x]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b75] %@ off=%.0f", key, nativeScrollView.contentOffset.x]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -3866,8 +3924,17 @@ static UIScrollView *nfb_findHorizontalScrollViewInView(UIView *view, CGFloat *b
 
 static UIScrollView *nfb_horizontalPagingScrollViewOf(UIViewController *vc) {
     if (![vc isViewLoaded]) return nil;
+    // The pager's own horizontal scroll view: remembered per controller and reused while it is
+    // still inside that controller's view and still scores as horizontal (else search again).
+    static NSMapTable<UIViewController *, UIScrollView *> *cache = nil;
+    if (!cache) cache = [NSMapTable weakToWeakObjectsMapTable];
+    UIScrollView *cached = [cache objectForKey:vc];
+    if (cached && [cached isDescendantOfView:vc.view] && nfb_horizontalScrollScore(cached) > 0) return cached;
     CGFloat bestScore = 0;
-    return nfb_findHorizontalScrollViewInView(vc.view, &bestScore);
+    UIScrollView *found = nfb_findHorizontalScrollViewInView(vc.view, &bestScore);
+    if (found) [cache setObject:found forKey:vc];
+    else [cache removeObjectForKey:vc];
+    return found;
 }
 
 static NSInteger nfb_estimatedHomePagingPageCount(UIViewController *paging) {
@@ -4053,6 +4120,7 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     // against the profile's own pager mid push-animation. Everything below belongs to the HOME
     // pager only (width constraint, stale app-tab columns, overlay, chrome).
     if (!nfb_isHomePagingController(paging) || ![paging isViewLoaded]) return;
+    if (!gNFBColumnsNeedsRestore) return;   // P2: nothing of ours on the stock Home
     gNFBColumnsResizeEntriesPaging = nil;
     gNFBColumnsResizeEntries = nil;
     for (UIViewController *tabVC in gNFBColumnsAppTabControllers.allValues) {
@@ -4072,7 +4140,11 @@ static void nfb_restoreInlineColumns(UIViewController *paging) {
     if (!scrollView) return;
 
     BOOL wasApplied = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsAppliedKey) != nil;
-    if (!wasApplied) return;
+    if (!wasApplied) {
+        // Overlay and chrome were undone above and the pager is not applied: fully restored.
+        gNFBColumnsNeedsRestore = NO;
+        return;
+    }
 
     NSNumber *pagingEnabled = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsPagingKey);
     NSNumber *bounceH = objc_getAssociatedObject(scrollView, &kNFBInlineColumnsBounceHKey);
@@ -4188,7 +4260,7 @@ static void nfb_columnsNoteLayoutPassDuration(CFTimeInterval seconds) {
     if (seconds > worst) worst = seconds;
     if (now - windowStart < 2.0) return;
     if (gNFBLogRecording && passes > 0) {
-        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b74] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
+        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b75] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
             (long)passes, total / passes * 1000.0, worst * 1000.0,
             total / (now - windowStart) * 100.0, now - windowStart]);
     }
@@ -4198,6 +4270,7 @@ static void nfb_columnsNoteLayoutPassDuration(CFTimeInterval seconds) {
 static void nfb_applyInlineColumns(UIViewController *paging) {
     if (!nfb_inlineColumnsActiveForHomePaging(paging) || ![paging isViewLoaded]) return;
     if (!nfb_homePagingControllerIsVisible(paging)) return;
+    gNFBColumnsNeedsRestore = YES;
     CFTimeInterval t0 = CACurrentMediaTime();
     nfb_layoutColumnsOverlayForPaging(paging);
     nfb_columnsNoteLayoutPassDuration(CACurrentMediaTime() - t0);
@@ -6370,7 +6443,7 @@ static void nfb_layoutActiveHomePaging(void) {
     if (gNFBLayoutActiveHomePagingRunning) {
         if (gNFBLogRecording) {
             static NSString *lastLayoutReentryKey = nil;
-            NSString *key = @"layout[b74] activeHome reentry deferred";
+            NSString *key = @"layout[b75] activeHome reentry deferred";
             if (![key isEqualToString:lastLayoutReentryKey]) { lastLayoutReentryKey = [key copy]; NFBLogEvent(key); }
         }
         nfb_requestLayoutActiveHomePagingOnNextTurn();
@@ -6775,7 +6848,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 
 // Button lifecycle on the stable Home container.
 %hook THFHomeTimelineContainerViewController
-- (void)viewDidAppear:(BOOL)animated { %orig; nfb_installCrashLoggerOnce(); NFBLogSnapshot(@"homeContainer.appear"); nfb_syncHomeTimelineTabIdentifierFromController(self); nfb_installButton(self.view.window); if (gInlineColumnsEnabled) nfb_scheduleLayoutActiveHomePaging(); else nfb_restoreAllSavedColumnsChrome(); }
+- (void)viewDidAppear:(BOOL)animated { %orig; nfb_installCrashLoggerOnce(); NFBLogSnapshot(@"homeContainer.appear"); nfb_syncHomeTimelineTabIdentifierFromController(self); nfb_installButton(self.view.window); if (gInlineColumnsEnabled) nfb_scheduleLayoutActiveHomePaging(); else if (gNFBColumnsNeedsRestore) nfb_restoreAllSavedColumnsChrome(); }
 - (void)viewDidDisappear:(BOOL)animated { %orig; NFBLogSnapshot(@"homeContainer.disappear"); nfb_removeButton(); }
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
     %orig(size, coordinator);
@@ -6823,7 +6896,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     if (!nfb_parentControllerNamed((UIViewController *)self, @"HomeTimelineContainer")) return;
     // Icon refresh only — do NOT run the full visibility logic here (it fades/disables the button).
     nfb_noteActiveTimelineScroll(scrollView);
-    nfb_updateStreamStateIconForVC(gActiveItemsVC);
+    nfb_scheduleStateIconUpdate();
 }
 %end
 
