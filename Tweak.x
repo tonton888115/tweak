@@ -2206,7 +2206,37 @@ static void BHTWatchdogCrashSuppressed(const char *cls) {
 }
 %end
 
+// b76: X re-shows the fleet line (showAnimated / visibility updates) after it was collapsed; with
+// its container at height 0 the live-Space rows then drew over the timeline. While "hide Spaces
+// bar" is on, the Home fleet line container stays hidden and the fleet line cannot be un-hidden.
+static char kBHTFleetContainerHiddenKey;
+
+static void BHTApplyFleetContainerHidden(id headerController) {
+    UIView *container = [headerController respondsToSelector:@selector(fleetLineContainerView)] ?
+        ((id(*)(id, SEL))objc_msgSend)(headerController, @selector(fleetLineContainerView)) : nil;
+    if (![container isKindOfClass:UIView.class] || BHTViewIsInsideProfileHeader(container)) return;
+    if (BHTShouldHideSpacesBarNow()) {
+        if (!objc_getAssociatedObject(container, &kBHTFleetContainerHiddenKey)) {
+            objc_setAssociatedObject(container, &kBHTFleetContainerHiddenKey, @(container.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (!container.hidden) container.hidden = YES;
+    } else {
+        NSNumber *saved = objc_getAssociatedObject(container, &kBHTFleetContainerHiddenKey);
+        if (!saved) return;
+        container.hidden = saved.boolValue;
+        objc_setAssociatedObject(container, &kBHTFleetContainerHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 %hook T1FleetLineView
+- (void)setHidden:(BOOL)hidden {
+    if (!hidden && BHTShouldHideSpacesBarNow() && !BHTViewIsInsideProfileHeader((UIView *)self)) hidden = YES;
+    %orig(hidden);
+}
+- (void)setAlpha:(CGFloat)alpha {
+    if (alpha > 0.0 && BHTShouldHideSpacesBarNow() && !BHTViewIsInsideProfileHeader((UIView *)self)) alpha = 0.0;
+    %orig(alpha);
+}
 - (void)didMoveToWindow {
     %orig;
     BHTCollapseSpacesChromeViewAndNearbyContainers((UIView *)self);
@@ -2229,9 +2259,29 @@ static void BHTWatchdogCrashSuppressed(const char *cls) {
 %end
 
 %hook T1FleetLineHeaderController
+- (BOOL)_t1_shouldShowFleetLine {
+    if (BHTShouldHideSpacesBarNow()) return NO;
+    return %orig;
+}
+- (void)showAnimated {
+    if (BHTShouldHideSpacesBarNow()) {
+        BHTApplyFleetContainerHidden(self);
+        return;
+    }
+    %orig;
+}
+- (void)_t1_updateFleetLineVisibility {
+    %orig;
+    BHTApplyFleetContainerHidden(self);
+}
+- (void)setFleetLineContainerView:(UIView *)view {
+    %orig(view);
+    BHTApplyFleetContainerHidden(self);
+}
 - (void)setFleetLineView:(UIView *)view {
     %orig(view);
     BHTCollapseSpacesChromeViewAndNearbyContainers(view);
+    BHTApplyFleetContainerHidden(self);
 }
 - (void)setUserPresenceView:(UIView *)view {
     %orig(view);

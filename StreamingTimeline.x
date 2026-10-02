@@ -3893,7 +3893,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b75] %@ off=%.0f", key, nativeScrollView.contentOffset.x]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b76] %@ off=%.0f", key, nativeScrollView.contentOffset.x]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -4260,7 +4260,7 @@ static void nfb_columnsNoteLayoutPassDuration(CFTimeInterval seconds) {
     if (seconds > worst) worst = seconds;
     if (now - windowStart < 2.0) return;
     if (gNFBLogRecording && passes > 0) {
-        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b75] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
+        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b76] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
             (long)passes, total / passes * 1000.0, worst * 1000.0,
             total / (now - windowStart) * 100.0, now - windowStart]);
     }
@@ -6443,7 +6443,7 @@ static void nfb_layoutActiveHomePaging(void) {
     if (gNFBLayoutActiveHomePagingRunning) {
         if (gNFBLogRecording) {
             static NSString *lastLayoutReentryKey = nil;
-            NSString *key = @"layout[b75] activeHome reentry deferred";
+            NSString *key = @"layout[b76] activeHome reentry deferred";
             if (![key isEqualToString:lastLayoutReentryKey]) { lastLayoutReentryKey = [key copy]; NFBLogEvent(key); }
         }
         nfb_requestLayoutActiveHomePagingOnNextTurn();
