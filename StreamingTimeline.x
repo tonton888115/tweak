@@ -1436,6 +1436,7 @@ static void nfb_installCrashLoggerOnce(void) {
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_INTERVAL_CHANGE", @"⏱ Change refresh interval…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showInterval]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_DIAG_SHOW", @"🔍 Diagnostics (copy & send)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showDiag]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_DIAG_SHARE", @"📤 Save diagnostics as a file (iCloud Drive…)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self shareDiagFile]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"CANCEL_BUTTON_TITLE", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
@@ -1467,6 +1468,37 @@ static void nfb_installCrashLoggerOnce(void) {
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_COPY", @"Copy") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ UIPasteboard.generalPasteboard.string = s; }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_CLOSE", @"Close") style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
+}
+// Diagnostics report + the log being recorded (if any) + the saved log, written to a text file
+// and handed to the share sheet ("Save to Files" -> iCloud Drive) so the PC can read it directly.
+- (void)shareDiagFile {
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    fmt.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *stamp = [fmt stringFromDate:[NSDate date]];
+    NSMutableString *text = [NSMutableString string];
+    [text appendFormat:@"NeoFreeBird 11.35 b73-diag %@\n\n", stamp];
+    [text appendString:nfb_buildDiagnosticReport() ?: @"(no report)"];
+    if (NFBLogIsRecording() && gNFBLog.count) {
+        [text appendString:@"\n\n=== log being recorded ===\n"];
+        [text appendString:[gNFBLog componentsJoinedByString:@"\n"]];
+    }
+    [text appendString:@"\n\n=== saved log ===\n"];
+    [text appendString:NFBLogSavedFileContents() ?: @"-"];
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"NeoFreeBird-diag-%@.txt", stamp]];
+    NSError *error = nil;
+    if (![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
+        [self toast:error.localizedDescription ?: @"write failed"];
+        return;
+    }
+    UIViewController *top = [self topVC];
+    if (!top) return;
+    UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
+    if (share.popoverPresentationController) {
+        share.popoverPresentationController.sourceView = gStreamButton ?: top.view;
+        share.popoverPresentationController.sourceRect = gStreamButton ? gStreamButton.bounds : top.view.bounds;
+    }
+    [top presentViewController:share animated:YES completion:nil];
 }
 - (void)showColumnsManage {
     UIViewController *top = [self topVC];
