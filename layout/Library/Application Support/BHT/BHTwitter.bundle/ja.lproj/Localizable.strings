@@ -519,6 +519,14 @@
 "NFB_DIAG_SHARE" = "📤 診断情報をファイルで保存（iCloud Drive など）";
 "NFB_NET_OFFLINE" = "オフライン";
 "NFB_NET_NO_REPLY" = "応答なし";
+"NFB_NET_MEASURING" = "測定中…";
+"NFB_NET_X_OUTAGE" = "X 障害?";
+"NFB_NET_X_NO_REPLY" = "X 応答なし";
+"NFB_NET_X_SECONDS" = "X %.1f秒";
+"NFB_NET_SPEEDTEST" = "📶 回線速度を測る（約10MB）";
+"NFB_NET_DOWNDETECTOR" = "🌐 X の障害情報（Downdetector）";
+"NFB_NET_SPEED_RESULT" = "ダウンロード: %.1f Mbps\nX の直近の読み込み: %@";
+"NFB_NET_SPEED_FAILED" = "測定できませんでした: %@";
 "NFB_LOG_COPIED_TITLE" = "録画ログ（コピー済み）";
 "NFB_SAVED_LOG_COPIED_TITLE" = "保存ログ（コピー済み）";
 "NFB_RECOPY" = "再コピー";

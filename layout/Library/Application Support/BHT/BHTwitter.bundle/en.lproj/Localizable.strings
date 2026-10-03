@@ -519,6 +519,14 @@
 "NFB_DIAG_SHARE" = "📤 Save diagnostics as a file (iCloud Drive…)";
 "NFB_NET_OFFLINE" = "Offline";
 "NFB_NET_NO_REPLY" = "no reply";
+"NFB_NET_MEASURING" = "measuring…";
+"NFB_NET_X_OUTAGE" = "X outage?";
+"NFB_NET_X_NO_REPLY" = "X no reply";
+"NFB_NET_X_SECONDS" = "X %.1fs";
+"NFB_NET_SPEEDTEST" = "📶 Measure connection speed (~10 MB)";
+"NFB_NET_DOWNDETECTOR" = "🌐 X outage reports (Downdetector)";
+"NFB_NET_SPEED_RESULT" = "Download: %.1f Mbps\nX last load: %@";
+"NFB_NET_SPEED_FAILED" = "Measurement failed: %@";
 "NFB_LOG_COPIED_TITLE" = "Recorded log (copied)";
 "NFB_SAVED_LOG_COPIED_TITLE" = "Saved log (copied)";
 "NFB_RECOPY" = "Copy again";

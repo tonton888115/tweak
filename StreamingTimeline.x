@@ -30,6 +30,7 @@
 #include <time.h>       // b68 hang sampler: clock_gettime_nsec_np
 #import <Network/Network.h>                          // b78 network badge: path monitor
 #import <CoreTelephony/CTTelephonyNetworkInfo.h>     // b78 network badge: 5G / 4G
+#import <SafariServices/SafariServices.h>            // b79 Downdetector page
 
 static void nfb_streamStart(UIViewController *vc);
 static void nfb_streamStop(UIViewController *vc);
@@ -1388,6 +1389,170 @@ static void nfb_installCrashLoggerOnce(void) {
     });
 }
 
+#pragma mark - network / X response badge (b78)
+
+// A small line under the stream button: connection (Wi-Fi / 5G / 4G / offline) and how long X's
+// last timeline load took (any pull / auto-refresh, measured from TFNDataViewController's
+// loadTopDidBegin -> loadTopDidEnd). Green < 1.5s, orange < 4s, red >= 4s or no reply in 12s.
+// Passive: no extra requests.
+static UILabel *gNFBNetBadge = nil;
+static NSInteger gNFBNetPath = -1;            // -1 unknown, 0 offline, 1 Wi-Fi, 2 cellular, 3 other
+static double gNFBLastLoadSeconds = -1.0;
+static BOOL gNFBLastLoadTimedOut = NO;
+static char kNFBLoadStartKey;
+static double gNFBLastMbps = -1.0;            // last speed test (download), Mbps
+static BOOL gNFBSpeedTestRunning = NO;
+static NSUInteger gNFBConsecutiveBadLoads = 0; // timeouts / >= 8s loads in a row (outage hint)
+
+static NSString *nfb_cellularGeneration(void) {
+    static CTTelephonyNetworkInfo *info = nil;
+    if (!info) info = [CTTelephonyNetworkInfo new];
+    NSString *tech = info.serviceCurrentRadioAccessTechnology.allValues.firstObject;
+    if (!tech) return @"Cell";
+    if (@available(iOS 14.1, *)) {
+        if ([tech isEqualToString:CTRadioAccessTechnologyNR] || [tech isEqualToString:CTRadioAccessTechnologyNRNSA]) return @"5G";
+    }
+    if ([tech isEqualToString:CTRadioAccessTechnologyLTE]) return @"4G";
+    return @"3G";
+}
+
+// Two lines under the stream button:
+//   1) connection + last measured download speed   e.g. "Wi-Fi ↓42 Mbps"
+//   2) how long X took to answer the last timeline load   e.g. "X 0.8秒" (green / orange / red),
+//      "X 応答なし" after 12s, "X 障害?" when that keeps happening while the connection is up.
+static void nfb_updateNetBadge(void) {
+    if (!gNFBNetBadge) return;
+    NSString *kind = gNFBNetPath == 1 ? @"Wi-Fi" : (gNFBNetPath == 2 ? nfb_cellularGeneration() : @"Net");
+    NSString *line1;
+    if (gNFBNetPath == 0) line1 = nfb_loc(@"NFB_NET_OFFLINE", @"Offline");
+    else if (gNFBSpeedTestRunning) line1 = [NSString stringWithFormat:@"%@ %@", kind, nfb_loc(@"NFB_NET_MEASURING", @"measuring…")];
+    else if (gNFBLastMbps >= 0.0) line1 = [NSString stringWithFormat:@"%@ ↓%.0f Mbps", kind, gNFBLastMbps];
+    else line1 = kind;
+    NSString *line2;
+    UIColor *color2;
+    if (gNFBNetPath == 0) {
+        line2 = @"X —";
+        color2 = UIColor.systemRedColor;
+    } else if (gNFBLastLoadTimedOut) {
+        line2 = gNFBConsecutiveBadLoads >= 2 ? nfb_loc(@"NFB_NET_X_OUTAGE", @"X outage?") : nfb_loc(@"NFB_NET_X_NO_REPLY", @"X no reply");
+        color2 = UIColor.systemRedColor;
+    } else if (gNFBLastLoadSeconds < 0.0) {
+        line2 = @"X —";
+        color2 = UIColor.secondaryLabelColor;
+    } else {
+        line2 = [NSString stringWithFormat:nfb_loc(@"NFB_NET_X_SECONDS", @"X %.1fs"), gNFBLastLoadSeconds];
+        color2 = gNFBLastLoadSeconds < 1.5 ? UIColor.systemGreenColor :
+            (gNFBLastLoadSeconds < 4.0 ? UIColor.systemOrangeColor : UIColor.systemRedColor);
+    }
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] initWithString:[line1 stringByAppendingString:@"\n"]
+        attributes:@{ NSForegroundColorAttributeName: UIColor.whiteColor }];
+    [text appendAttributedString:[[NSAttributedString alloc] initWithString:line2 attributes:@{ NSForegroundColorAttributeName: color2 }]];
+    gNFBNetBadge.attributedText = text;
+}
+
+static void nfb_startNetMonitorOnce(void) {
+    static dispatch_once_t once;
+    static nw_path_monitor_t monitor = nil;
+    dispatch_once(&once, ^{
+        monitor = nw_path_monitor_create();
+        nw_path_monitor_set_queue(monitor, dispatch_get_main_queue());
+        nw_path_monitor_set_update_handler(monitor, ^(nw_path_t path) {
+            NSInteger previous = gNFBNetPath;
+            if (nw_path_get_status(path) != nw_path_status_satisfied) gNFBNetPath = 0;
+            else if (nw_path_uses_interface_type(path, nw_interface_type_wifi)) gNFBNetPath = 1;
+            else if (nw_path_uses_interface_type(path, nw_interface_type_cellular)) gNFBNetPath = 2;
+            else gNFBNetPath = 3;
+            if (gNFBNetPath != previous) gNFBLastMbps = -1.0;   // a different link: old speed no longer applies
+            nfb_updateNetBadge();
+            static CFTimeInterval lastAutoTest = -1000.0;
+            if (gNFBNetPath == 1 && previous != 1 && CACurrentMediaTime() - lastAutoTest > 600.0) {
+                lastAutoTest = CACurrentMediaTime();
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    if (gNFBNetPath == 1) nfb_runSpeedTest(3000000, nil);
+                });
+            }
+        });
+        nw_path_monitor_start(monitor);
+    });
+}
+
+static void nfb_noteLoadBegan(id owner) {
+    if (!owner) return;
+    NSNumber *start = @(CACurrentMediaTime());
+    objc_setAssociatedObject(owner, &kNFBLoadStartKey, start, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak id weakOwner = owner;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        id strongOwner = weakOwner;
+        if (strongOwner && objc_getAssociatedObject(strongOwner, &kNFBLoadStartKey) == start) {
+            objc_setAssociatedObject(strongOwner, &kNFBLoadStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            gNFBLastLoadTimedOut = YES;
+            if (gNFBNetPath != 0) gNFBConsecutiveBadLoads++;
+            NFBLogEvent(@"netBadge load timed out (12s)");
+            nfb_updateNetBadge();
+        }
+    });
+}
+
+static void nfb_noteLoadEnded(id owner) {
+    NSNumber *start = owner ? objc_getAssociatedObject(owner, &kNFBLoadStartKey) : nil;
+    if (!start) return;
+    objc_setAssociatedObject(owner, &kNFBLoadStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gNFBLastLoadSeconds = CACurrentMediaTime() - start.doubleValue;
+    gNFBLastLoadTimedOut = NO;
+    gNFBConsecutiveBadLoads = gNFBLastLoadSeconds >= 8.0 ? gNFBConsecutiveBadLoads + 1 : 0;
+    nfb_updateNetBadge();
+}
+
+// Download speed: fetches `bytes` of throwaway data from Cloudflare's public speed-test endpoint
+// (the one speed.cloudflare.com uses) and reports Mbps. On demand from the menu (10 MB), and once
+// automatically after joining Wi-Fi (3 MB, at most every 10 minutes); never automatic on cellular.
+static void nfb_runSpeedTest(NSUInteger bytes, void (^done)(double mbps, NSError *error)) {
+    if (gNFBSpeedTestRunning) return;
+    gNFBSpeedTestRunning = YES;
+    nfb_updateNetBadge();
+    NSURLSessionConfiguration *cfg = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    cfg.timeoutIntervalForRequest = 20.0;
+    cfg.timeoutIntervalForResource = 30.0;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://speed.cloudflare.com/__down?bytes=%lu", (unsigned long)bytes]];
+    CFTimeInterval t0 = CACurrentMediaTime();
+    [[session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        double seconds = CACurrentMediaTime() - t0;
+        double mbps = (!error && data.length && seconds > 0.0) ? (data.length * 8.0 / seconds / 1e6) : -1.0;
+        [session finishTasksAndInvalidate];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gNFBSpeedTestRunning = NO;
+            if (mbps >= 0.0) gNFBLastMbps = mbps;
+            NFBLogEvent([NSString stringWithFormat:@"speedTest bytes=%lu got=%lu %.2fs mbps=%.1f err=%@", (unsigned long)bytes,
+                (unsigned long)data.length, seconds, mbps, error.localizedDescription ?: @"-"]);
+            nfb_updateNetBadge();
+            if (done) done(mbps, error);
+        });
+    }] resume];
+}
+
+static void nfb_installNetBadge(void) {
+    if (!gStreamButton) return;
+    if (!gNFBNetBadge) {
+        // Right-aligned to the button's right edge so it never runs off the screen.
+        gNFBNetBadge = [[UILabel alloc] initWithFrame:CGRectMake(46.0 - 104.0, 46.0, 104.0, 28.0)];
+        gNFBNetBadge.font = [UIFont monospacedDigitSystemFontOfSize:10.5 weight:UIFontWeightSemibold];
+        gNFBNetBadge.numberOfLines = 2;
+        gNFBNetBadge.textAlignment = NSTextAlignmentRight;
+        gNFBNetBadge.adjustsFontSizeToFitWidth = YES;
+        gNFBNetBadge.minimumScaleFactor = 0.75;
+        gNFBNetBadge.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+        gNFBNetBadge.layer.cornerRadius = 6.0;
+        gNFBNetBadge.layer.masksToBounds = YES;
+        gNFBNetBadge.userInteractionEnabled = NO;
+    }
+    // A subview of the button: it fades / hides together with it.
+    if (gNFBNetBadge.superview != gStreamButton) [gStreamButton addSubview:gNFBNetBadge];
+    nfb_startNetMonitorOnce();
+    nfb_updateNetBadge();
+}
+
 #pragma mark - tap / long-press handler (reliable action sheets)
 
 @interface NFBStreamHandler : NSObject
@@ -1475,6 +1640,8 @@ static void nfb_installCrashLoggerOnce(void) {
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_INTERVAL_CHANGE", @"⏱ Change refresh interval…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showInterval]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_DIAG_SHOW", @"🔍 Diagnostics (copy & send)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self showDiag]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_NET_SPEEDTEST", @"📶 Measure connection speed (~10 MB)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self speedTest]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_NET_DOWNDETECTOR", @"🌐 X outage reports (Downdetector)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self openDowndetector]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_DIAG_SHARE", @"📤 Save diagnostics as a file (iCloud Drive…)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ [self shareDiagFile]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"CANCEL_BUTTON_TITLE", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
@@ -1508,6 +1675,29 @@ static void nfb_installCrashLoggerOnce(void) {
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_CLOSE", @"Close") style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
+- (void)speedTest {
+    if (gNFBNetPath == 0) {
+        [self toast:nfb_loc(@"NFB_NET_OFFLINE", @"Offline")];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    nfb_runSpeedTest(10000000, ^(double mbps, NSError *error) {
+        NSString *msg = mbps >= 0.0 ?
+            [NSString stringWithFormat:nfb_loc(@"NFB_NET_SPEED_RESULT", @"Download: %.1f Mbps\nX last load: %@"), mbps,
+                gNFBLastLoadSeconds >= 0.0 ? [NSString stringWithFormat:@"%.1fs", gNFBLastLoadSeconds] : @"—"] :
+            [NSString stringWithFormat:nfb_loc(@"NFB_NET_SPEED_FAILED", @"Measurement failed: %@"), error.localizedDescription ?: @"?"];
+        [weakSelf toast:msg];
+    });
+}
+// Downdetector has no public API and its pages are bot-protected, so the app does not read it in
+// the background; this opens the X page (Japan) in an in-app Safari sheet.
+- (void)openDowndetector {
+    UIViewController *top = [self topVC];
+    NSURL *url = [NSURL URLWithString:@"https://downdetector.jp/shougai/twitter/"];
+    if (!top || !url) return;
+    SFSafariViewController *safari = [[SFSafariViewController alloc] initWithURL:url];
+    [top presentViewController:safari animated:YES completion:nil];
+}
 // Diagnostics report + the log being recorded (if any) + the saved log, written to a text file
 // and handed to the share sheet ("Save to Files" -> iCloud Drive) so the PC can read it directly.
 - (void)shareDiagFile {
@@ -1516,7 +1706,7 @@ static void nfb_installCrashLoggerOnce(void) {
     fmt.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [fmt stringFromDate:[NSDate date]];
     NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"NeoFreeBird 11.35 b78 (b77 code, -O0) %@\n\n", stamp];
+    [text appendFormat:@"NeoFreeBird 11.35 b79 (b78 + badge/speed/nav pin, -O0) %@\n\n", stamp];
     [text appendString:nfb_buildDiagnosticReport() ?: @"(no report)"];
     if (NFBLogIsRecording() && gNFBLog.count) {
         [text appendString:@"\n\n=== log being recorded ===\n"];
@@ -1707,111 +1897,6 @@ static void nfb_installCrashLoggerOnce(void) {
 
 static UIViewController *nfb_makeColumnsSettingsViewController(void) {
     return [[NFBColumnsSettingsViewController alloc] init];
-}
-
-#pragma mark - network / X response badge (b78)
-
-// A small line under the stream button: connection (Wi-Fi / 5G / 4G / offline) and how long X's
-// last timeline load took (any pull / auto-refresh, measured from TFNDataViewController's
-// loadTopDidBegin -> loadTopDidEnd). Green < 1.5s, orange < 4s, red >= 4s or no reply in 12s.
-// Passive: no extra requests.
-static UILabel *gNFBNetBadge = nil;
-static NSInteger gNFBNetPath = -1;            // -1 unknown, 0 offline, 1 Wi-Fi, 2 cellular, 3 other
-static double gNFBLastLoadSeconds = -1.0;
-static BOOL gNFBLastLoadTimedOut = NO;
-static char kNFBLoadStartKey;
-
-static NSString *nfb_cellularGeneration(void) {
-    static CTTelephonyNetworkInfo *info = nil;
-    if (!info) info = [CTTelephonyNetworkInfo new];
-    NSString *tech = info.serviceCurrentRadioAccessTechnology.allValues.firstObject;
-    if (!tech) return @"Cell";
-    if (@available(iOS 14.1, *)) {
-        if ([tech isEqualToString:CTRadioAccessTechnologyNR] || [tech isEqualToString:CTRadioAccessTechnologyNRNSA]) return @"5G";
-    }
-    if ([tech isEqualToString:CTRadioAccessTechnologyLTE]) return @"4G";
-    return @"3G";
-}
-
-static void nfb_updateNetBadge(void) {
-    if (!gNFBNetBadge) return;
-    NSString *kind = gNFBNetPath == 1 ? @"Wi-Fi" : (gNFBNetPath == 2 ? nfb_cellularGeneration() : @"");
-    NSString *text;
-    UIColor *color;
-    if (gNFBNetPath == 0) {
-        text = nfb_loc(@"NFB_NET_OFFLINE", @"Offline");
-        color = UIColor.systemRedColor;
-    } else if (gNFBLastLoadTimedOut) {
-        text = [NSString stringWithFormat:@"%@ %@", kind, nfb_loc(@"NFB_NET_NO_REPLY", @"no reply")];
-        color = UIColor.systemRedColor;
-    } else if (gNFBLastLoadSeconds < 0.0) {
-        text = kind.length ? kind : @"-";
-        color = UIColor.secondaryLabelColor;
-    } else {
-        text = [NSString stringWithFormat:@"%@ %.1fs", kind, gNFBLastLoadSeconds];
-        color = gNFBLastLoadSeconds < 1.5 ? UIColor.systemGreenColor :
-            (gNFBLastLoadSeconds < 4.0 ? UIColor.systemOrangeColor : UIColor.systemRedColor);
-    }
-    gNFBNetBadge.text = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-    gNFBNetBadge.textColor = color;
-}
-
-static void nfb_startNetMonitorOnce(void) {
-    static dispatch_once_t once;
-    static nw_path_monitor_t monitor = nil;
-    dispatch_once(&once, ^{
-        monitor = nw_path_monitor_create();
-        nw_path_monitor_set_queue(monitor, dispatch_get_main_queue());
-        nw_path_monitor_set_update_handler(monitor, ^(nw_path_t path) {
-            if (nw_path_get_status(path) != nw_path_status_satisfied) gNFBNetPath = 0;
-            else if (nw_path_uses_interface_type(path, nw_interface_type_wifi)) gNFBNetPath = 1;
-            else if (nw_path_uses_interface_type(path, nw_interface_type_cellular)) gNFBNetPath = 2;
-            else gNFBNetPath = 3;
-            nfb_updateNetBadge();
-        });
-        nw_path_monitor_start(monitor);
-    });
-}
-
-static void nfb_noteLoadBegan(id owner) {
-    if (!owner) return;
-    NSNumber *start = @(CACurrentMediaTime());
-    objc_setAssociatedObject(owner, &kNFBLoadStartKey, start, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    __weak id weakOwner = owner;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        id strongOwner = weakOwner;
-        if (strongOwner && objc_getAssociatedObject(strongOwner, &kNFBLoadStartKey) == start) {
-            objc_setAssociatedObject(strongOwner, &kNFBLoadStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            gNFBLastLoadTimedOut = YES;
-            NFBLogEvent(@"netBadge load timed out (12s)");
-            nfb_updateNetBadge();
-        }
-    });
-}
-
-static void nfb_noteLoadEnded(id owner) {
-    NSNumber *start = owner ? objc_getAssociatedObject(owner, &kNFBLoadStartKey) : nil;
-    if (!start) return;
-    objc_setAssociatedObject(owner, &kNFBLoadStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    gNFBLastLoadSeconds = CACurrentMediaTime() - start.doubleValue;
-    gNFBLastLoadTimedOut = NO;
-    nfb_updateNetBadge();
-}
-
-static void nfb_installNetBadge(void) {
-    if (!gStreamButton) return;
-    if (!gNFBNetBadge) {
-        gNFBNetBadge = [[UILabel alloc] initWithFrame:CGRectMake(-14.0, 45.0, 74.0, 13.0)];
-        gNFBNetBadge.font = [UIFont monospacedDigitSystemFontOfSize:10.0 weight:UIFontWeightSemibold];
-        gNFBNetBadge.textAlignment = NSTextAlignmentCenter;
-        gNFBNetBadge.adjustsFontSizeToFitWidth = YES;
-        gNFBNetBadge.minimumScaleFactor = 0.7;
-        gNFBNetBadge.userInteractionEnabled = NO;
-    }
-    // A subview of the button: it fades / hides together with it.
-    if (gNFBNetBadge.superview != gStreamButton) [gStreamButton addSubview:gNFBNetBadge];
-    nfb_startNetMonitorOnce();
-    nfb_updateNetBadge();
 }
 
 #pragma mark - button visuals + lifecycle
@@ -4623,7 +4708,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b78] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b79] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -5044,7 +5129,7 @@ static void nfb_columnsNoteLayoutPassDuration(CFTimeInterval seconds) {
     if (seconds > worst) worst = seconds;
     if (now - windowStart < 2.0) return;
     if (gNFBLogRecording && passes > 0) {
-        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b78] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
+        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b79] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
             (long)passes, total / passes * 1000.0, worst * 1000.0,
             total / (now - windowStart) * 100.0, now - windowStart]);
     }
@@ -7326,7 +7411,7 @@ static void nfb_layoutActiveHomePaging(void) {
     if (gNFBLayoutActiveHomePagingRunning) {
         if (gNFBLogRecording) {
             static NSString *lastLayoutReentryKey = nil;
-            NSString *key = @"layout[b78] activeHome reentry deferred";
+            NSString *key = @"layout[b79] activeHome reentry deferred";
             if (![key isEqualToString:lastLayoutReentryKey]) { lastLayoutReentryKey = [key copy]; NFBLogEvent(key); }
         }
         nfb_requestLayoutActiveHomePagingOnNextTurn();
@@ -7548,6 +7633,38 @@ void NFBStreamPrefsChanged(void) {
     if (vc) nfb_streamStart(vc);   // restart the timer so a changed interval takes effect immediately
 }
 
+// b79: X collapses the Home header (logo bar + segment row) as the timeline scrolls. In columns
+// mode several timelines scroll at once and the header could be left half-collapsed, so entering
+// columns over a half-collapsed header left a big gap above the columns. While columns are shown
+// the header stays fully expanded and does not collapse; leaving restores X's own setting.
+static char kNFBNavCollapsingSavedKey;
+static void nfb_columnsPinNavigationBar(BOOL columns) {
+    UIViewController *paging = nfb_findAnyHomePagingController();
+    UINavigationController *nav = paging ? nfb_homeTimelineNavController(paging) : nil;
+    if (!nav) return;
+    BOOL canToggle = [nav respondsToSelector:@selector(setCollapsingNavigationBarEnabled:)] &&
+                     [nav respondsToSelector:@selector(isCollapsingNavigationBarEnabled)];
+    @try {
+        if (columns) {
+            if (canToggle && !objc_getAssociatedObject(nav, &kNFBNavCollapsingSavedKey)) {
+                BOOL wasEnabled = ((BOOL(*)(id, SEL))objc_msgSend)(nav, @selector(isCollapsingNavigationBarEnabled));
+                objc_setAssociatedObject(nav, &kNFBNavCollapsingSavedKey, @(wasEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            if (canToggle) ((void(*)(id, SEL, BOOL))objc_msgSend)(nav, @selector(setCollapsingNavigationBarEnabled:), NO);
+        } else if (canToggle) {
+            NSNumber *saved = objc_getAssociatedObject(nav, &kNFBNavCollapsingSavedKey);
+            if (saved) ((void(*)(id, SEL, BOOL))objc_msgSend)(nav, @selector(setCollapsingNavigationBarEnabled:), saved.boolValue);
+            objc_setAssociatedObject(nav, &kNFBNavCollapsingSavedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if ([nav respondsToSelector:@selector(setNavigationBarCollapsed:animated:)]) {
+            ((void(*)(id, SEL, BOOL, BOOL))objc_msgSend)(nav, @selector(setNavigationBarCollapsed:animated:), NO, NO);
+        }
+    } @catch (NSException *e) {
+        NFBLogEvent([NSString stringWithFormat:@"columnsPinNav threw %@", e.name]);
+    }
+    NFBLogEvent([NSString stringWithFormat:@"columnsPinNav columns=%d canToggle=%d", columns ? 1 : 0, canToggle ? 1 : 0]);
+}
+
 void NFBSetInlineColumnsEnabled(BOOL enabled) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ NFBSetInlineColumnsEnabled(enabled); });
@@ -7556,6 +7673,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
     BOOL changed = gInlineColumnsEnabled != enabled;
     if (changed) NFBLogEvent([NSString stringWithFormat:@"NFBSetInlineColumns -> %d", enabled]);
     gInlineColumnsEnabled = enabled;
+    if (changed) nfb_columnsPinNavigationBar(enabled);
     if (!enabled) {
         nfb_columnsDismissAllDetailNavs();
         gNFBLastTouchedColumnView = nil;
