@@ -60,9 +60,9 @@ jobs:
           cd main
           sed -i '' "s/^TARGET.*$/TARGET := iphone:clang:${{ inputs.sdk_version }}:${{ inputs.target_version }}/" Makefile
           make clean || true
-          # Optimised build (-Os). The Makefile's default is a DEBUG build (-O0) for every hook.
-          make DEBUG=0
-          make package DEBUG=0
+          # b78: back to the Makefile's DEBUG (-O0) build to test whether -Os broke the Spaces bar.
+          make
+          make package
         env:
           THEOS: ${{ github.workspace }}/theos
 

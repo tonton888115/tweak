@@ -2203,6 +2203,77 @@ static void BHTWatchdogCrashSuppressed(const char *cls) {
 }
 %end
 
+// b78: video ads, with the existing "hide promoted" setting.
+//  - pre-/mid-roll breaks of publisher (Amplify VMAP) videos: the playlist keeps only the content
+//  - dynamic preroll ads: no tweet / player session / card allows one, and nothing is prefetched
+//  - ads inserted between videos in the full-screen video viewer and timelines (Google native ads)
+@interface TAVAmplifyVMAPPlaylist : NSObject
+@end
+@interface TAFDynamicVideoAdManager : NSObject
+@end
+@interface TVPSessionConfiguration : NSObject
+@end
+@interface TMAPlayableMediaAttachment : NSObject
+@end
+@interface TFCCardData : NSObject
+@end
+@interface _TtC14T1TwitterSwift20JetfuelImmersiveItem : NSObject
+@end
+@interface _TtC14T1TwitterSwift34JetfuelTAVVideoPlayerSessionSource : NSObject
+@end
+@interface _TtC14T1TwitterSwift18ImmersiveViewModel : NSObject
+@end
+@interface _TtC14T1TwitterSwift40URTTimelineGoogleNativeAdTableRowAdapter : NSObject
+@end
+
+%hook TAVAmplifyVMAPPlaylist
+- (id)initWithContentItems:(NSArray *)contentItems adItems:(NSArray *)adItems {
+    return %orig(contentItems, [BHTManager HidePromoted] ? @[] : adItems);
+}
+- (NSArray *)adVideoItems {
+    return [BHTManager HidePromoted] ? @[] : %orig;
+}
+%end
+
+%hook TAFDynamicVideoAdManager
+- (void)prefetchDynamicAdsForVideoAdsTweetsIfNeeded:(id)tweets withAccountID:(id)accountID userReference:(id)userReference scribe:(id)scribe includeLongVideos:(BOOL)includeLongVideos auditAllowedUserIDs:(id)auditAllowedUserIDs {
+    if ([BHTManager HidePromoted]) return;
+    %orig;
+}
+%end
+
+%hook TFNTwitterStatus
+- (BOOL)allowDynamicAd { return [BHTManager HidePromoted] ? NO : %orig; }
+%end
+%hook TVPSessionConfiguration
+- (BOOL)allowDynamicAd { return [BHTManager HidePromoted] ? NO : %orig; }
+%end
+%hook TMAPlayableMediaAttachment
+- (BOOL)allowDynamicAd { return [BHTManager HidePromoted] ? NO : %orig; }
+%end
+%hook TFCCardData
+- (BOOL)allowDynamicAd { return [BHTManager HidePromoted] ? NO : %orig; }
+%end
+%hook _TtC14T1TwitterSwift20JetfuelImmersiveItem
+- (BOOL)allowDynamicAd { return [BHTManager HidePromoted] ? NO : %orig; }
+%end
+%hook _TtC14T1TwitterSwift34JetfuelTAVVideoPlayerSessionSource
+- (BOOL)allowDynamicAd { return [BHTManager HidePromoted] ? NO : %orig; }
+%end
+
+%hook _TtC14T1TwitterSwift18ImmersiveViewModel
+- (void)googleAdManagerDidCacheAdWithNotification:(id)notification {
+    if ([BHTManager HidePromoted]) return;
+    %orig;
+}
+%end
+%hook _TtC14T1TwitterSwift40URTTimelineGoogleNativeAdTableRowAdapter
+- (void)googleAdManagerDidCacheAdWithNotification:(id)notification {
+    if ([BHTManager HidePromoted]) return;
+    %orig;
+}
+%end
+
 %hook T1FleetLineView
 - (void)didMoveToWindow {
     %orig;

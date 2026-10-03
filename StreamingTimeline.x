@@ -28,6 +28,8 @@
 #include <mach/mach.h>  // b68 hang sampler: thread_suspend / thread_get_state / vm_read_overwrite
 #include <stdatomic.h>  // b68 hang sampler: main-thread heartbeat
 #include <time.h>       // b68 hang sampler: clock_gettime_nsec_np
+#import <Network/Network.h>                          // b78 network badge: path monitor
+#import <CoreTelephony/CTTelephonyNetworkInfo.h>     // b78 network badge: 5G / 4G
 
 static void nfb_streamStart(UIViewController *vc);
 static void nfb_streamStop(UIViewController *vc);
@@ -844,7 +846,11 @@ static BOOL nfb_streamTriggerTarget(UIViewController *target) {
     // Following's clean path: refresh the TFNTwitterHomeTimeline directly.
     if (!did && (r = nfb_findResponder(target, @selector(refreshWithSource:completion:), 0))) {
         __weak UIViewController *weakTarget = target;
+        id timingOwner = r;
+        nfb_noteLoadBegan(timingOwner);
+        __weak id weakTimingOwner = timingOwner;
         void (^completion)(void) = [^{
+            nfb_noteLoadEnded(weakTimingOwner);
             UIViewController *strongTarget = weakTarget;
             if (strongTarget) nfb_afterRefresh(strongTarget);
         } copy];
@@ -1508,7 +1514,7 @@ static void nfb_installCrashLoggerOnce(void) {
     fmt.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [fmt stringFromDate:[NSDate date]];
     NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"NeoFreeBird 11.35 b77 (b73 base + perf) %@\n\n", stamp];
+    [text appendFormat:@"NeoFreeBird 11.35 b78 (b77 code, -O0) %@\n\n", stamp];
     [text appendString:nfb_buildDiagnosticReport() ?: @"(no report)"];
     if (NFBLogIsRecording() && gNFBLog.count) {
         [text appendString:@"\n\n=== log being recorded ===\n"];
@@ -1701,15 +1707,132 @@ static UIViewController *nfb_makeColumnsSettingsViewController(void) {
     return [[NFBColumnsSettingsViewController alloc] init];
 }
 
+#pragma mark - network / X response badge (b78)
+
+// A small line under the stream button: connection (Wi-Fi / 5G / 4G / offline) and how long X's
+// last timeline load took (any pull / auto-refresh, measured from TFNDataViewController's
+// loadTopDidBegin -> loadTopDidEnd). Green < 1.5s, orange < 4s, red >= 4s or no reply in 12s.
+// Passive: no extra requests.
+static UILabel *gNFBNetBadge = nil;
+static NSInteger gNFBNetPath = -1;            // -1 unknown, 0 offline, 1 Wi-Fi, 2 cellular, 3 other
+static double gNFBLastLoadSeconds = -1.0;
+static BOOL gNFBLastLoadTimedOut = NO;
+static char kNFBLoadStartKey;
+
+static NSString *nfb_cellularGeneration(void) {
+    static CTTelephonyNetworkInfo *info = nil;
+    if (!info) info = [CTTelephonyNetworkInfo new];
+    NSString *tech = info.serviceCurrentRadioAccessTechnology.allValues.firstObject;
+    if (!tech) return @"Cell";
+    if (@available(iOS 14.1, *)) {
+        if ([tech isEqualToString:CTRadioAccessTechnologyNR] || [tech isEqualToString:CTRadioAccessTechnologyNRNSA]) return @"5G";
+    }
+    if ([tech isEqualToString:CTRadioAccessTechnologyLTE]) return @"4G";
+    return @"3G";
+}
+
+static void nfb_updateNetBadge(void) {
+    if (!gNFBNetBadge) return;
+    NSString *kind = gNFBNetPath == 1 ? @"Wi-Fi" : (gNFBNetPath == 2 ? nfb_cellularGeneration() : @"");
+    NSString *text;
+    UIColor *color;
+    if (gNFBNetPath == 0) {
+        text = nfb_loc(@"NFB_NET_OFFLINE", @"Offline");
+        color = UIColor.systemRedColor;
+    } else if (gNFBLastLoadTimedOut) {
+        text = [NSString stringWithFormat:@"%@ %@", kind, nfb_loc(@"NFB_NET_NO_REPLY", @"no reply")];
+        color = UIColor.systemRedColor;
+    } else if (gNFBLastLoadSeconds < 0.0) {
+        text = kind.length ? kind : @"-";
+        color = UIColor.secondaryLabelColor;
+    } else {
+        text = [NSString stringWithFormat:@"%@ %.1fs", kind, gNFBLastLoadSeconds];
+        color = gNFBLastLoadSeconds < 1.5 ? UIColor.systemGreenColor :
+            (gNFBLastLoadSeconds < 4.0 ? UIColor.systemOrangeColor : UIColor.systemRedColor);
+    }
+    gNFBNetBadge.text = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    gNFBNetBadge.textColor = color;
+}
+
+static void nfb_startNetMonitorOnce(void) {
+    static dispatch_once_t once;
+    static nw_path_monitor_t monitor = nil;
+    dispatch_once(&once, ^{
+        monitor = nw_path_monitor_create();
+        nw_path_monitor_set_queue(monitor, dispatch_get_main_queue());
+        nw_path_monitor_set_update_handler(monitor, ^(nw_path_t path) {
+            if (nw_path_get_status(path) != nw_path_status_satisfied) gNFBNetPath = 0;
+            else if (nw_path_uses_interface_type(path, nw_interface_type_wifi)) gNFBNetPath = 1;
+            else if (nw_path_uses_interface_type(path, nw_interface_type_cellular)) gNFBNetPath = 2;
+            else gNFBNetPath = 3;
+            nfb_updateNetBadge();
+        });
+        nw_path_monitor_start(monitor);
+    });
+}
+
+static void nfb_noteLoadBegan(id owner) {
+    if (!owner) return;
+    NSNumber *start = @(CACurrentMediaTime());
+    objc_setAssociatedObject(owner, &kNFBLoadStartKey, start, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak id weakOwner = owner;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        id strongOwner = weakOwner;
+        if (strongOwner && objc_getAssociatedObject(strongOwner, &kNFBLoadStartKey) == start) {
+            objc_setAssociatedObject(strongOwner, &kNFBLoadStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            gNFBLastLoadTimedOut = YES;
+            NFBLogEvent(@"netBadge load timed out (12s)");
+            nfb_updateNetBadge();
+        }
+    });
+}
+
+static void nfb_noteLoadEnded(id owner) {
+    NSNumber *start = owner ? objc_getAssociatedObject(owner, &kNFBLoadStartKey) : nil;
+    if (!start) return;
+    objc_setAssociatedObject(owner, &kNFBLoadStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gNFBLastLoadSeconds = CACurrentMediaTime() - start.doubleValue;
+    gNFBLastLoadTimedOut = NO;
+    nfb_updateNetBadge();
+}
+
+static void nfb_installNetBadge(void) {
+    if (!gStreamButton) return;
+    if (!gNFBNetBadge) {
+        gNFBNetBadge = [[UILabel alloc] initWithFrame:CGRectMake(-14.0, 45.0, 74.0, 13.0)];
+        gNFBNetBadge.font = [UIFont monospacedDigitSystemFontOfSize:10.0 weight:UIFontWeightSemibold];
+        gNFBNetBadge.textAlignment = NSTextAlignmentCenter;
+        gNFBNetBadge.adjustsFontSizeToFitWidth = YES;
+        gNFBNetBadge.minimumScaleFactor = 0.7;
+        gNFBNetBadge.userInteractionEnabled = NO;
+    }
+    // A subview of the button: it fades / hides together with it.
+    if (gNFBNetBadge.superview != gStreamButton) [gStreamButton addSubview:gNFBNetBadge];
+    nfb_startNetMonitorOnce();
+    nfb_updateNetBadge();
+}
+
 #pragma mark - button visuals + lifecycle
 
+// On: the ring depletes over the refresh interval and its centre shows the interval in seconds.
+// Off: a grey refresh arrow.
 static void nfb_styleButton(BOOL on) {
     if (!gStreamButton) return;
-    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightSemibold];
-    NSString *name = on ? @"arrow.clockwise.circle.fill" : @"arrow.clockwise.circle";
-    [gStreamButton setImage:[[UIImage systemImageNamed:name withConfiguration:cfg] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    if (on) {
+        [gStreamButton setImage:nil forState:UIControlStateNormal];
+        NSString *seconds = [NSString stringWithFormat:@"%ld", (long)[BHTManager autoStreamInterval]];
+        UIFont *font = [UIFont monospacedDigitSystemFontOfSize:(seconds.length > 2 ? 12.0 : 15.0) weight:UIFontWeightBold];
+        [gStreamButton setAttributedTitle:[[NSAttributedString alloc] initWithString:seconds
+            attributes:@{ NSFontAttributeName: font, NSForegroundColorAttributeName: UIColor.systemBlueColor }] forState:UIControlStateNormal];
+    } else {
+        [gStreamButton setAttributedTitle:nil forState:UIControlStateNormal];
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightSemibold];
+        [gStreamButton setImage:[[UIImage systemImageNamed:@"arrow.clockwise.circle" withConfiguration:cfg]
+            imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    }
     gStreamButton.tintColor = on ? nil : [UIColor systemGrayColor];
     gStreamButton.gauge.hidden = !on;
+    nfb_installNetBadge();
     nfb_updateStreamStateIconForVC(gActiveItemsVC);
 }
 static void nfb_updateGauge(BOOL on, NSTimeInterval interval) {
@@ -4498,7 +4621,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b77] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b78] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -4919,7 +5042,7 @@ static void nfb_columnsNoteLayoutPassDuration(CFTimeInterval seconds) {
     if (seconds > worst) worst = seconds;
     if (now - windowStart < 2.0) return;
     if (gNFBLogRecording && passes > 0) {
-        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b77] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
+        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b78] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
             (long)passes, total / passes * 1000.0, worst * 1000.0,
             total / (now - windowStart) * 100.0, now - windowStart]);
     }
@@ -7201,7 +7324,7 @@ static void nfb_layoutActiveHomePaging(void) {
     if (gNFBLayoutActiveHomePagingRunning) {
         if (gNFBLogRecording) {
             static NSString *lastLayoutReentryKey = nil;
-            NSString *key = @"layout[b77] activeHome reentry deferred";
+            NSString *key = @"layout[b78] activeHome reentry deferred";
             if (![key isEqualToString:lastLayoutReentryKey]) { lastLayoutReentryKey = [key copy]; NFBLogEvent(key); }
         }
         nfb_requestLayoutActiveHomePagingOnNextTurn();
@@ -7650,6 +7773,11 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 // surface and never reach the home items VC scroll hook, so the stream state icon kept reading
 // "paused" even when the list sat at the very top. Refresh straight from the list's own scroll,
 // but only when it belongs to the Home surface so unrelated URT screens are unaffected.
+%hook TFNDataViewController
+- (void)loadTopDidBegin { %orig; nfb_noteLoadBegan(self); }
+- (void)loadTopDidEnd { %orig; nfb_noteLoadEnded(self); }
+%end
+
 %hook T1URTViewController
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
     %orig;

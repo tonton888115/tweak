@@ -11,7 +11,7 @@ NFB_DIAG ?= 1
 TWEAK_NAME = BHTwitter
 
 BHTwitter_FILES = Tweak.x StreamingTimeline.x ModernSettingsViewController.m $(wildcard *.m BHDownload/*.m BHTBundle/*.m Colours/*.m JGProgressHUD/*.m SAMKeychain/*.m AppIcon/*.m CustomTabBar/*.m ThemeColor/*.m)
-BHTwitter_FRAMEWORKS = UIKit Foundation AVFoundation AVKit CoreMotion GameController VideoToolbox Accelerate CoreMedia CoreImage CoreGraphics ImageIO Photos CoreServices SystemConfiguration SafariServices Security QuartzCore WebKit SceneKit
+BHTwitter_FRAMEWORKS = Network CoreTelephony UIKit Foundation AVFoundation AVKit CoreMotion GameController VideoToolbox Accelerate CoreMedia CoreImage CoreGraphics ImageIO Photos CoreServices SystemConfiguration SafariServices Security QuartzCore WebKit SceneKit
 BHTwitter_PRIVATE_FRAMEWORKS = Preferences
 BHTwitter_EXTRA_FRAMEWORKS = Cephei CepheiPrefs CepheiUI
 BHTwitter_OBJ_FILES = $(shell find lib -name '*.a')

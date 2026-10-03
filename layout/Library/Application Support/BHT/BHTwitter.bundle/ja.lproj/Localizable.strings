@@ -517,6 +517,8 @@
 "NFB_INTERVAL_CHANGE" = "⏱ 更新間隔を変更…";
 "NFB_DIAG_SHOW" = "🔍 診断情報（コピーして送って）";
 "NFB_DIAG_SHARE" = "📤 診断情報をファイルで保存（iCloud Drive など）";
+"NFB_NET_OFFLINE" = "オフライン";
+"NFB_NET_NO_REPLY" = "応答なし";
 "NFB_LOG_COPIED_TITLE" = "録画ログ（コピー済み）";
 "NFB_SAVED_LOG_COPIED_TITLE" = "保存ログ（コピー済み）";
 "NFB_RECOPY" = "再コピー";
