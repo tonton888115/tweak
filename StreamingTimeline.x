@@ -34,6 +34,8 @@
 static void nfb_streamStart(UIViewController *vc);
 static void nfb_streamStop(UIViewController *vc);
 static void nfb_installButton(UIWindow *win);
+static void nfb_noteLoadBegan(id owner);
+static void nfb_noteLoadEnded(id owner);
 static void nfb_removeButton(void);
 static UIViewController *nfb_selectedTimelineVC(UIViewController *vc);
 static void nfb_streamTrigger(UIViewController *vc);
