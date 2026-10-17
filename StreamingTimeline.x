@@ -170,6 +170,18 @@ static NSTimeInterval gLastUserTimelineScrollInteraction = 0.0;
 static NSMutableArray<NSString *> *gNFBLayoutPerfLines = nil;   // b82: last columns layout windows, for the diag file
 static double gNFBLayoutEntriesSeconds = 0.0;   // b82: per-window cost split (layoutPerf)
 static double gNFBLayoutChromeSeconds = 0.0;
+// b83: cost split of one columns pass (pre / chrome / split / setup / cols / sync / tail), the
+// slowest pass of each window is reported; plus the segmented controller's own hide pass.
+static double gNFBPassSeg[7];
+static NSInteger gNFBPassSyncCount = 0;
+static CFTimeInterval gNFBPassMarkAt = 0.0;
+static double gNFBSegHideSeconds = 0.0;
+static NSInteger gNFBSegHideCount = 0;
+static void nfb_passMark(int seg) {
+    CFTimeInterval now = CACurrentMediaTime();
+    gNFBPassSeg[seg] += now - gNFBPassMarkAt;
+    gNFBPassMarkAt = now;
+}
 static BOOL gRefreshStartedAtTop = NO;
 static char kNFBRefreshStartedAtKey;
 static char kNFBRefreshStartedAtTopKey;
@@ -1745,7 +1757,7 @@ static void nfb_installNetBadge(void) {
     fmt.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [fmt stringFromDate:[NSDate date]];
     NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"NeoFreeBird 11.35 b82 (b81 + cheaper columns layout, -O0) %@\n\n", stamp];
+    [text appendFormat:@"NeoFreeBird 11.35 b83 (b82 + no chrome scan mid-swipe, -O0) %@\n\n", stamp];
     [text appendString:nfb_buildDiagnosticReport() ?: @"(no report)"];
     nfb_flushScrollRun();
     [text appendFormat:@"\n\n=== TL scroll smoothness (last sessions; slow = frame gap > 25ms) ===\n%@",
@@ -3117,7 +3129,8 @@ static void nfb_setColumnsGlobalTopChromeHidden(BOOL hidden) {
 // b82: the full chrome scan (three subtree walks with text collection) ran on every columns layout
 // pass. Now it runs at most every 0.5s per pager, or sooner when the top hierarchy changes (child
 // counts of the segmented / container views); in between, the views already hidden are only kept
-// hidden (cheap). A bar that appears between scans can show for up to 0.5s.
+// hidden (cheap). A bar that appears between scans can show for up to 0.5s (b83: 1.5s, or until
+// the swipe ends — unless the top hierarchy changes).
 static char kNFBChromeScanAtKey;
 static char kNFBChromeScanSigKey;
 
@@ -3139,7 +3152,12 @@ static void nfb_setColumnsSegmentedHiddenForPaging(UIViewController *paging, BOO
         NSString *sig = [NSString stringWithFormat:@"%lu/%lu", (unsigned long)segmented.viewIfLoaded.subviews.count,
             (unsigned long)container.viewIfLoaded.subviews.count];
         NSNumber *lastScan = objc_getAssociatedObject(paging, &kNFBChromeScanAtKey);
-        if (lastScan && now - lastScan.doubleValue < 0.5 && [sig isEqualToString:objc_getAssociatedObject(paging, &kNFBChromeScanSigKey)]) {
+        BOOL sameSig = [sig isEqualToString:objc_getAssociatedObject(paging, &kNFBChromeScanSigKey)];
+        // b83: a full scan costs ~20-25ms (-O0) — never mid-swipe (layout passes come every frame
+        // then), and otherwise at most every 1.5s while the top hierarchy is unchanged.
+        UIScrollView *pagerScroll = lastScan ? nfb_horizontalPagingScrollViewOf(paging) : nil;
+        BOOL swiping = pagerScroll && (pagerScroll.isDragging || pagerScroll.isTracking || pagerScroll.isDecelerating);
+        if (lastScan && sameSig && (swiping || now - lastScan.doubleValue < 1.5)) {
             nfb_reassertSavedColumnsChrome();
             return;
         }
@@ -4439,6 +4457,9 @@ static void nfb_columnsExpandPrimaryViaConstraint(UIViewController *paging, UISc
 
 static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     if (!nfb_inlineColumnsActiveForHomePaging(paging) || ![paging isViewLoaded]) return;
+    memset(gNFBPassSeg, 0, sizeof(gNFBPassSeg));
+    gNFBPassSyncCount = 0;
+    gNFBPassMarkAt = CACurrentMediaTime();
     // Twitter's own paging layout runs in %orig (before us) on every pass and snaps the pages back
     // to full-width paging positions. We must ALWAYS re-apply the column frames so that snap can't
     // win mid-drag (that was the "catch and bounce back"). Only the contentSize/contentOffset
@@ -4486,9 +4507,11 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     // walk per pass was pure waste (the pager scroll doesn't change mid-pass).
     UIScrollView *nativeScrollView = activeColumnsScroll ?: nfb_horizontalPagingScrollViewOf(paging);
     if (!nativeScrollView) return;
+    nfb_passMark(0);
     CFTimeInterval chromeStart = CACurrentMediaTime();
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
     gNFBLayoutChromeSeconds += CACurrentMediaTime() - chromeStart;
+    nfb_passMark(1);
     NSMutableArray<NSDictionary *> *layoutEntries = [NSMutableArray array];
     NSMutableArray<UIViewController *> *pages = [NSMutableArray array];
     for (NSDictionary *entry in entries) {
@@ -4550,6 +4573,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
     nfb_columnsApplyNativeSplitTierForPaging(paging, nfb_columnsFullWidthPref()); // b37: native medium tier (sidebar yes, extended content no)
     UIView *host = nfb_columnsHostViewForPaging(paging);
     nfb_applyColumnsLogoBarHidden(paging);                              // Issue C: hide iPad logo/nav bar at root
+    nfb_passMark(2);
     CGRect bounds = nativeScrollView.bounds;
     if (bounds.size.width < 120.0 || bounds.size.height < 240.0) return;
     CGFloat columnWidth = nfb_columnsColumnWidth(bounds.size.width);
@@ -4614,6 +4638,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         }
     }
 
+    nfb_passMark(3);
     NSUInteger idx = 0;
     NSInteger combinedSlotIdx = -1;   // b71: the combined Home column's slot, if laid out this pass
     for (NSDictionary *entry in layoutEntries) {
@@ -4709,7 +4734,12 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
             // track the new width live (off-screen columns stay batched to avoid the b57 all-column
             // burst).
             BOOL columnVisibleForSync = CGRectIntersectsRect(columnFrame, nativeScrollView.bounds);
-            if (!columnsScrollDragging && isTimeline && (!gNFBColumnsSizeTransitioning || columnVisibleForSync)) [columnView layoutIfNeeded];
+            if (!columnsScrollDragging && isTimeline && (!gNFBColumnsSizeTransitioning || columnVisibleForSync)) {
+                CFTimeInterval syncStart = CACurrentMediaTime();
+                [columnView layoutIfNeeded];
+                gNFBPassSeg[5] += CACurrentMediaTime() - syncStart;
+                gNFBPassSyncCount++;
+            }
         }
         if (isTimeline) {
             nfb_adjustColumnScrollForPage(vc, columnView);
@@ -4731,6 +4761,8 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         idx++;
     }
     nfb_columnsLayoutCombinedBar(nativeScrollView, combinedSlotIdx, columnWidth);   // b71
+    nfb_passMark(4);
+    gNFBPassSeg[4] -= gNFBPassSeg[5];   // the loop total includes the sync layouts
 
     // Legacy fallback only. b37 sources Search/Explore from the compact app-tab Guide VC instead of
     // transplanting the wide app-split trends/search sidebar.
@@ -4813,10 +4845,11 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b82] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b83] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
+    nfb_passMark(6);
 }
 
 static CGFloat nfb_horizontalScrollScore(UIScrollView *sv) {
@@ -5227,16 +5260,23 @@ static void nfb_columnsNoteLayoutPassDuration(CFTimeInterval seconds) {
     static CFTimeInterval total = 0.0;
     static CFTimeInterval worst = 0.0;
     static NSInteger passes = 0;
+    static NSString *worstSplit = nil;
     CFTimeInterval now = CACurrentMediaTime();
     if (windowStart <= 0.0) windowStart = now;
     total += seconds;
     passes++;
-    if (seconds > worst) worst = seconds;
+    if (seconds > worst) {
+        worst = seconds;
+        worstSplit = [NSString stringWithFormat:@"pre=%.1f chrome=%.1f split=%.1f setup=%.1f cols=%.1f sync=%.1f(%ld) tail=%.1f",
+            gNFBPassSeg[0] * 1000.0, gNFBPassSeg[1] * 1000.0, gNFBPassSeg[2] * 1000.0, gNFBPassSeg[3] * 1000.0,
+            gNFBPassSeg[4] * 1000.0, gNFBPassSeg[5] * 1000.0, (long)gNFBPassSyncCount, gNFBPassSeg[6] * 1000.0];
+    }
     if (now - windowStart < 2.0) return;
     if (passes > 0) {
-        NSString *line = [NSString stringWithFormat:@"layoutPerf[b82] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs entries=%.1fms chrome=%.1fms",
+        NSString *line = [NSString stringWithFormat:@"layoutPerf[b83] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs entries=%.1fms chrome=%.1fms segHide=%.1fms/%ld worst[%@]",
             (long)passes, total / passes * 1000.0, worst * 1000.0,
-            total / (now - windowStart) * 100.0, now - windowStart, gNFBLayoutEntriesSeconds * 1000.0, gNFBLayoutChromeSeconds * 1000.0];
+            total / (now - windowStart) * 100.0, now - windowStart, gNFBLayoutEntriesSeconds * 1000.0, gNFBLayoutChromeSeconds * 1000.0,
+            gNFBSegHideSeconds * 1000.0, (long)gNFBSegHideCount, worstSplit ?: @"-"];
         if (gNFBLogRecording) NFBLogEvent(line);
         if (!gNFBLayoutPerfLines) gNFBLayoutPerfLines = [NSMutableArray array];
         static NSDateFormatter *fmt = nil;
@@ -5244,8 +5284,9 @@ static void nfb_columnsNoteLayoutPassDuration(CFTimeInterval seconds) {
         [gNFBLayoutPerfLines addObject:[NSString stringWithFormat:@"%@ %@", [fmt stringFromDate:[NSDate date]], line]];
         if (gNFBLayoutPerfLines.count > 30) [gNFBLayoutPerfLines removeObjectAtIndex:0];
     }
-    windowStart = now; total = 0.0; worst = 0.0; passes = 0;
+    windowStart = now; total = 0.0; worst = 0.0; passes = 0; worstSplit = nil;
     gNFBLayoutEntriesSeconds = 0.0; gNFBLayoutChromeSeconds = 0.0;
+    gNFBSegHideSeconds = 0.0; gNFBSegHideCount = 0;
 }
 
 static void nfb_applyInlineColumns(UIViewController *paging) {
@@ -7555,7 +7596,7 @@ static void nfb_layoutActiveHomePaging(void) {
     if (gNFBLayoutActiveHomePagingRunning) {
         if (gNFBLogRecording) {
             static NSString *lastLayoutReentryKey = nil;
-            NSString *key = @"layout[b82] activeHome reentry deferred";
+            NSString *key = @"layout[b83] activeHome reentry deferred";
             if (![key isEqualToString:lastLayoutReentryKey]) { lastLayoutReentryKey = [key copy]; NFBLogEvent(key); }
         }
         nfb_requestLayoutActiveHomePagingOnNextTurn();
@@ -7730,8 +7771,11 @@ static void nfb_reapplyColumnsSegmentedControlHidden(void) {
     if (paging && [paging isViewLoaded]) nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
     UIViewController *segmented = paging ? nfb_parentControllerNamed(paging, @"Segmented") : nil;
     if (segmented && [segmented isViewLoaded]) {
+        CFTimeInterval segStart = CACurrentMediaTime();
         nfb_applyColumnsSegmentedControlHidden(segmented);
         nfb_forceColumnsSegmentedControlHeightCollapsed(segmented);
+        gNFBSegHideSeconds += CACurrentMediaTime() - segStart;
+        gNFBSegHideCount++;
     }
 }
 
@@ -8177,8 +8221,11 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 - (void)viewDidLayoutSubviews {
     %orig;
     if (gInlineColumnsEnabled) {
+        CFTimeInterval segStart = CACurrentMediaTime();
         nfb_applyColumnsSegmentedControlHidden(self);
         nfb_forceColumnsSegmentedControlHeightCollapsed(self);
+        gNFBSegHideSeconds += CACurrentMediaTime() - segStart;
+        gNFBSegHideCount++;
     }
 }
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
