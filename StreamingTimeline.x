@@ -1742,7 +1742,7 @@ static void nfb_installNetBadge(void) {
     fmt.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [fmt stringFromDate:[NSDate date]];
     NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"NeoFreeBird 11.35 b80 (b79 + immersive ad filter + scroll work, -O0) %@\n\n", stamp];
+    [text appendFormat:@"NeoFreeBird 11.35 b81 (b80 + no stream work mid-scroll, -O0) %@\n\n", stamp];
     [text appendString:nfb_buildDiagnosticReport() ?: @"(no report)"];
     nfb_flushScrollRun();
     [text appendFormat:@"\n\n=== TL scroll smoothness (last sessions; slow = frame gap > 25ms) ===\n%@",
@@ -2027,14 +2027,25 @@ static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
 // Scroll callbacks fire every frame; the stream state behind the icon (columns, scroll views, tab)
 // is re-evaluated at most ~3x per second instead.
 static BOOL gNFBStateIconPending = NO;
-static void nfb_scheduleStateIconUpdate(void) {
-    if (gNFBStateIconPending) return;
-    gNFBStateIconPending = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+// b81: trailing debounce — the check (which in columns rebuilds the column list) runs once the
+// scroll has been quiet for 0.3s, never in the middle of a scroll.
+static CFTimeInterval gNFBStateIconRequestedAt = 0.0;
+static void nfb_runStateIconUpdateWhenIdle(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (CACurrentMediaTime() - gNFBStateIconRequestedAt < 0.3) {
+            nfb_runStateIconUpdateWhenIdle();   // still scrolling: look again later
+            return;
+        }
         gNFBStateIconPending = NO;
         NFBUpdateStreamButtonVisibility();   // b73 has no tab-change notification: re-check here
         nfb_updateStreamStateIconForVC(gActiveItemsVC);
     });
+}
+static void nfb_scheduleStateIconUpdate(void) {
+    gNFBStateIconRequestedAt = CACurrentMediaTime();
+    if (gNFBStateIconPending) return;
+    gNFBStateIconPending = YES;
+    nfb_runStateIconUpdateWhenIdle();
 }
 
 static void nfb_installButton(UIWindow *win) {
@@ -2315,7 +2326,9 @@ static void nfb_streamStart(UIViewController *vc) {
             }
         }
     }];
-    [[NSRunLoop mainRunLoop] addTimer:timer forMode:UITrackingRunLoopMode];
+    // b81: default run loop mode only (scheduledTimer...). While a scroll view is being dragged or
+    // decelerating the run loop is in UITrackingRunLoopMode, so the tick (refresh checks + the
+    // refresh itself) waits until the scroll ends instead of running mid-scroll.
     objc_setAssociatedObject(vc, &kNFBStreamTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
@@ -4764,7 +4777,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b80] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b81] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -5185,7 +5198,7 @@ static void nfb_columnsNoteLayoutPassDuration(CFTimeInterval seconds) {
     if (seconds > worst) worst = seconds;
     if (now - windowStart < 2.0) return;
     if (gNFBLogRecording && passes > 0) {
-        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b80] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
+        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b81] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
             (long)passes, total / passes * 1000.0, worst * 1000.0,
             total / (now - windowStart) * 100.0, now - windowStart]);
     }
@@ -7467,7 +7480,7 @@ static void nfb_layoutActiveHomePaging(void) {
     if (gNFBLayoutActiveHomePagingRunning) {
         if (gNFBLogRecording) {
             static NSString *lastLayoutReentryKey = nil;
-            NSString *key = @"layout[b80] activeHome reentry deferred";
+            NSString *key = @"layout[b81] activeHome reentry deferred";
             if (![key isEqualToString:lastLayoutReentryKey]) { lastLayoutReentryKey = [key copy]; NFBLogEvent(key); }
         }
         nfb_requestLayoutActiveHomePagingOnNextTurn();
