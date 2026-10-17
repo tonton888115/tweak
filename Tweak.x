@@ -2226,6 +2226,54 @@ static void BHTWatchdogCrashSuppressed(const char *cls) {
 @interface _TtC14T1TwitterSwift40URTTimelineGoogleNativeAdTableRowAdapter : NSObject
 @end
 
+// b80: the full-screen (TikTok-like) video feed loads its pages from two GraphQL operations and
+// keeps its own card list, so promoted videos never pass the timeline filters. Remove the
+// promoted entries ("promoted-tweet-…") from those responses before X parses them — the approach
+// upstream NeoFreeBird/app uses since v7.2.0 (commit e37db29); 11.35 has the same TNL initializer
+// and the same operation names.
+@interface TNLResponseInfo : NSObject
+@end
+
+static BOOL NFBIsImmersiveTimelineURL(NSURL *url) {
+    NSArray<NSString *> *parts = url.path.pathComponents;
+    return [parts containsObject:@"graphql"] &&
+        [@[@"ImmersiveViewerExploreMixerTimeline", @"ImmersiveProfileViewer"] containsObject:parts.lastObject ?: @""];
+}
+
+static id NFBRemovePromotedEntries(id node, BOOL *removed) {
+    if ([node isKindOfClass:NSArray.class]) {
+        NSMutableArray *kept = [NSMutableArray array];
+        for (id value in node) {
+            id entryID = nil;
+            if ([value isKindOfClass:NSDictionary.class]) entryID = value[@"entry_id"] ?: value[@"entryId"];
+            if ([entryID isKindOfClass:NSString.class] && [entryID hasPrefix:@"promoted-tweet-"]) {
+                *removed = YES;
+                continue;
+            }
+            [kept addObject:NFBRemovePromotedEntries(value, removed)];
+        }
+        return kept;
+    }
+    if ([node isKindOfClass:NSDictionary.class]) {
+        NSMutableDictionary *copy = [node mutableCopy];
+        for (id key in node) copy[key] = NFBRemovePromotedEntries(node[key], removed);
+        return copy;
+    }
+    return node;
+}
+
+%hook TNLResponseInfo
+- (instancetype)initWithFinalURLRequest:(NSURLRequest *)request URLResponse:(NSURLResponse *)response source:(NSInteger)source data:(NSData *)data temporarySavedFile:(id)temporarySavedFile {
+    if ([BHTManager HidePromoted] && data.length && NFBIsImmersiveTimelineURL(request.URL)) {
+        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        BOOL removed = NO;
+        id filtered = json ? NFBRemovePromotedEntries(json, &removed) : nil;
+        if (removed) data = [NSJSONSerialization dataWithJSONObject:filtered options:0 error:nil] ?: data;
+    }
+    return %orig(request, response, source, data, temporarySavedFile);
+}
+%end
+
 %hook TAVAmplifyVMAPPlaylist
 - (id)initWithContentItems:(NSArray *)contentItems adItems:(NSArray *)adItems {
     return %orig(contentItems, [BHTManager HidePromoted] ? @[] : adItems);

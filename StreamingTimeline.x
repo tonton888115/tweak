@@ -589,6 +589,41 @@ static BOOL nfb_isTimelineAtTop(UIViewController *vc) {
     CGFloat topY = -sv.adjustedContentInset.top;
     return sv.contentOffset.y <= topY + 8.0;
 }
+// b80: one summary per TL scroll session (drag + deceleration): frames, longest gap between frames,
+// frames that took > 25ms (a visible hitch at 60/120Hz). The last sessions go into the diag file.
+static NSMutableArray<NSString *> *gNFBScrollSessions = nil;
+static struct { CFTimeInterval start, last, maxGap; NSUInteger frames, slow; } gNFBScrollRun;
+
+static void nfb_flushScrollRun(void) {
+    if (gNFBScrollRun.frames >= 10) {
+        if (!gNFBScrollSessions) gNFBScrollSessions = [NSMutableArray array];
+        NSDateFormatter *fmt = nil;
+        static NSDateFormatter *shared = nil;
+        if (!shared) { shared = [NSDateFormatter new]; shared.dateFormat = @"HH:mm:ss"; }
+        fmt = shared;
+        [gNFBScrollSessions addObject:[NSString stringWithFormat:@"%@ frames=%lu %.1fs maxGap=%.0fms slow(>25ms)=%lu",
+            [fmt stringFromDate:[NSDate date]], (unsigned long)gNFBScrollRun.frames, gNFBScrollRun.last - gNFBScrollRun.start,
+            gNFBScrollRun.maxGap * 1000.0, (unsigned long)gNFBScrollRun.slow]];
+        if (gNFBScrollSessions.count > 30) [gNFBScrollSessions removeObjectAtIndex:0];
+    }
+    memset(&gNFBScrollRun, 0, sizeof(gNFBScrollRun));
+}
+
+static void nfb_noteScrollFrame(UIScrollView *sv) {
+    if (!(sv.isDragging || sv.isDecelerating || sv.isTracking)) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (gNFBScrollRun.last > 0.0 && now - gNFBScrollRun.last > 0.5) nfb_flushScrollRun();   // a new session
+    if (gNFBScrollRun.last > 0.0) {
+        double gap = now - gNFBScrollRun.last;
+        if (gap > gNFBScrollRun.maxGap) gNFBScrollRun.maxGap = gap;
+        if (gap > 0.025) gNFBScrollRun.slow++;
+    } else {
+        gNFBScrollRun.start = now;
+    }
+    gNFBScrollRun.frames++;
+    gNFBScrollRun.last = now;
+}
+
 static void nfb_noteActiveTimelineScroll(UIScrollView *sv) {
     if (!sv) return;
     gActiveTimelineScrollView = sv;
@@ -1707,8 +1742,11 @@ static void nfb_installNetBadge(void) {
     fmt.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [fmt stringFromDate:[NSDate date]];
     NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"NeoFreeBird 11.35 b79 (b78 + badge/speed/nav pin, -O0) %@\n\n", stamp];
+    [text appendFormat:@"NeoFreeBird 11.35 b80 (b79 + immersive ad filter + scroll work, -O0) %@\n\n", stamp];
     [text appendString:nfb_buildDiagnosticReport() ?: @"(no report)"];
+    nfb_flushScrollRun();
+    [text appendFormat:@"\n\n=== TL scroll smoothness (last sessions; slow = frame gap > 25ms) ===\n%@",
+        gNFBScrollSessions.count ? [gNFBScrollSessions componentsJoinedByString:@"\n"] : @"(no scroll recorded)"];
     if (NFBLogIsRecording() && gNFBLog.count) {
         [text appendString:@"\n\n=== log being recorded ===\n"];
         [text appendString:[gNFBLog componentsJoinedByString:@"\n"]];
@@ -2140,15 +2178,23 @@ static BOOL nfb_tabViewSelected(UIView *view, BOOL *known) {
     return NO;
 }
 
+// The view holding the tab buttons, remembered so later lookups scan a few views instead of every
+// view in every window (b80: this ran 2-3x every 0.3s while scrolling).
+static __weak UIView *gNFBTabContainer = nil;
+
 static NSString *nfb_selectedTabPageInView(UIView *view, int depth) {
     if (!view || view.hidden || view.alpha < 0.01 || depth > 12) return nil;
-    Class tabClass = NSClassFromString(@"T1TabView");
-    BOOL looksLikeTab = (tabClass && [view isKindOfClass:tabClass]) || [NSStringFromClass(view.class) isEqualToString:@"T1TabView"];
+    static Class tabClass = Nil;
+    if (!tabClass) tabClass = NSClassFromString(@"T1TabView");
+    BOOL looksLikeTab = tabClass && [view isKindOfClass:tabClass];
     if (looksLikeTab) {
         BOOL known = NO;
         BOOL selected = nfb_tabViewSelected(view, &known);
         NSString *page = nfb_scribePageOfTabView(view);
-        if (known && selected && page.length) return page;
+        if (known && selected && page.length) {
+            gNFBTabContainer = view.superview;
+            return page;
+        }
     }
     for (UIView *subview in view.subviews.reverseObjectEnumerator) {
         NSString *page = nfb_selectedTabPageInView(subview, depth + 1);
@@ -2158,12 +2204,21 @@ static NSString *nfb_selectedTabPageInView(UIView *view, int depth) {
 }
 
 static NSString *nfb_currentSelectedTabPage(void) {
+    static NSString *cached = nil;
+    static CFTimeInterval cachedAt = 0.0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (cachedAt > 0.0 && now - cachedAt < 0.25) return cached;
+    NSString *found = nil;
+    UIView *container = gNFBTabContainer;
+    if (container.window) found = nfb_selectedTabPageInView(container, 10);   // the tab row only (depth 10..12)
     for (UIWindow *window in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
+        if (found.length) break;
         if (window.hidden || window.alpha < 0.01) continue;
-        NSString *page = nfb_selectedTabPageInView(window, 0);
-        if (page.length) return page;
+        found = nfb_selectedTabPageInView(window, 0);
     }
-    return nil;
+    cached = [found copy];
+    cachedAt = now;
+    return cached;
 }
 
 static BOOL nfb_homeTabSelectedOrUnknown(void) {
@@ -4709,7 +4764,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b79] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b80] %@ off=%.0f extRemoved=%d", key, nativeScrollView.contentOffset.x, gNFBExtendedContentRemoved ? 1 : 0]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -5130,7 +5185,7 @@ static void nfb_columnsNoteLayoutPassDuration(CFTimeInterval seconds) {
     if (seconds > worst) worst = seconds;
     if (now - windowStart < 2.0) return;
     if (gNFBLogRecording && passes > 0) {
-        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b79] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
+        NFBLogEvent([NSString stringWithFormat:@"layoutPerf[b80] passes=%ld avg=%.2fms max=%.2fms busy=%.1f%% window=%.1fs",
             (long)passes, total / passes * 1000.0, worst * 1000.0,
             total / (now - windowStart) * 100.0, now - windowStart]);
     }
@@ -7412,7 +7467,7 @@ static void nfb_layoutActiveHomePaging(void) {
     if (gNFBLayoutActiveHomePagingRunning) {
         if (gNFBLogRecording) {
             static NSString *lastLayoutReentryKey = nil;
-            NSString *key = @"layout[b79] activeHome reentry deferred";
+            NSString *key = @"layout[b80] activeHome reentry deferred";
             if (![key isEqualToString:lastLayoutReentryKey]) { lastLayoutReentryKey = [key copy]; NFBLogEvent(key); }
         }
         nfb_requestLayoutActiveHomePagingOnNextTurn();
@@ -7880,7 +7935,7 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 // disappears this home VC; the timer must keep running so it can refresh the list via
 // the paging controller's selectedViewController. It self-cleans on dealloc / when off.
 - (void)viewDidDisappear:(BOOL)animated { %orig; }
-- (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_noteActiveTimelineScroll(scrollView); nfb_visibilityForScroll(scrollView); }
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_noteScrollFrame(scrollView); nfb_noteActiveTimelineScroll(scrollView); nfb_visibilityForScroll(scrollView); }
 %end
 
 // Older app versions.
@@ -7902,8 +7957,18 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 %hook T1URTViewController
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
     %orig;
-    if (!nfb_parentControllerNamed((UIViewController *)self, @"HomeTimelineContainer")) return;
+    // b80: "is this list inside Home?" is answered once per controller (it was a parent walk with
+    // class-name string checks on every scroll frame of every list in the app).
+    static char kNFBURTInHomeKey;
+    NSNumber *inHome = objc_getAssociatedObject(self, &kNFBURTInHomeKey);
+    if (!inHome) {
+        UIViewController *vc = (UIViewController *)self;
+        inHome = @(nfb_parentControllerNamed(vc, @"HomeTimelineContainer") != nil);
+        if (vc.parentViewController) objc_setAssociatedObject(self, &kNFBURTInHomeKey, inHome, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (!inHome.boolValue) return;
     // Icon refresh only — do NOT run the full visibility logic here (it fades/disables the button).
+    nfb_noteScrollFrame(scrollView);
     nfb_noteActiveTimelineScroll(scrollView);
     nfb_scheduleStateIconUpdate();
 }
