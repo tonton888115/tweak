@@ -143,6 +143,8 @@
 
 "RESTORE_REPLY_CONTEXT_TITLE" = "返信コンテキストを復元";
 "RESTORE_REPLY_CONTEXT_DETAIL_TITLE" = "ツイートの下に返信されている人を表示します。";
+"SHOW_POLL_RESULTS_TITLE" = "投票前に結果を表示";
+"SHOW_POLL_RESULTS_DETAIL" = "投票する前に各選択肢の投票率を表示し、他のユーザーの投票状況を確認できるようにします。";
 
 "ENABLE_TRANSLATE_OPTION_TITLE" = "AI翻訳ボタンを表示 (ベータ版)";
 "ENABLE_TRANSLATE_OPTION_DETAIL_TITLE" = "システム言語以外のツイートにAI翻訳ボタンを追加します。APIキーが必要です。";

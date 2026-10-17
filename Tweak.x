@@ -2216,7 +2216,54 @@ static void BHTWatchdogCrashSuppressed(const char *cls) {
 @interface TMAPlayableMediaAttachment : NSObject
 @end
 @interface TFCCardData : NSObject
+- (NSString *)stringForKey:(NSString *)key;
+- (NSString *)stringForKey:(NSString *)key defaultValue:(NSString *)value;
+- (NSNumber *)numberForKey:(NSString *)key;
+- (NSNumber *)numberFromStringForKey:(NSString *)key;
+- (BOOL)boolForKey:(NSString *)key;
 @end
+
+// b84: poll results before voting — port of orionblur/NeoFreeBird c2fd183. Polls carry at most
+// four choices; image polls' card names encode no count, so probe choice1..4 bindings.
+static const NSUInteger NFBPollMaxChoices = 4;
+
+// "choice2_label" -> 2, anything else -> 0.
+static NSUInteger NFBPollChoiceIndexForKey(NSString *key) {
+    if (![key hasPrefix:@"choice"] || ![key hasSuffix:@"_label"]) return 0;
+    NSInteger index = [key substringWithRange:NSMakeRange(6, key.length - 12)].integerValue;
+    return index > 0 ? (NSUInteger)index : 0;
+}
+
+static BOOL NFBShowPollResults(void) {
+    id value = [[NSUserDefaults standardUserDefaults] objectForKey:@"show_poll_results"];
+    return value ? [value boolValue] : YES;
+}
+
+static NSString *NFBPollTitleWithPercentage(TFCCardData *cardData, NSString *key, NSString *title) {
+    NSUInteger choice = NFBPollChoiceIndexForKey(key);
+    if (choice == 0 || choice > NFBPollMaxChoices || title.length == 0 || !NFBShowPollResults()) return title;
+    // Already showing results: the poll ended, or the user voted.
+    if ([cardData boolForKey:@"counts_are_final"] || [cardData stringForKey:@"selected_choice"].length > 0) return title;
+    // numberForKey: tells a missing binding from a zero tally; neither it nor
+    // numberFromStringForKey: is hooked, so probing the siblings cannot recurse back here.
+    long long total = 0, votes = 0;
+    for (NSUInteger i = 1; i <= NFBPollMaxChoices; i++) {
+        NSString *countKey = [NSString stringWithFormat:@"choice%lu_count", (unsigned long)i];
+        NSNumber *count = [cardData numberForKey:countKey] ?: [cardData numberFromStringForKey:countKey];
+        if (!count) continue;
+        total += count.longLongValue;
+        if (i == choice) votes = count.longLongValue;
+    }
+    if (total <= 0) return title;
+    static NSNumberFormatter *formatter;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        formatter = [[NSNumberFormatter alloc] init];
+        formatter.numberStyle = NSNumberFormatterPercentStyle;
+        formatter.maximumFractionDigits = 0;
+    });
+    return [NSString stringWithFormat:@"%@ (%@)", title, [formatter stringFromNumber:@((double)votes / (double)total)]];
+}
 @interface _TtC14T1TwitterSwift20JetfuelImmersiveItem : NSObject
 @end
 @interface _TtC14T1TwitterSwift34JetfuelTAVVideoPlayerSessionSource : NSObject
@@ -2301,6 +2348,14 @@ static id NFBRemovePromotedEntries(id node, BOOL *removed) {
 %end
 %hook TFCCardData
 - (BOOL)allowDynamicAd { return [BHTManager HidePromoted] ? NO : %orig; }
+- (NSString *)stringForKey:(NSString *)key {
+    NSString *title = %orig;
+    return NFBPollTitleWithPercentage(self, key, title);
+}
+- (NSString *)stringForKey:(NSString *)key defaultValue:(NSString *)value {
+    NSString *title = %orig;
+    return NFBPollTitleWithPercentage(self, key, title);
+}
 %end
 %hook _TtC14T1TwitterSwift20JetfuelImmersiveItem
 - (BOOL)allowDynamicAd { return [BHTManager HidePromoted] ? NO : %orig; }

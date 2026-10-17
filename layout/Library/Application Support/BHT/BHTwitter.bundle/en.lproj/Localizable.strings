@@ -143,6 +143,8 @@
 
 "RESTORE_REPLY_CONTEXT_TITLE" = "Restore reply context";
 "RESTORE_REPLY_CONTEXT_DETAIL_TITLE" = "Shows the people that are being replied to under Tweets.";
+"SHOW_POLL_RESULTS_TITLE" = "Show poll results before voting";
+"SHOW_POLL_RESULTS_DETAIL" = "Appends the poll results to option names before you vote, so you can see how others have voted.";
 
 "ENABLE_TRANSLATE_OPTION_TITLE" = "AI translate button (beta)";
 "ENABLE_TRANSLATE_OPTION_DETAIL_TITLE" = "Adds an AI translate button to Tweets that are not in your language. Requires an API key.";

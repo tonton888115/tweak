@@ -176,6 +176,7 @@ static double gNFBPassSeg[7];
 static NSInteger gNFBPassSyncCount = 0;
 static CFTimeInterval gNFBPassMarkAt = 0.0;
 static double gNFBSegHideSeconds = 0.0;
+static NSMutableArray<NSString *> *gNFBStallLines = nil;   // b84: main-thread stalls while recording (main thread only)
 static NSInteger gNFBSegHideCount = 0;
 static void nfb_passMark(int seg) {
     CFTimeInterval now = CACurrentMediaTime();
@@ -1330,6 +1331,35 @@ static void nfb_appendHangSample(double stallSeconds, int sampleIndex, const uin
     close(fd);
 }
 
+// b84: one stack as "image+0xoffset [symbol]" frames (offsets are symbolised offline against the
+// IPA's binaries; dladdr names only exported / our own symbols). Called after thread_resume.
+static void nfb_appendStackFrames(NSMutableString *out, const uintptr_t *frames, int frameCount) {
+    for (int i = 0; i < frameCount; i++) {
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        const char *image = "?";
+        uintptr_t imageOffset = 0;
+        if (dladdr((const void *)frames[i], &info)) {
+            if (info.dli_fname) {
+                const char *slash = strrchr(info.dli_fname, '/');
+                image = slash ? slash + 1 : info.dli_fname;
+            }
+            if (info.dli_fbase) imageOffset = frames[i] - (uintptr_t)info.dli_fbase;
+        }
+        [out appendFormat:@" | %s+0x%lx", image, (unsigned long)imageOffset];
+        if (info.dli_sname) [out appendFormat:@" %.80s", info.dli_sname];
+    }
+}
+
+static void nfb_noteStallSummary(uint64_t totalMs, NSString *firstSample) {
+    if (!gNFBStallLines) gNFBStallLines = [NSMutableArray array];
+    static NSDateFormatter *fmt = nil;
+    if (!fmt) { fmt = [NSDateFormatter new]; fmt.dateFormat = @"HH:mm:ss"; }
+    NSString *stack = firstSample.length > 900 ? [firstSample substringToIndex:900] : (firstSample ?: @"-");
+    [gNFBStallLines addObject:[NSString stringWithFormat:@"%@ ~%llums %@", [fmt stringFromDate:[NSDate date]], totalMs, stack]];
+    if (gNFBStallLines.count > 30) [gNFBStallLines removeObjectAtIndex:0];
+}
+
 static void *nfb_hangSamplerMain(void *arg) {
     (void)arg;
     pthread_setname_np("nfb-hang-sampler");
@@ -1337,8 +1367,15 @@ static void *nfb_hangSamplerMain(void *arg) {
     uint64_t stallStartMs = 0;
     uint64_t nextSampleAtMs = 0;
     int samplesTaken = 0;
+    uint64_t shortStallBeat = 0;     // b84: the last heartbeat before the current short stall
+    int shortSamples = 0;
+    NSString *shortFirst = nil;
+    static const uint64_t kShortSampleAtMs[3] = {100, 250, 600};
     for (;;) {
         if (!gNFBLogRecording) {
+            shortStallBeat = 0;
+            shortSamples = 0;
+            shortFirst = nil;
             // Diagnostics only: idle (one wake every 3s, no main-queue pings) unless the log is recording.
             usleep(3000000);
             uint64_t idleNow = nfb_uptimeMs();
@@ -1349,7 +1386,7 @@ static void *nfb_hangSamplerMain(void *arg) {
             samplesTaken = 0;
             continue;
         }
-        usleep(500000);
+        usleep(40000);   // b84: 40ms while recording (was 500ms) so ~0.1s scroll hitches are caught
         uint64_t now = nfb_uptimeMs();
         BOOL processWasSuspended = (now - lastLoopMs) > 2500;   // our own loop stalled => app was suspended, not hung
         lastLoopMs = now;
@@ -1358,6 +1395,9 @@ static void *nfb_hangSamplerMain(void *arg) {
             atomic_store(&gNFBMainPingPending, 0);
             stallStartMs = 0;
             samplesTaken = 0;
+            shortStallBeat = 0;
+            shortSamples = 0;
+            shortFirst = nil;
             continue;
         }
         if (!atomic_exchange(&gNFBMainPingPending, 1)) {        // never flood the main queue during a stall
@@ -1369,6 +1409,40 @@ static void *nfb_hangSamplerMain(void *arg) {
         uint64_t beat = atomic_load(&gNFBMainBeatMs);
         if (!beat) continue;
         uint64_t ageMs = now > beat ? now - beat : 0;
+        // b84: short stalls. Samples are queued to the main queue (NFBLogEvent), so they land in the
+        // log right after the stall ends; the summary (duration + first stack) goes to the diag file.
+        if (ageMs >= kShortSampleAtMs[0]) {
+            if (!shortStallBeat) {
+                shortStallBeat = beat;
+                shortSamples = 0;
+                shortFirst = nil;
+            }
+            if (shortSamples < 3 && ageMs >= kShortSampleAtMs[shortSamples]) {
+                uintptr_t frames[48];
+                int frameCount = nfb_captureMainThreadStack(frames, 48);
+                shortSamples++;
+                if (frameCount > 0) {
+                    @autoreleasepool {
+                        NSMutableString *line = [NSMutableString stringWithFormat:@"stall[b84] sample%d at=%llums", shortSamples, ageMs];
+                        nfb_appendStackFrames(line, frames, frameCount);
+                        if (shortSamples == 1) shortFirst = [line copy];
+                        NFBLogEvent(line);
+                    }
+                }
+            }
+        } else if (shortStallBeat) {
+            if (shortSamples > 0) {
+                uint64_t totalMs = beat > shortStallBeat ? beat - shortStallBeat : ageMs;
+                NSString *first = shortFirst;
+                @autoreleasepool {
+                    NFBLogEvent([NSString stringWithFormat:@"stall[b84] end ~%llums samples=%d", totalMs, shortSamples]);
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{ nfb_noteStallSummary(totalMs, first); });
+            }
+            shortStallBeat = 0;
+            shortSamples = 0;
+            shortFirst = nil;
+        }
         if (ageMs < 2000) {
             if (stallStartMs && samplesTaken) {
                 char line[96];
@@ -1757,13 +1831,15 @@ static void nfb_installNetBadge(void) {
     fmt.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [fmt stringFromDate:[NSDate date]];
     NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"NeoFreeBird 11.35 b83 (b82 + no chrome scan mid-swipe, -O0) %@\n\n", stamp];
+    [text appendFormat:@"NeoFreeBird 11.35 b84 (b83 + poll results + stall stacks, -O0) %@\n\n", stamp];
     [text appendString:nfb_buildDiagnosticReport() ?: @"(no report)"];
     nfb_flushScrollRun();
     [text appendFormat:@"\n\n=== TL scroll smoothness (last sessions; slow = frame gap > 25ms) ===\n%@",
         gNFBScrollSessions.count ? [gNFBScrollSessions componentsJoinedByString:@"\n"] : @"(no scroll recorded)"];
     [text appendFormat:@"\n\n=== columns layout cost (2s windows; recorded even without log recording) ===\n%@",
         gNFBLayoutPerfLines.count ? [gNFBLayoutPerfLines componentsJoinedByString:@"\n"] : @"(no columns layout yet)"];
+    [text appendFormat:@"\n\n=== main-thread stalls >= ~0.1s (while recording; first stack, image+offset) ===\n%@",
+        gNFBStallLines.count ? [gNFBStallLines componentsJoinedByString:@"\n"] : @"(none recorded)"];
     if (NFBLogIsRecording() && gNFBLog.count) {
         [text appendString:@"\n\n=== log being recorded ===\n"];
         [text appendString:[gNFBLog componentsJoinedByString:@"\n"]];
