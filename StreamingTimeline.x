@@ -38,6 +38,7 @@ static void nfb_installButton(UIWindow *win);
 static void nfb_noteLoadBegan(id owner);
 static void nfb_noteLoadEnded(id owner);
 static void nfb_runSpeedTest(NSUInteger bytes, void (^done)(double mbps, NSError *error));
+static NSString *nfb_fleetLineHeadersDiag(void);
 static void nfb_removeButton(void);
 static UIViewController *nfb_selectedTimelineVC(UIViewController *vc);
 static void nfb_streamTrigger(UIViewController *vc);
@@ -1859,7 +1860,7 @@ static void nfb_installNetBadge(void) {
     fmt.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *stamp = [fmt stringFromDate:[NSDate date]];
     NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"NeoFreeBird 11.35 b85 (b84 + refactor: dead code out, KVC probe cache, -O0) %@\n\n", stamp];
+    [text appendFormat:@"NeoFreeBird 11.35 b86 (b85 + Spaces row inset refresh after columns, -O0) %@\n\n", stamp];
     [text appendString:nfb_buildDiagnosticReport() ?: @"(no report)"];
     nfb_flushScrollRun();
     [text appendFormat:@"\n\n=== TL scroll smoothness (last sessions; slow = frame gap > 25ms) ===\n%@",
@@ -1868,6 +1869,7 @@ static void nfb_installNetBadge(void) {
         gNFBLayoutPerfLines.count ? [gNFBLayoutPerfLines componentsJoinedByString:@"\n"] : @"(no columns layout yet)"];
     [text appendFormat:@"\n\n=== main-thread stalls >= ~0.1s (while recording; first stack, image+offset) ===\n%@",
         gNFBStallLines.count ? [gNFBStallLines componentsJoinedByString:@"\n"] : @"(none recorded)"];
+    [text appendFormat:@"\n\n=== Spaces row headers (X's recorded row height -> timeline top) ===\n%@", nfb_fleetLineHeadersDiag()];
     if (NFBLogIsRecording() && gNFBLog.count) {
         [text appendString:@"\n\n=== log being recorded ===\n"];
         [text appendString:[gNFBLog componentsJoinedByString:@"\n"]];
@@ -3027,6 +3029,58 @@ static void nfb_restoreColumnsChromeInView(UIView *view, int depth) {
     }
 }
 
+// b86: Home's timeline makes room for the Spaces row through X's T1FleetLineHeaderController:
+// -_t1_updateFleetlineHeaderExpandedHeight records the row's height (0 while its container is
+// hidden) and -_t1_updateTopInset puts it into the parent controller's additionalSafeAreaInsets.
+// X re-runs that only from the parent's layout (-parentDidLayoutSubviews). Columns hide the row,
+// so X records 0; after columns-off showed the row again nothing re-ran it, and the timeline's
+// first ~79pt sat under the Spaces row (b84 device diag: inset 144.3 vs header bottom 228.7).
+// Every controller that attaches is remembered here; after the columns chrome comes back, X's own
+// layout callback is run once more on each.
+static NSHashTable *gNFBFleetLineHeaders = nil;
+static BOOL gNFBFleetLineRefreshQueued = NO;
+
+static void nfb_refreshFleetLineHeadersSoon(NSString *reason) {
+    if (gNFBFleetLineRefreshQueued || !gNFBFleetLineHeaders.count) return;
+    gNFBFleetLineRefreshQueued = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gNFBFleetLineRefreshQueued = NO;
+        if (gInlineColumnsEnabled) return;   // columns keep the row hidden and set their own insets
+        SEL sel = NSSelectorFromString(@"parentDidLayoutSubviews");
+        NSUInteger refreshed = 0;
+        for (id header in gNFBFleetLineHeaders.allObjects) {
+            if (![header respondsToSelector:sel]) continue;
+            @try {
+                ((void (*)(id, SEL))objc_msgSend)(header, sel);
+                refreshed++;
+            } @catch (NSException *e) {
+                NFBLogEvent([NSString stringWithFormat:@"fleetLineRefresh[b86] threw %@", e.name]);
+            }
+        }
+        if (gNFBLogRecording) NFBLogEvent([NSString stringWithFormat:@"fleetLineRefresh[b86] %@ n=%lu", reason ?: @"-", (unsigned long)refreshed]);
+    });
+}
+
+// One line per remembered header: the row height X recorded, the parent's extra top safe area it
+// derived from it, and the row container's live state (they should agree outside columns).
+static NSString *nfb_fleetLineHeadersDiag(void) {
+    NSMutableString *out = [NSMutableString string];
+    SEL expandedSel = NSSelectorFromString(@"fleetLineHeaderExpandedHeight");
+    SEL containerSel = NSSelectorFromString(@"fleetLineContainerView");
+    for (id header in gNFBFleetLineHeaders.allObjects) {
+        double expanded = nfb_resp(header, expandedSel) ? ((double (*)(id, SEL))objc_msgSend)(header, expandedSel) : -1.0;
+        id parent = nfb_resp(header, @selector(parentViewController)) ? ((id (*)(id, SEL))objc_msgSend)(header, @selector(parentViewController)) : nil;
+        UIView *container = nfb_resp(header, containerSel) ? ((id (*)(id, SEL))objc_msgSend)(header, containerSel) : nil;
+        CGFloat extraTop = [parent isKindOfClass:UIViewController.class] ? ((UIViewController *)parent).additionalSafeAreaInsets.top : -1.0;
+        UIScrollView *sv = [parent isKindOfClass:UIViewController.class] ? nfb_mainScrollViewOf((UIViewController *)parent) : nil;
+        [out appendFormat:@"header expanded=%.1f parent=%@ extraTop=%.1f container=%@ hidden=%d h=%.1f win=%d tlInset=%.1f\n",
+            expanded, parent ? NSStringFromClass([parent class]) : @"nil", extraTop,
+            container ? NSStringFromClass(container.class) : @"nil", container.hidden ? 1 : 0, container.bounds.size.height,
+            container.window ? 1 : 0, sv ? sv.contentInset.top : -1.0];
+    }
+    return out.length ? out : @"(no header controller seen)";
+}
+
 static void nfb_restoreAllSavedColumnsChrome(void) {
     NSArray<UIView *> *savedViews = [gNFBInlineColumnsSavedChromeViews allObjects];
     for (UIView *view in savedViews) {
@@ -3037,6 +3091,7 @@ static void nfb_restoreAllSavedColumnsChrome(void) {
         if (!window) continue;
         nfb_restoreColumnsChromeInView(window, 0);
     }
+    if (savedViews.count) nfb_refreshFleetLineHeadersSoon(@"restore");
 }
 
 static void nfb_restoreAllSavedColumnsChromeSoon(NSString *reason) {
@@ -3049,6 +3104,8 @@ static void nfb_restoreAllSavedColumnsChromeSoon(NSString *reason) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (gInlineColumnsEnabled) return;
             nfb_restoreAllSavedColumnsChrome();
+            // The header may still have been mid-restore (nav bar expanding) at the first refresh.
+            nfb_refreshFleetLineHeadersSoon(reason);
             if (gNFBLogRecording) {
                 NFBLogEvent([NSString stringWithFormat:@"columnsChromeRestore %@+%.2f", reason ?: @"deferred", delay.doubleValue]);
             }
@@ -4259,7 +4316,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b85] %@ off=%.0f", key, nativeScrollView.contentOffset.x]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b86] %@ off=%.0f", key, nativeScrollView.contentOffset.x]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -6841,7 +6898,7 @@ static void nfb_layoutActiveHomePaging(void) {
     if (gNFBLayoutActiveHomePagingRunning) {
         if (gNFBLogRecording) {
             static NSString *lastLayoutReentryKey = nil;
-            NSString *key = @"layout[b85] activeHome reentry deferred";
+            NSString *key = @"layout[b86] activeHome reentry deferred";
             if (![key isEqualToString:lastLayoutReentryKey]) { lastLayoutReentryKey = [key copy]; NFBLogEvent(key); }
         }
         nfb_requestLayoutActiveHomePagingOnNextTurn();
@@ -7314,6 +7371,15 @@ void NFBSetInlineColumnsEnabled(BOOL enabled) {
 - (void)viewDidAppear:(BOOL)animated { %orig; nfb_installCrashLoggerOnce(); gActiveItemsVC = self; nfb_installButton(self.view.window); nfb_streamStart(self); }
 - (void)viewDidDisappear:(BOOL)animated { %orig; nfb_streamStop(self); }
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView { %orig; gActiveItemsVC = self; nfb_noteActiveTimelineScroll(scrollView); nfb_visibilityForScroll(scrollView); }
+%end
+
+// b86: remember the Spaces-row header controllers (see nfb_refreshFleetLineHeadersSoon).
+%hook T1FleetLineHeaderController
+- (void)attachToViewController:(id)viewController {
+    %orig;
+    if (!gNFBFleetLineHeaders) gNFBFleetLineHeaders = [NSHashTable weakObjectsHashTable];
+    [gNFBFleetLineHeaders addObject:self];
+}
 %end
 
 // Pinned-list timelines are hosted by T1URTViewController inside the Home paging
