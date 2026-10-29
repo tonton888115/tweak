@@ -542,3 +542,5 @@
 "NFB_COLUMNS_TAB_TITLE" = "Columns";
 "NFB_COLUMNS_HOST_ROW" = "Tab to replace with Columns…";
 "NFB_COLUMNS_HOST_PICKER_TITLE" = "Which tab becomes the Columns tab?";
+"NFB_OPEN_SETTINGS" = "⚙️ NeoFreeBird settings";
+"NFB_COLUMNS_HOST_MENU" = "🗂 Tab to replace with Columns…";

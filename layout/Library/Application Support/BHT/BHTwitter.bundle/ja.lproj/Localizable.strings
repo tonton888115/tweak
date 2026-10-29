@@ -540,3 +540,5 @@
 "NFB_COLUMNS_TAB_TITLE" = "カラム";
 "NFB_COLUMNS_HOST_ROW" = "カラムに置き換えるタブ…";
 "NFB_COLUMNS_HOST_PICKER_TITLE" = "どのタブを「カラム」タブにしますか？";
+"NFB_OPEN_SETTINGS" = "⚙️ NeoFreeBird の設定";
+"NFB_COLUMNS_HOST_MENU" = "🗂 カラムに置き換えるタブ…";

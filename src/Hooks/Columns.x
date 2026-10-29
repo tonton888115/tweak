@@ -1185,6 +1185,36 @@ void NFBColumnsShowManager(UIViewController *presenter) {
     [presenter presentViewController:nav animated:YES completion:nil];
 }
 
+// Which bottom tab becomes the Columns tab. Offers every tab the app has built (as recorded by
+// the custom tab bar), except Home and the "more" dash. Used by the Timelines settings row and
+// the stream button's long-press menu.
+void NFBColumnsShowHostPicker(UIViewController *presenter, void (^changed)(void)) {
+    if (!presenter) return;
+    BHTBundle *bundle = [BHTBundle sharedBundle];
+    NSString *current = [[NSUserDefaults standardUserDefaults] stringForKey:@"nfb_columns_host"] ?: @"communities";
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:[bundle localizedStringForKey:@"NFB_COLUMNS_HOST_PICKER_TITLE"]
+                         message:nil
+                  preferredStyle:UIAlertControllerStyleAlert];
+    for (NSDictionary *tab in [CustomTabBarUtility availableTabs]) {
+        NSString *page = tab[TabPageKey];
+        if (!page.length || [page isEqualToString:CustomTabBarHomePageID] || [page isEqualToString:@"dash"]) continue;
+        NSString *title = [tab[TabTitleKey] length] ? tab[TabTitleKey] : page;
+        if ([page isEqualToString:current]) title = [@"✓ " stringByAppendingString:title];
+        [alert addAction:[UIAlertAction actionWithTitle:title
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+                                                    [[NSUserDefaults standardUserDefaults] setObject:page forKey:@"nfb_columns_host"];
+                                                    NFBColumnsPrefsChanged();
+                                                    if (changed) changed();
+                                                }]];
+    }
+    [alert addAction:[UIAlertAction actionWithTitle:[bundle localizedStringForKey:@"CANCEL_ACTION_LABEL"]
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [presenter presentViewController:alert animated:YES completion:nil];
+}
+
 static BOOL nfb_colsOwnsScroll(UIScrollView *scrollView) {
     return scrollView && scrollView == gNFBColsCollectionView && nfb_colsActiveNow();
 }

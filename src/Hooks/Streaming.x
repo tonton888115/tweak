@@ -72,6 +72,7 @@ NSInteger NFBColumnsPageRecommended(UIViewController *vc);
 void NFBColumnsSetActive(BOOL active);
 NSString *NFBColumnsHostPageID(void);
 void NFBColumnsShowManager(UIViewController *presenter);
+void NFBColumnsShowHostPicker(UIViewController *presenter, void (^changed)(void));   // Columns.x
 NSString *NFBColumnsDiagnostic(void);
 
 // UI strings: BHTBundle key with an inline English fallback (BHTBundle returns the KEY for
@@ -1233,7 +1234,15 @@ static void nfb_installCrashLoggerOnce(void) {
         [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_COLUMNS_MANAGE", @"📐 Manage columns (reorder / show)…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             NFBColumnsShowManager([self topVC]);
         }]];
+        [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_COLUMNS_HOST_MENU", @"🗂 Tab to replace with Columns…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            NFBColumnsShowHostPicker([self topVC], nil);
+        }]];
     }
+    // NeoFreeBird v7 has no row in X's own settings: its page opens from a long press on the
+    // logo above the home timeline. This menu is where the fork builds kept it.
+    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_OPEN_SETTINGS", @"⚙️ NeoFreeBird settings") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self openSettings];
+    }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_DIAG_SHOW", @"🔍 Diagnostics (copy & send)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self showDiag];
     }]];
@@ -1242,6 +1251,25 @@ static void nfb_installCrashLoggerOnce(void) {
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"CANCEL_ACTION_LABEL", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
+}
+
+- (void)openSettings {
+    id account = nil;
+    Class hostClass = objc_getClass("T1HostViewController");
+    if ([hostClass respondsToSelector:@selector(sharedHostViewController)]) {
+        id host = ((id(*)(id, SEL))objc_msgSend)(hostClass, @selector(sharedHostViewController));
+        if ([host respondsToSelector:@selector(currentAccount)]) account = ((id(*)(id, SEL))objc_msgSend)(host, @selector(currentAccount));
+    }
+    UIViewController *settings = [BHTManager BHTSettingsWithAccount:account];
+    if (!settings) return;
+    UIViewController *home = gActiveItemsVC ?: nfb_findHomeContainer();
+    UINavigationController *nav = home.navigationController;
+    if (nav && home.viewIfLoaded.window) {
+        [nav pushViewController:settings animated:YES];
+        return;
+    }
+    UINavigationController *wrapper = [[UINavigationController alloc] initWithRootViewController:settings];
+    [[self topVC] presentViewController:wrapper animated:YES completion:nil];
 }
 
 - (void)toast:(NSString *)msg {
