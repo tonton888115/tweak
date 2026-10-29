@@ -371,7 +371,8 @@ static NSDictionary<NSString*, NSDictionary*>* BHTSettingsPages(void) {
                     },
                     @{
                         @"key": @"show_poll_results",
-                        @"default": @NO,
+                        // Fork (b84): on by default, as in the 11.35 builds.
+                        @"default": @YES,
                         @"type": @"toggle"
                     },
                     @{

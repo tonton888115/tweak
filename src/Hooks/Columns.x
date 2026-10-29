@@ -28,8 +28,6 @@
 @end
 @interface _TtC10TFNUISwift29LegacySegmentedViewController : UIViewController
 @end
-@interface T1AppSplitViewController : UIViewController
-@end
 @interface _TtC10TFNUISwiftP33_19E25DFCBFA569FDFA3E56F314F9A42420PagingCollectionView : UICollectionView
 @end
 @interface _TtC32TwitterHomeFeatureImplementation35HomeTimelineContainerViewController : UIViewController
@@ -895,7 +893,9 @@ static void nfb_colsRefreshTabViews(UIViewController *nav, UIViewController *tab
         ((NSInteger(*)(id, SEL))objc_msgSend)(nav, @selector(selectedIndex)) : NSNotFound;
     [nfb_colsTabViews(tabBarController) enumerateObjectsUsingBlock:^(T1TabView *tabView, NSUInteger idx, BOOL *stop) {
         if (![tabView isKindOfClass:NSClassFromString(@"T1TabView")]) return;
-        if ([tabView respondsToSelector:@selector(_t1_updateTitleLabel)]) [tabView _t1_updateTitleLabel];
+        if ([tabView respondsToSelector:@selector(_t1_updateTitleLabel)]) {
+            ((void(*)(id, SEL))objc_msgSend)(tabView, @selector(_t1_updateTitleLabel));
+        }
         BOOL isSelected = selected != NSNotFound ? (NSInteger)idx == selected : tabView.isSelected;
         ((void(*)(id, SEL, BOOL))objc_msgSend)(tabView, @selector(setSelected:), isSelected);
     }];
@@ -1588,9 +1588,10 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
 
 - (void)_t1_updateTitleLabel {
     %orig;
-    if (nfb_colsEnabled() && [self.scribePage isEqualToString:NFBColumnsHostPageID()]) {
-        self.titleLabel.text = nfb_colsTabTitle();
-        self.accessibilityLabel = nfb_colsTabTitle();
+    if (nfb_colsEnabled() && [self.scribePage isEqualToString:NFBColumnsHostPageID()] &&
+        [self respondsToSelector:@selector(titleLabel)]) {
+        UILabel *label = ((id(*)(id, SEL))objc_msgSend)(self, @selector(titleLabel));
+        if ([label isKindOfClass:UILabel.class]) label.text = nfb_colsTabTitle();
     }
 }
 
