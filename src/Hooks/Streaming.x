@@ -1796,6 +1796,26 @@ static void nfb_visibilityForScroll(UIScrollView *sv) {
 // The view holding the tab buttons, remembered so later lookups scan a few views instead of
 // every view in every window.
 static __weak UIView *gNFBTabContainer = nil;
+// X's tab bar controller, remembered from its own hooks below. On X 12.38.1 the view walk came
+// back empty on device (diag page=(nil)), and while it finds nothing every lookup walks every
+// window again; the controller knows the selected tab directly.
+static __weak UIViewController *gNFBTabBarController = nil;
+static const char *gNFBTabPageVia = "-";   // diagnostics: "ctl" / "walk" / "-"
+
+static NSString *nfb_selectedTabPageFromController(void) {
+    UIViewController *controller = gNFBTabBarController;
+    if (!controller.viewIfLoaded.window) return nil;
+    if (![controller respondsToSelector:@selector(tabViews)] || ![controller respondsToSelector:@selector(selectedTabIndex)]) return nil;
+    // A hidden tab bar reads as "unknown", like the view walk (which skips hidden views).
+    if ([controller respondsToSelector:@selector(isTabBarHidden)] &&
+        ((BOOL(*)(id, SEL))objc_msgSend)(controller, @selector(isTabBarHidden))) return nil;
+    NSArray *tabViews = ((id(*)(id, SEL))objc_msgSend)(controller, @selector(tabViews));
+    NSInteger index = ((NSInteger(*)(id, SEL))objc_msgSend)(controller, @selector(selectedTabIndex));
+    if (![tabViews isKindOfClass:NSArray.class] || index < 0 || (NSUInteger)index >= tabViews.count) return nil;
+    T1TabView *tabView = tabViews[(NSUInteger)index];
+    if (![tabView respondsToSelector:@selector(scribePage)]) return nil;
+    return tabView.scribePage.length ? tabView.scribePage : nil;
+}
 
 static NSString *nfb_selectedTabPageInView(UIView *view, int depth) {
     if (!view || view.hidden || view.alpha < 0.01 || depth > 12) return nil;
@@ -1820,9 +1840,10 @@ static NSString *nfb_currentSelectedTabPage(void) {
     if (gNFBSelectedTabPageCacheAt > 0.0 && now - gNFBSelectedTabPageCacheAt < cacheTTL) {
         return gNFBSelectedTabPageCache;
     }
-    NSString *selectedPage = nil;
+    NSString *selectedPage = nfb_selectedTabPageFromController();
+    gNFBTabPageVia = selectedPage.length ? "ctl" : "walk";
     UIView *container = gNFBTabContainer;
-    if (container.window) selectedPage = nfb_selectedTabPageInView(container, 10);   // depth 10..12: the tab row only
+    if (!selectedPage.length && container.window) selectedPage = nfb_selectedTabPageInView(container, 10);   // depth 10..12: the tab row only
     for (UIWindow *window in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
         if (selectedPage.length) break;
         if (window.hidden || window.alpha < 0.01) continue;
@@ -2143,8 +2164,10 @@ static NSString *nfb_buildDiagnosticReport(void) {
     [s appendFormat:@"%@\n", NFBHeatSummary()];
     [s appendFormat:@"%@\n", nfb_healthLine()];
     [s appendFormat:@"%@\n", nfb_netDiagLine()];
-    [s appendFormat:@"streaming on=%d interval=%ld page=%@ button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",
-        nfb_streamEnabled() ? 1 : 0, (long)nfb_streamInterval(), nfb_currentSelectedTabPage() ?: @"(nil)", gStreamButton ? 1 : 0,
+    NSString *diagPage = nfb_currentSelectedTabPage();
+    [s appendFormat:@"streaming on=%d interval=%ld page=%@ via=%s tabCtl=%d button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",
+        nfb_streamEnabled() ? 1 : 0, (long)nfb_streamInterval(), diagPage ?: @"(nil)", gNFBTabPageVia, gNFBTabBarController ? 1 : 0,
+        gStreamButton ? 1 : 0,
         (gStreamButton && !gStreamButton.hidden) ? 1 : 0, gStreamButton ? gStreamButton.alpha : -1.0, gStreamButton.window ? 1 : 0,
         bf.origin.x, bf.origin.y, bf.size.width, bf.size.height,
         buttonIndex == NSNotFound ? -1L : (long)buttonIndex, (unsigned long)winSubviews.count];
@@ -2304,18 +2327,27 @@ static NSString *nfb_buildDiagnosticReport(void) {
 // Tab switches invalidate the selected-tab cache so the button hides/shows immediately.
 %hook T1TabBarViewController
 
+- (void)setTabViews:(NSArray *)tabViews {
+    %orig;
+    gNFBTabBarController = self;
+    NFBNoteTabSelectionChanged();
+}
+
 - (void)setSelectedTabIndex:(NSInteger)tabIndex {
     %orig;
+    gNFBTabBarController = self;
     NFBNoteTabSelectionChanged();
 }
 
 - (void)selectTabAtIndex:(NSInteger)tabIndex {
     %orig;
+    gNFBTabBarController = self;
     NFBNoteTabSelectionChanged();
 }
 
 - (void)customTabBar:(id)tabBar selectTabAtIndex:(NSInteger)tabIndex withView:(UIView *)tabView {
     %orig;
+    gNFBTabBarController = self;
     NFBNoteTabSelectionChanged();
 }
 
