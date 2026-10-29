@@ -1162,7 +1162,9 @@ static NSString *nfb_cellularGeneration(void) {
     if (!info) info = [CTTelephonyNetworkInfo new];
     NSString *tech = info.serviceCurrentRadioAccessTechnology.allValues.firstObject;
     if (!tech) return @"Cell";
-    if ([tech isEqualToString:CTRadioAccessTechnologyNR] || [tech isEqualToString:CTRadioAccessTechnologyNRNSA]) return @"5G";
+    if (@available(iOS 14.1, *)) {
+        if ([tech isEqualToString:CTRadioAccessTechnologyNR] || [tech isEqualToString:CTRadioAccessTechnologyNRNSA]) return @"5G";
+    }
     if ([tech isEqualToString:CTRadioAccessTechnologyLTE]) return @"4G";
     return @"3G";
 }
