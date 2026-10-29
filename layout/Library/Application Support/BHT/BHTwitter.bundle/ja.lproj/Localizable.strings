@@ -542,3 +542,12 @@
 "NFB_COLUMNS_HOST_PICKER_TITLE" = "どのタブを「カラム」タブにしますか？";
 "NFB_OPEN_SETTINGS" = "⚙️ NeoFreeBird の設定";
 "NFB_COLUMNS_HOST_MENU" = "🗂 カラムに置き換えるタブ…";
+"NFB_NET_OFFLINE" = "オフライン";
+"NFB_NET_MEASURING" = "測定中…";
+"NFB_NET_X_OUTAGE" = "X 障害?";
+"NFB_NET_X_NO_REPLY" = "X 応答なし";
+"NFB_NET_X_SECONDS" = "X %.1f秒";
+"NFB_NET_SPEEDTEST" = "📶 回線速度を測る（約10MB）";
+"NFB_NET_DOWNDETECTOR" = "🌐 X の障害情報（Downdetector）";
+"NFB_NET_SPEED_RESULT" = "ダウンロード: %.1f Mbps\nX の直近の読み込み: %@";
+"NFB_NET_SPEED_FAILED" = "測定できませんでした: %@";

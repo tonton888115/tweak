@@ -18,6 +18,9 @@
 #import "HookHelpers.h"
 #import <QuartzCore/QuartzCore.h>
 #import <string.h>
+#import <Network/Network.h>                          // network badge: path monitor (fork b78)
+#import <CoreTelephony/CTTelephonyNetworkInfo.h>     // network badge: 5G / 4G (fork b78)
+#import <SafariServices/SafariServices.h>            // Downdetector page (fork b79)
 #include <execinfo.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -58,6 +61,10 @@ static NSString *nfb_diagShortString(NSString *value, NSUInteger maxLen);
 static NSString *nfb_diagTextForView(UIView *view, NSUInteger maxLen);
 static NSString *nfb_buildDiagnosticReport(void);
 void NFBUpdateStreamButtonVisibility(void);
+static void nfb_noteLoadBegan(id owner);
+static void nfb_noteLoadEnded(id owner);
+static void nfb_runSpeedTest(NSUInteger bytes, void (^done)(double mbps, NSError *error));
+static void nfb_installNetBadge(void);
 void NFBNoteTabSelectionChanged(void);
 void NFBLogEvent(NSString *msg);
 NSString *NFBHeatSummary(void);   // HeatProbe.x
@@ -610,7 +617,11 @@ static BOOL nfb_streamTriggerTarget(UIViewController *target) {
     // Following's clean path: refresh the TFNTwitterHomeTimeline directly.
     if ((r = nfb_findResponder(target, @selector(refreshWithSource:completion:), 0))) {
         __weak UIViewController *weakTarget = target;
+        id timingOwner = r;
+        nfb_noteLoadBegan(timingOwner);
+        __weak id weakTimingOwner = timingOwner;
         void (^completion)(void) = [^{
+            nfb_noteLoadEnded(weakTimingOwner);
             UIViewController *strongTarget = weakTarget;
             if (strongTarget) nfb_afterRefresh(strongTarget);
         } copy];
@@ -1129,6 +1140,172 @@ static void nfb_installCrashLoggerOnce(void) {
     });
 }
 
+#pragma mark - network / X response badge (fork b78-b79)
+
+// A small two-line pill under the stream button:
+//   1) connection + last measured download speed   e.g. "Wi-Fi ↓42 Mbps"
+//   2) how long X took to answer the last timeline load   e.g. "X 0.8秒" (green < 1.5s, orange < 4s,
+//      red >= 4s), "X 応答なし" after 12s, "X 障害?" when that keeps happening while the link is up.
+// Load time = TFNDataViewController loadTopDidBegin -> loadTopDidEnd (pull / auto-refresh) and the
+// auto-refresh's refreshWithSource:completion:. Passive: no extra requests except the speed test.
+static UILabel *gNFBNetBadge = nil;
+static NSInteger gNFBNetPath = -1;            // -1 unknown, 0 offline, 1 Wi-Fi, 2 cellular, 3 other
+static double gNFBLastLoadSeconds = -1.0;
+static BOOL gNFBLastLoadTimedOut = NO;
+static char kNFBLoadStartKey;
+static double gNFBLastMbps = -1.0;            // last speed test (download), Mbps
+static BOOL gNFBSpeedTestRunning = NO;
+static NSUInteger gNFBConsecutiveBadLoads = 0; // timeouts / >= 8s loads in a row (outage hint)
+
+static NSString *nfb_cellularGeneration(void) {
+    static CTTelephonyNetworkInfo *info = nil;
+    if (!info) info = [CTTelephonyNetworkInfo new];
+    NSString *tech = info.serviceCurrentRadioAccessTechnology.allValues.firstObject;
+    if (!tech) return @"Cell";
+    if ([tech isEqualToString:CTRadioAccessTechnologyNR] || [tech isEqualToString:CTRadioAccessTechnologyNRNSA]) return @"5G";
+    if ([tech isEqualToString:CTRadioAccessTechnologyLTE]) return @"4G";
+    return @"3G";
+}
+
+static void nfb_updateNetBadge(void) {
+    if (!gNFBNetBadge) return;
+    NSString *kind = gNFBNetPath == 1 ? @"Wi-Fi" : (gNFBNetPath == 2 ? nfb_cellularGeneration() : @"Net");
+    NSString *line1;
+    if (gNFBNetPath == 0) line1 = nfb_loc(@"NFB_NET_OFFLINE", @"Offline");
+    else if (gNFBSpeedTestRunning) line1 = [NSString stringWithFormat:@"%@ %@", kind, nfb_loc(@"NFB_NET_MEASURING", @"measuring…")];
+    else if (gNFBLastMbps >= 0.0) line1 = [NSString stringWithFormat:@"%@ ↓%.0f Mbps", kind, gNFBLastMbps];
+    else line1 = kind;
+    NSString *line2;
+    UIColor *color2;
+    if (gNFBNetPath == 0) {
+        line2 = @"X —";
+        color2 = UIColor.systemRedColor;
+    } else if (gNFBLastLoadTimedOut) {
+        line2 = gNFBConsecutiveBadLoads >= 2 ? nfb_loc(@"NFB_NET_X_OUTAGE", @"X outage?") : nfb_loc(@"NFB_NET_X_NO_REPLY", @"X no reply");
+        color2 = UIColor.systemRedColor;
+    } else if (gNFBLastLoadSeconds < 0.0) {
+        line2 = @"X —";
+        color2 = UIColor.secondaryLabelColor;
+    } else {
+        line2 = [NSString stringWithFormat:nfb_loc(@"NFB_NET_X_SECONDS", @"X %.1fs"), gNFBLastLoadSeconds];
+        color2 = gNFBLastLoadSeconds < 1.5 ? UIColor.systemGreenColor :
+            (gNFBLastLoadSeconds < 4.0 ? UIColor.systemOrangeColor : UIColor.systemRedColor);
+    }
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] initWithString:[line1 stringByAppendingString:@"\n"]
+        attributes:@{ NSForegroundColorAttributeName: UIColor.whiteColor }];
+    [text appendAttributedString:[[NSAttributedString alloc] initWithString:line2 attributes:@{ NSForegroundColorAttributeName: color2 }]];
+    gNFBNetBadge.attributedText = text;
+}
+
+static void nfb_startNetMonitorOnce(void) {
+    static dispatch_once_t once;
+    static nw_path_monitor_t monitor = nil;
+    dispatch_once(&once, ^{
+        monitor = nw_path_monitor_create();
+        nw_path_monitor_set_queue(monitor, dispatch_get_main_queue());
+        nw_path_monitor_set_update_handler(monitor, ^(nw_path_t path) {
+            NSInteger previous = gNFBNetPath;
+            if (nw_path_get_status(path) != nw_path_status_satisfied) gNFBNetPath = 0;
+            else if (nw_path_uses_interface_type(path, nw_interface_type_wifi)) gNFBNetPath = 1;
+            else if (nw_path_uses_interface_type(path, nw_interface_type_cellular)) gNFBNetPath = 2;
+            else gNFBNetPath = 3;
+            if (gNFBNetPath != previous) gNFBLastMbps = -1.0;   // a different link: old speed no longer applies
+            nfb_updateNetBadge();
+            static CFTimeInterval lastAutoTest = -1000.0;
+            if (gNFBNetPath == 1 && previous != 1 && CACurrentMediaTime() - lastAutoTest > 600.0) {
+                lastAutoTest = CACurrentMediaTime();
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    if (gNFBNetPath == 1) nfb_runSpeedTest(3000000, nil);
+                });
+            }
+        });
+        nw_path_monitor_start(monitor);
+    });
+}
+
+static void nfb_noteLoadBegan(id owner) {
+    if (!owner) return;
+    NSNumber *start = @(CACurrentMediaTime());
+    objc_setAssociatedObject(owner, &kNFBLoadStartKey, start, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak id weakOwner = owner;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        id strongOwner = weakOwner;
+        if (strongOwner && objc_getAssociatedObject(strongOwner, &kNFBLoadStartKey) == start) {
+            objc_setAssociatedObject(strongOwner, &kNFBLoadStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            gNFBLastLoadTimedOut = YES;
+            if (gNFBNetPath != 0) gNFBConsecutiveBadLoads++;
+            NFBLogEvent(@"netBadge load timed out (12s)");
+            nfb_updateNetBadge();
+        }
+    });
+}
+
+static void nfb_noteLoadEnded(id owner) {
+    NSNumber *start = owner ? objc_getAssociatedObject(owner, &kNFBLoadStartKey) : nil;
+    if (!start) return;
+    objc_setAssociatedObject(owner, &kNFBLoadStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gNFBLastLoadSeconds = CACurrentMediaTime() - start.doubleValue;
+    gNFBLastLoadTimedOut = NO;
+    gNFBConsecutiveBadLoads = gNFBLastLoadSeconds >= 8.0 ? gNFBConsecutiveBadLoads + 1 : 0;
+    nfb_updateNetBadge();
+}
+
+// Download speed: fetches `bytes` of throwaway data from Cloudflare's public speed-test endpoint
+// (the one speed.cloudflare.com uses) and reports Mbps. On demand from the menu (10 MB), and once
+// automatically after joining Wi-Fi (3 MB, at most every 10 minutes); never automatic on cellular.
+static void nfb_runSpeedTest(NSUInteger bytes, void (^done)(double mbps, NSError *error)) {
+    if (gNFBSpeedTestRunning) return;
+    gNFBSpeedTestRunning = YES;
+    nfb_updateNetBadge();
+    NSURLSessionConfiguration *cfg = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    cfg.timeoutIntervalForRequest = 20.0;
+    cfg.timeoutIntervalForResource = 30.0;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://speed.cloudflare.com/__down?bytes=%lu", (unsigned long)bytes]];
+    CFTimeInterval t0 = CACurrentMediaTime();
+    [[session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        double seconds = CACurrentMediaTime() - t0;
+        double mbps = (!error && data.length && seconds > 0.0) ? (data.length * 8.0 / seconds / 1e6) : -1.0;
+        [session finishTasksAndInvalidate];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gNFBSpeedTestRunning = NO;
+            if (mbps >= 0.0) gNFBLastMbps = mbps;
+            NFBLogEvent([NSString stringWithFormat:@"speedTest bytes=%lu got=%lu %.2fs mbps=%.1f err=%@", (unsigned long)bytes,
+                (unsigned long)data.length, seconds, mbps, error.localizedDescription ?: @"-"]);
+            nfb_updateNetBadge();
+            if (done) done(mbps, error);
+        });
+    }] resume];
+}
+
+static void nfb_installNetBadge(void) {
+    if (!gStreamButton) return;
+    if (!gNFBNetBadge) {
+        // Right-aligned to the button's right edge so it never runs off the screen.
+        gNFBNetBadge = [[UILabel alloc] initWithFrame:CGRectMake(46.0 - 104.0, 46.0, 104.0, 28.0)];
+        gNFBNetBadge.font = [UIFont monospacedDigitSystemFontOfSize:10.5 weight:UIFontWeightSemibold];
+        gNFBNetBadge.numberOfLines = 2;
+        gNFBNetBadge.textAlignment = NSTextAlignmentRight;
+        gNFBNetBadge.adjustsFontSizeToFitWidth = YES;
+        gNFBNetBadge.minimumScaleFactor = 0.75;
+        gNFBNetBadge.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+        gNFBNetBadge.layer.cornerRadius = 6.0;
+        gNFBNetBadge.layer.masksToBounds = YES;
+        gNFBNetBadge.userInteractionEnabled = NO;
+    }
+    // A subview of the button: it fades / hides together with it.
+    if (gNFBNetBadge.superview != gStreamButton) [gStreamButton addSubview:gNFBNetBadge];
+    nfb_startNetMonitorOnce();
+    nfb_updateNetBadge();
+}
+
+static NSString *nfb_netDiagLine(void) {
+    return [NSString stringWithFormat:@"net path=%ld lastLoad=%.2fs timedOut=%d badLoads=%lu mbps=%.1f testing=%d badge=%d",
+        (long)gNFBNetPath, gNFBLastLoadSeconds, gNFBLastLoadTimedOut ? 1 : 0, (unsigned long)gNFBConsecutiveBadLoads,
+        gNFBLastMbps, gNFBSpeedTestRunning ? 1 : 0, gNFBNetBadge.superview ? 1 : 0];
+}
+
 #pragma mark - tap / long-press handler
 
 @interface NFBStreamHandler : NSObject
@@ -1223,6 +1400,12 @@ static void nfb_installCrashLoggerOnce(void) {
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_INTERVAL_CHANGE", @"⏱ Change refresh interval…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self showInterval];
     }]];
+    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_NET_SPEEDTEST", @"📶 Measure connection speed (~10 MB)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self speedTest];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_NET_DOWNDETECTOR", @"🌐 X outage reports (Downdetector)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self openDowndetector];
+    }]];
     BOOL columnsTab = [BHTSettings boolForKey:@"nfb_columns_enabled"];
     BOOL columnsOn = NFBColumnsActive();
     if (columnsTab) {
@@ -1270,6 +1453,31 @@ static void nfb_installCrashLoggerOnce(void) {
     }
     UINavigationController *wrapper = [[UINavigationController alloc] initWithRootViewController:settings];
     [[self topVC] presentViewController:wrapper animated:YES completion:nil];
+}
+
+- (void)speedTest {
+    if (gNFBNetPath == 0) {
+        [self toast:nfb_loc(@"NFB_NET_OFFLINE", @"Offline")];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    nfb_runSpeedTest(10000000, ^(double mbps, NSError *error) {
+        NSString *msg = mbps >= 0.0 ?
+            [NSString stringWithFormat:nfb_loc(@"NFB_NET_SPEED_RESULT", @"Download: %.1f Mbps\nX last load: %@"), mbps,
+                gNFBLastLoadSeconds >= 0.0 ? [NSString stringWithFormat:@"%.1fs", gNFBLastLoadSeconds] : @"—"] :
+            [NSString stringWithFormat:nfb_loc(@"NFB_NET_SPEED_FAILED", @"Measurement failed: %@"), error.localizedDescription ?: @"?"];
+        [weakSelf toast:msg];
+    });
+}
+
+// Downdetector has no public API and its pages are bot-protected, so the app does not read it in
+// the background; this opens the X page (Japan) in an in-app Safari sheet.
+- (void)openDowndetector {
+    UIViewController *top = [self topVC];
+    NSURL *url = [NSURL URLWithString:@"https://downdetector.jp/shougai/twitter/"];
+    if (!top || !url) return;
+    SFSafariViewController *safari = [[SFSafariViewController alloc] initWithURL:url];
+    [top presentViewController:safari animated:YES completion:nil];
 }
 
 - (void)toast:(NSString *)msg {
@@ -1358,6 +1566,7 @@ static void nfb_styleButton(BOOL on) {
     gStreamButton.tintColor = on ? accent : [UIColor systemGrayColor];
     gStreamButton.gauge.strokeColor = accent.CGColor;
     gStreamButton.gauge.hidden = !on;
+    nfb_installNetBadge();
     nfb_updateStreamStateIconForVC(gActiveItemsVC);
 }
 
@@ -1931,6 +2140,7 @@ static NSString *nfb_buildDiagnosticReport(void) {
         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?"];
     [s appendFormat:@"%@\n", NFBHeatSummary()];
     [s appendFormat:@"%@\n", nfb_healthLine()];
+    [s appendFormat:@"%@\n", nfb_netDiagLine()];
     [s appendFormat:@"streaming on=%d interval=%ld page=%@ button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",
         nfb_streamEnabled() ? 1 : 0, (long)nfb_streamInterval(), nfb_currentSelectedTabPage() ?: @"(nil)", gStreamButton ? 1 : 0,
         (gStreamButton && !gStreamButton.hidden) ? 1 : 0, gStreamButton ? gStreamButton.alpha : -1.0, gStreamButton.window ? 1 : 0,
@@ -2058,6 +2268,21 @@ static NSString *nfb_buildDiagnosticReport(void) {
     gActiveItemsVC = self;
     nfb_noteActiveTimelineScroll(scrollView);
     nfb_visibilityForScroll(scrollView);
+}
+
+%end
+
+// X's answer time for pull-to-refresh and any other top load (network badge).
+%hook TFNDataViewController
+
+- (void)loadTopDidBegin {
+    %orig;
+    nfb_noteLoadBegan(self);
+}
+
+- (void)loadTopDidEnd {
+    %orig;
+    nfb_noteLoadEnded(self);
 }
 
 %end
