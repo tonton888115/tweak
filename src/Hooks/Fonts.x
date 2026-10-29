@@ -5,6 +5,7 @@
 
 #import "Headers/XHeaders.h"
 #import "HookHelpers.h"
+#import <os/lock.h>
 
 // MARK: - Change font
 
@@ -107,12 +108,33 @@
 %end
 
 // The picked font name for a weight, or nil when the user runs Twitter's own.
+// Asked for every font X builds, so the two names are re-read only when the
+// defaults change.
 static NSString* CustomFontName(BOOL isBold) {
-    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
-    if (![defaults boolForKey:@"custom_fonts"]) {
-        return nil;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static uint64_t cachedGeneration = UINT64_MAX;
+    static NSString* cachedRegular;
+    static NSString* cachedBold;
+    NFBHeatCount(NFBHeatFontLookup);
+    uint64_t generation = BHTDefaultsGeneration();
+    os_unfair_lock_lock(&lock);
+    if (cachedGeneration == generation) {
+        NSString* name = isBold ? cachedBold : cachedRegular;
+        os_unfair_lock_unlock(&lock);
+        return name;
     }
-    return [defaults objectForKey:isBold ? @"bhtwitter_font_2" : @"bhtwitter_font_1"];
+    os_unfair_lock_unlock(&lock);
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    BOOL enabled = [defaults boolForKey:@"custom_fonts"];
+    NSString* regular = enabled ? [defaults objectForKey:@"bhtwitter_font_1"] : nil;
+    NSString* bold = enabled ? [defaults objectForKey:@"bhtwitter_font_2"] : nil;
+    os_unfair_lock_lock(&lock);
+    cachedRegular = [regular isKindOfClass:NSString.class] ? regular : nil;
+    cachedBold = [bold isKindOfClass:NSString.class] ? bold : nil;
+    cachedGeneration = generation;
+    NSString* name = isBold ? cachedBold : cachedRegular;
+    os_unfair_lock_unlock(&lock);
+    return name;
 }
 
 static BOOL BHTFontIsBold(UIFont* font) {

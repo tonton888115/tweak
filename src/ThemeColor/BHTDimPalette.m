@@ -27,19 +27,43 @@ static UIColor* BHTColorWithRGB(uint32_t rgb) {
 // changed the background family, never the foreground. Exposed (not static)
 // so Theme.x's UIColor hook can reuse the same three shades.
 UIColor* BHTDimBackgroundColor(void) {
-    return BHTColorWithRGB(0x15202B);
+    // Returned from per-resolution color hooks: one shared instance.
+    static UIColor* color;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        color = BHTColorWithRGB(0x15202B);
+    });
+    return color;
 }
 UIColor* BHTDimElevatedBackgroundColor(void) {
-    return BHTColorWithRGB(0x192734);
+    // Returned from per-resolution color hooks: one shared instance.
+    static UIColor* color;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        color = BHTColorWithRGB(0x192734);
+    });
+    return color;
 }
 UIColor* BHTDimHighlightBackgroundColor(void) {
-    return BHTColorWithRGB(0x1C2836);
+    // Returned from per-resolution color hooks: one shared instance.
+    static UIColor* color;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        color = BHTColorWithRGB(0x1C2836);
+    });
+    return color;
 }
 
 // The legacy Dim search field used its own neutral shade rather than any of
 // the three general-purpose background colors above.
 UIColor* BHTDimSearchPillColor(void) {
-    return BHTColorWithRGB(0x29333F);
+    // Returned from per-resolution color hooks: one shared instance.
+    static UIColor* color;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        color = BHTColorWithRGB(0x29333F);
+    });
+    return color;
 }
 
 static UIColor* BHTCurrentAccentColor(id<TAEColorPalette> palette) {

@@ -1268,7 +1268,10 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
 
 - (void)prepareLayout {
     %orig;
-    if (nfb_colsActiveForLayout(self)) gNFBColsScroll.prepares++;
+    if (nfb_colsActiveForLayout(self)) {
+        gNFBColsScroll.prepares++;
+        NFBHeatCount(NFBHeatColumnsLayout);
+    }
 }
 
 - (CGPoint)targetContentOffsetForProposedContentOffset:(CGPoint)proposed withScrollingVelocity:(CGPoint)velocity {
@@ -1591,6 +1594,16 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
     }
 }
 
+- (NSString *)title {
+    if (nfb_colsEnabled() && [self.scribePage isEqualToString:NFBColumnsHostPageID()]) return nfb_colsTabTitle();
+    return %orig;
+}
+
+- (NSString *)accessibilityLabel {
+    if (nfb_colsEnabled() && [self.scribePage isEqualToString:NFBColumnsHostPageID()]) return nfb_colsTabTitle();
+    return %orig;
+}
+
 - (void)setSelected:(BOOL)selected {
     if (nfb_colsActiveNow()) {
         NSString *page = self.scribePage;
@@ -1648,6 +1661,7 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
 
 %end
 
+%group NFBColsExtendedContentSplit
 %hook T1AppSplitViewController
 
 - (BOOL)displayExtendedContent {
@@ -1677,8 +1691,13 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
 }
 
 %end
+%end
 
 %ctor {
     %init;
+    Class split = objc_getClass("T1AppSplitViewController");
+    if (split && class_getInstanceMethod(split, @selector(private_splitModeForSize:displayExtendedContent:displaySideBar:))) {
+        %init(NFBColsExtendedContentSplit);
+    }
     nfb_colsLaunchGuard();
 }

@@ -8,6 +8,7 @@
 #import "Headers/TFNHeaders.h"
 #import "Headers/UIHeaders.h"
 #import "HookHelpers.h"
+#import <os/lock.h>
 
 @interface UIColor (BHTDynamicColorIdentifier)
 - (id)tfn_dynamicColorIdentifier;
@@ -19,7 +20,7 @@ static NSNumber* selectedThemeColor(void) {
     return [NSUserDefaults.standardUserDefaults objectForKey:@"bh_color_theme_selectedColor"];
 }
 
-static UIColor* selectedCustomThemeColor(void) {
+static UIColor* selectedCustomThemeColorUncached(void) {
     NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
     if ([defaults integerForKey:@"bh_color_theme_selectedColor"] != -1) return nil;
     NSArray* components = [defaults arrayForKey:@"bh_color_theme_customColor"];
@@ -28,6 +29,29 @@ static UIColor* selectedCustomThemeColor(void) {
                            green:[components[1] doubleValue]
                             blue:[components[2] doubleValue]
                            alpha:[components[3] doubleValue]];
+}
+
+// Asked on every palette and dynamic color lookup, so it is recomputed only
+// when the defaults change instead of reading two keys and building a color
+// each time.
+static UIColor* selectedCustomThemeColor(void) {
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static uint64_t cachedGeneration = UINT64_MAX;
+    static UIColor* cached;
+    uint64_t generation = BHTDefaultsGeneration();
+    os_unfair_lock_lock(&lock);
+    if (cachedGeneration == generation) {
+        UIColor* color = cached;
+        os_unfair_lock_unlock(&lock);
+        return color;
+    }
+    os_unfair_lock_unlock(&lock);
+    UIColor* color = selectedCustomThemeColorUncached();
+    os_unfair_lock_lock(&lock);
+    cached = color;
+    cachedGeneration = generation;
+    os_unfair_lock_unlock(&lock);
+    return color;
 }
 
 static NSInteger nativeThemeOption(NSInteger option) {
@@ -147,6 +171,7 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
 %hook TAEColorLoader
 
 - (UIColor*)colorForPropertyName:(NSString*)name {
+    NFBHeatCount(NFBHeatPaletteColor);
     UIColor* color = %orig;
     if (BHTMappingLoadedColor || !selectedCustomThemeColor() ||
         ![name isKindOfClass:NSString.class] ||
@@ -175,6 +200,7 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
 %hook TFNDynamicColorManager
 
 - (UIColor*)dynamicColorForObject:(id)object color:(UIColor*)color {
+    NFBHeatCount(NFBHeatDynamicColor);
     UIColor* resolved = %orig;
     if (BHTMappingDynamicColor || !selectedCustomThemeColor()) return resolved;
     id identifier = [color respondsToSelector:@selector(tfn_dynamicColorIdentifier)]
@@ -205,6 +231,7 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
 %hook TAETwitterColorPaletteSettingInfo
 
 - (id<TAEColorPalette>)colorPalette {
+    NFBHeatCount(NFBHeatPaletteRequest);
     id<TAEColorPalette> realPalette = %orig;
     if (selectedCustomThemeColor()) {
         UIColor* native = objc_getAssociatedObject(realPalette, &BHTNativePrimaryColorKey);
@@ -216,7 +243,24 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     if (self.isDark && BHTDimThemeEnabled()) {
-        return (id<TAEColorPalette>)[BHTDimPaletteProxy proxyWithPalette:realPalette];
+        // Reuse the proxy made for the current dark palette: a new object per
+        // request made every lookup look like a palette change to anything
+        // comparing them. Only the last pair is kept (the proxy retains its
+        // palette), so a replaced palette is released with its proxy.
+        static os_unfair_lock proxyLock = OS_UNFAIR_LOCK_INIT;
+        static id lastRealPalette;
+        static id lastProxy;
+        os_unfair_lock_lock(&proxyLock);
+        id proxy = lastRealPalette == (id)realPalette ? lastProxy : nil;
+        os_unfair_lock_unlock(&proxyLock);
+        if (!proxy) {
+            proxy = [BHTDimPaletteProxy proxyWithPalette:realPalette];
+            os_unfair_lock_lock(&proxyLock);
+            lastRealPalette = realPalette;
+            lastProxy = proxy;
+            os_unfair_lock_unlock(&proxyLock);
+        }
+        return (id<TAEColorPalette>)proxy;
     }
     return realPalette;
 }
@@ -228,6 +272,26 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
 // dynamic system background colors, which Apple defines as pure black (or
 // near enough) in Dark. Re-point those at the same three Dim shades so
 // nothing native-styled is left behind.
+// One Dim variant per system color: a fresh provider color on every call never
+// compares equal to the color a view already has, so each re-apply counted as
+// a change. The original is UIKit's shared instance, so it is the cache key.
+static UIColor* BHTDimDynamicVariant(UIColor* original, UIColor* (*dimShade)(void),
+                                     os_unfair_lock* lock, UIColor* __strong* cachedOriginal,
+                                     UIColor* __strong* cachedDim) {
+    os_unfair_lock_lock(lock);
+    UIColor* dim = *cachedOriginal == original ? *cachedDim : nil;
+    os_unfair_lock_unlock(lock);
+    if (dim) return dim;
+    dim = [UIColor colorWithDynamicProvider:^UIColor*(UITraitCollection* traits) {
+        return traits.userInterfaceStyle == UIUserInterfaceStyleDark ? dimShade() : original;
+    }];
+    os_unfair_lock_lock(lock);
+    *cachedOriginal = original;
+    *cachedDim = dim;
+    os_unfair_lock_unlock(lock);
+    return dim;
+}
+
 %hook UIColor
 
 + (UIColor*)systemBackgroundColor {
@@ -235,10 +299,10 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
     if (!BHTDimThemeEnabled()) {
         return original;
     }
-    return [UIColor colorWithDynamicProvider:^UIColor*(UITraitCollection* traits) {
-        return traits.userInterfaceStyle == UIUserInterfaceStyleDark ? BHTDimBackgroundColor()
-                                                                     : original;
-    }];
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static UIColor* cachedOriginal;
+    static UIColor* cachedDim;
+    return BHTDimDynamicVariant(original, BHTDimBackgroundColor, &lock, &cachedOriginal, &cachedDim);
 }
 
 + (UIColor*)secondarySystemBackgroundColor {
@@ -246,10 +310,10 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
     if (!BHTDimThemeEnabled()) {
         return original;
     }
-    return [UIColor colorWithDynamicProvider:^UIColor*(UITraitCollection* traits) {
-        return traits.userInterfaceStyle == UIUserInterfaceStyleDark ? BHTDimElevatedBackgroundColor()
-                                                                     : original;
-    }];
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static UIColor* cachedOriginal;
+    static UIColor* cachedDim;
+    return BHTDimDynamicVariant(original, BHTDimElevatedBackgroundColor, &lock, &cachedOriginal, &cachedDim);
 }
 
 + (UIColor*)tertiarySystemBackgroundColor {
@@ -257,10 +321,10 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
     if (!BHTDimThemeEnabled()) {
         return original;
     }
-    return [UIColor colorWithDynamicProvider:^UIColor*(UITraitCollection* traits) {
-        return traits.userInterfaceStyle == UIUserInterfaceStyleDark ? BHTDimHighlightBackgroundColor()
-                                                                     : original;
-    }];
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static UIColor* cachedOriginal;
+    static UIColor* cachedDim;
+    return BHTDimDynamicVariant(original, BHTDimHighlightBackgroundColor, &lock, &cachedOriginal, &cachedDim);
 }
 
 + (UIColor*)systemGroupedBackgroundColor {
@@ -268,10 +332,10 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
     if (!BHTDimThemeEnabled()) {
         return original;
     }
-    return [UIColor colorWithDynamicProvider:^UIColor*(UITraitCollection* traits) {
-        return traits.userInterfaceStyle == UIUserInterfaceStyleDark ? BHTDimBackgroundColor()
-                                                                     : original;
-    }];
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static UIColor* cachedOriginal;
+    static UIColor* cachedDim;
+    return BHTDimDynamicVariant(original, BHTDimBackgroundColor, &lock, &cachedOriginal, &cachedDim);
 }
 
 + (UIColor*)secondarySystemGroupedBackgroundColor {
@@ -279,10 +343,10 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
     if (!BHTDimThemeEnabled()) {
         return original;
     }
-    return [UIColor colorWithDynamicProvider:^UIColor*(UITraitCollection* traits) {
-        return traits.userInterfaceStyle == UIUserInterfaceStyleDark ? BHTDimElevatedBackgroundColor()
-                                                                     : original;
-    }];
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static UIColor* cachedOriginal;
+    static UIColor* cachedDim;
+    return BHTDimDynamicVariant(original, BHTDimElevatedBackgroundColor, &lock, &cachedOriginal, &cachedDim);
 }
 
 + (UIColor*)tertiarySystemGroupedBackgroundColor {
@@ -290,10 +354,10 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
     if (!BHTDimThemeEnabled()) {
         return original;
     }
-    return [UIColor colorWithDynamicProvider:^UIColor*(UITraitCollection* traits) {
-        return traits.userInterfaceStyle == UIUserInterfaceStyleDark ? BHTDimHighlightBackgroundColor()
-                                                                     : original;
-    }];
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static UIColor* cachedOriginal;
+    static UIColor* cachedDim;
+    return BHTDimDynamicVariant(original, BHTDimHighlightBackgroundColor, &lock, &cachedOriginal, &cachedDim);
 }
 
 %end
@@ -301,6 +365,7 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
 %hook UIDynamicSystemColor
 
 - (UIColor*)resolvedColorWithTraitCollection:(UITraitCollection*)traitCollection {
+    NFBHeatCount(NFBHeatColorResolve);
     UIColor* original = %orig;
     if (!BHTDimThemeEnabled() || traitCollection.userInterfaceStyle != UIUserInterfaceStyleDark) {
         return original;
@@ -313,6 +378,7 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
 
 %hook UIDeviceRGBColor
 - (UIColor*)resolvedColorWithTraitCollection:(UITraitCollection*)traitCollection {
+    NFBHeatCount(NFBHeatColorResolve);
     UIColor* original = %orig;
     if (!BHTDimThemeEnabled() || traitCollection.userInterfaceStyle != UIUserInterfaceStyleDark) {
         return original;
@@ -326,6 +392,7 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
 %hook UIDynamicCatalogColor
 
 - (UIColor*)resolvedColorWithTraitCollection:(UITraitCollection*)traitCollection {
+    NFBHeatCount(NFBHeatColorResolve);
     UIColor* original = %orig;
     if (!BHTDimThemeEnabled() || traitCollection.userInterfaceStyle != UIUserInterfaceStyleDark) {
         return original;
@@ -339,6 +406,7 @@ static UIColor* BHTReplaceKnownAccent(UIColor* color, UIColor* currentNative) {
 %hook UIExtendedSRGBColorSpace
 
 - (UIColor*)resolvedColorWithTraitCollection:(UITraitCollection*)traitCollection {
+    NFBHeatCount(NFBHeatColorResolve);
     UIColor* original = %orig;
     if (!BHTDimThemeEnabled() || traitCollection.userInterfaceStyle != UIUserInterfaceStyleDark) {
         return original;
@@ -391,10 +459,12 @@ static UIColor* BHTDimNormalizedViewBackground(UIView* view, UIColor* color) {
 %hook UIView
 
 - (void)setBackgroundColor:(UIColor*)color {
+    NFBHeatCount(NFBHeatViewBackgroundColor);
     %orig(BHTDimNormalizedViewBackground(self, color));
 }
 
 - (void)didMoveToWindow {
+    NFBHeatCount(NFBHeatViewMovedToWindow);
     %orig;
     if (self.window && self.backgroundColor) {
         UIColor* normalized = BHTDimNormalizedViewBackground(self, self.backgroundColor);

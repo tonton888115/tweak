@@ -60,6 +60,7 @@ static NSString *nfb_buildDiagnosticReport(void);
 void NFBUpdateStreamButtonVisibility(void);
 void NFBNoteTabSelectionChanged(void);
 void NFBLogEvent(NSString *msg);
+NSString *NFBHeatSummary(void);   // HeatProbe.x
 void NFBLogSnapshot(NSString *reason);
 void NFBStreamPrefsChanged(void);
 // Columns.x
@@ -273,6 +274,14 @@ static BOOL nfb_isRecommendedHomeTimeline(UIViewController *vc) {
         if (homeVC) return nfb_vcIsOrContains((UIViewController *)homeVC, vc);
     }
     if ([NSStringFromClass(vc.class) containsString:@"PinnedTimelineViewController"]) return NO;
+    // X 12.38 dropped -isHomeSelected. Each home page reports its own scribe page instead:
+    // "home" is For You, "home_latest" is Following.
+    NSString *scribePage = nfb_resp(vc, @selector(scribePage)) ?
+        ((id(*)(id, SEL))objc_msgSend)(vc, @selector(scribePage)) : nil;
+    if ([scribePage isKindOfClass:NSString.class]) {
+        if ([scribePage isEqualToString:@"home_latest"]) return NO;
+        if ([scribePage isEqualToString:@"home"]) return YES;
+    }
     if (container && nfb_resp(container, @selector(isHomeSelected))) {
         // isHomeSelected describes the DISPLAYED page only. A home-items page that is not the
         // displayed one is never a refresh target, so treat it conservatively as For You.
@@ -625,6 +634,7 @@ static BOOL nfb_streamTriggerTarget(UIViewController *target) {
         ((void(*)(id, SEL))objc_msgSend)(r, @selector(clearTimelineCacheAndRefresh));
         did = YES;
     }
+    if (did) NFBHeatCount(NFBHeatStreamRefresh);
     if (did && !willRevealFromCompletion) nfb_afterRefresh(target);
     if (!did) NFBLogEvent([NSString stringWithFormat:@"streamTrigger noEntryPoint target=%@", NSStringFromClass(target.class)]);
     return did;
@@ -1780,6 +1790,7 @@ static void nfb_streamStart(UIViewController *vc) {
             nfb_updateStreamStateIconForVC(target);
             return;
         }
+        NFBHeatCount(NFBHeatStreamTick);
         if (nfb_streamShouldFire(target)) nfb_streamTrigger(target);
     }];
     timer.tolerance = MIN(1.0, MAX(0.25, interval * 0.1));
@@ -1888,15 +1899,21 @@ static NSString *nfb_buildDiagnosticReport(void) {
     CGRect bf = gStreamButton.window ? [gStreamButton convertRect:gStreamButton.bounds toView:nil] : CGRectZero;
     NSArray *winSubviews = gStreamButton.window.subviews;
     NSUInteger buttonIndex = winSubviews ? [winSubviews indexOfObject:gStreamButton] : NSNotFound;
+    [s appendFormat:@"NeoFreeBird port %s (%s) on X %@\n", NFB_VERSION_STRING, NFB_COMMIT_STRING,
+        [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?"];
+    [s appendFormat:@"%@\n", NFBHeatSummary()];
     [s appendFormat:@"%@\n", nfb_healthLine()];
     [s appendFormat:@"streaming on=%d interval=%ld page=%@ button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",
         nfb_streamEnabled() ? 1 : 0, (long)nfb_streamInterval(), nfb_currentSelectedTabPage() ?: @"(nil)", gStreamButton ? 1 : 0,
         (gStreamButton && !gStreamButton.hidden) ? 1 : 0, gStreamButton ? gStreamButton.alpha : -1.0, gStreamButton.window ? 1 : 0,
         bf.origin.x, bf.origin.y, bf.size.width, bf.size.height,
         buttonIndex == NSNotFound ? -1L : (long)buttonIndex, (unsigned long)winSubviews.count];
-    [s appendFormat:@"container=%@ containerActive=%@ isHomeSelected=%d\n",
+    id activeScribePage = nfb_resp(containerActive, @selector(scribePage)) ?
+        ((id(*)(id, SEL))objc_msgSend)(containerActive, @selector(scribePage)) : nil;
+    [s appendFormat:@"container=%@ containerActive=%@ scribePage=%@ isHomeSelected=%d\n",
         container ? NSStringFromClass(container.class) : @"nil",
-        containerActive ? NSStringFromClass(containerActive.class) : @"nil", homeSelected ? 1 : 0];
+        containerActive ? NSStringFromClass(containerActive.class) : @"nil",
+        [activeScribePage isKindOfClass:NSString.class] ? activeScribePage : @"-", homeSelected ? 1 : 0];
     [s appendFormat:@"active=%@ selected=%@ recommended=%d strictTop=%d top8=%d canRun=%d\n",
         active ? NSStringFromClass(active.class) : @"nil",
         selected ? NSStringFromClass(selected.class) : @"nil",

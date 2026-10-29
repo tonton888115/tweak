@@ -4,6 +4,7 @@
 //
 
 #import "HookHelpers.h"
+#import <os/lock.h>
 
 // While set, -isSubscribedTo: (below) reports the account's genuine
 // subscription state instead of the forced premium tiers, so paths that need
@@ -37,7 +38,7 @@ static BOOL AccountIsGenuinelyPremium(void) {
 
 // MARK: - Feature switch overrides
 
-static NSNumber* FeatureSwitchOverrideValueForKey(NSString* key) {
+static NSNumber* FeatureSwitchOverrideValueForKeyUncached(NSString* key) {
     if (![key isKindOfClass:[NSString class]]) {
         return nil;
     }
@@ -73,6 +74,13 @@ static NSNumber* FeatureSwitchOverrideValueForKey(NSString* key) {
     if ([key isEqualToString:
                  @"hometimeline_pinned_tabs_pinned_trailing_accessory_enabled"]) {
         return hideCustomTimelines ? @NO : nil;
+    }
+
+    // Fork (b68): X's hang watchdog turns any multi-second main-thread stall
+    // into a deliberate abort(). Report it disabled; ForkExtras.x no-ops its
+    // crash() as the second line of defense.
+    if ([key isEqualToString:@"ios_performance_watchdog_disabled"]) {
+        return @YES;
     }
 
     // Restore the animated launch screen (AppLifecycle.x strips its X-shaped
@@ -441,6 +449,54 @@ static NSNumber* FeatureSwitchOverrideValueForKey(NSString* key) {
     }
 
     return nil;
+}
+
+// X reads feature switches constantly (cell configuration, layout, scrolling)
+// and every read passes through both hooked classes below, each running the
+// lookup above: a settings read plus ~150 string comparisons, mostly to
+// conclude that the key has no override. Answers are cached per key and
+// dropped whenever the defaults change; keys whose answer depends on per-call
+// state (the genuine tab gates, the genuine premium status) are never cached.
+static os_unfair_lock FeatureSwitchCacheLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableDictionary<NSString*, id>* FeatureSwitchCache;
+static uint64_t FeatureSwitchCacheGeneration;
+
+static BOOL FeatureSwitchOverrideIsStateDependent(NSString* key) {
+    return [key isEqualToString:@"subscriptions_premium_hub_enabled"] ||
+           [key isEqualToString:@"recruiting_global_jobs_hub_enabled"] ||
+           [key isEqualToString:@"creator_studio_nav_enabled"] ||
+           [key isEqualToString:@"creator_monetization_dashboard_enabled"];
+}
+
+static NSNumber* FeatureSwitchOverrideValueForKey(NSString* key) {
+    if (![key isKindOfClass:[NSString class]]) {
+        return nil;
+    }
+    NFBHeatCount(NFBHeatFeatureSwitchRead);
+
+    uint64_t generation = BHTDefaultsGeneration();
+    os_unfair_lock_lock(&FeatureSwitchCacheLock);
+    if (!FeatureSwitchCache || FeatureSwitchCacheGeneration != generation) {
+        FeatureSwitchCache = FeatureSwitchCache ?: [NSMutableDictionary new];
+        [FeatureSwitchCache removeAllObjects];
+        FeatureSwitchCacheGeneration = generation;
+    }
+    id cached = FeatureSwitchCache[key];
+    os_unfair_lock_unlock(&FeatureSwitchCacheLock);
+    if (cached) {
+        return cached == NSNull.null ? nil : cached;
+    }
+
+    NFBHeatCount(NFBHeatFeatureSwitchMiss);
+    NSNumber* value = FeatureSwitchOverrideValueForKeyUncached(key);
+    if (!FeatureSwitchOverrideIsStateDependent(key)) {
+        os_unfair_lock_lock(&FeatureSwitchCacheLock);
+        if (FeatureSwitchCacheGeneration == generation) {
+            FeatureSwitchCache[key] = value ?: NSNull.null;
+        }
+        os_unfair_lock_unlock(&FeatureSwitchCacheLock);
+    }
+    return value;
 }
 
 // Every feature switch facade bottoms out in TFSFeatureSwitches, but instances

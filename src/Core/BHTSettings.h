@@ -24,3 +24,13 @@
 + (NSInteger)integerForKey:(NSString*)key;
 
 @end
+
+// Bumped whenever NSUserDefaults changes in this process. Hot-path caches of
+// values derived from settings compare against it to know when to recompute.
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint64_t BHTDefaultsGeneration(void);
+#ifdef __cplusplus
+}
+#endif

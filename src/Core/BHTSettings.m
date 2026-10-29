@@ -8,6 +8,9 @@
 #import "Core/BHTSettings.h"
 #import "Core/BHTBundle.h"
 #import "Core/BHTManager.h"
+#import <os/lock.h>
+#import <stdatomic.h>
+#import "Core/NFBHeat.h"
 
 static NSDictionary<NSString*, NSDictionary*>* BHTSettingsPages(void) {
     static NSDictionary<NSString*, NSDictionary*>* pages;
@@ -663,20 +666,68 @@ static NSDictionary<NSString*, NSDictionary*>* BHTSettingsIndex(void) {
     return keys;
 }
 
-+ (BOOL)boolForKey:(NSString*)key {
-    id value = [[NSUserDefaults standardUserDefaults] objectForKey:key];
-    if (value != nil) {
-        return [value boolValue];
+// Hooks on UIKit hot paths (every background color, color resolution, font,
+// feature switch read) ask for settings thousands of times a second, and each
+// NSUserDefaults lookup takes its lock and searches the preference domains.
+// The effective value (stored or registry default) is cached per key; any
+// change to the defaults bumps the generation and empties the cache.
+static os_unfair_lock BHTSettingsCacheLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableDictionary<NSString*, id>* BHTSettingsCache;
+static uint64_t BHTSettingsCacheGeneration;
+static _Atomic uint64_t BHTDefaultsGenerationValue;
+
+uint64_t BHTDefaultsGeneration(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        [NSNotificationCenter.defaultCenter
+            addObserverForName:NSUserDefaultsDidChangeNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(__unused NSNotification* note) {
+                        atomic_fetch_add_explicit(&BHTDefaultsGenerationValue, 1,
+                                                  memory_order_relaxed);
+                    }];
+    });
+    return atomic_load_explicit(&BHTDefaultsGenerationValue, memory_order_relaxed);
+}
+
+static id BHTSettingsEffectiveValue(NSString* key) {
+    if (!key) {
+        return nil;
     }
-    return [[self settingForKey:key][@"default"] boolValue];
+    NFBHeatCount(NFBHeatSettingsRead);
+    uint64_t generation = BHTDefaultsGeneration();
+    os_unfair_lock_lock(&BHTSettingsCacheLock);
+    if (!BHTSettingsCache || BHTSettingsCacheGeneration != generation) {
+        BHTSettingsCache = BHTSettingsCache ?: [NSMutableDictionary new];
+        [BHTSettingsCache removeAllObjects];
+        BHTSettingsCacheGeneration = generation;
+    }
+    id cached = BHTSettingsCache[key];
+    os_unfair_lock_unlock(&BHTSettingsCacheLock);
+    if (cached) {
+        return cached == NSNull.null ? nil : cached;
+    }
+
+    NFBHeatCount(NFBHeatSettingsMiss);
+    id value = [[NSUserDefaults standardUserDefaults] objectForKey:key] ?:
+        [BHTSettings settingForKey:key][@"default"];
+    os_unfair_lock_lock(&BHTSettingsCacheLock);
+    if (BHTSettingsCacheGeneration == generation) {
+        BHTSettingsCache[key] = value ?: NSNull.null;
+    }
+    os_unfair_lock_unlock(&BHTSettingsCacheLock);
+    return value;
+}
+
++ (BOOL)boolForKey:(NSString*)key {
+    id value = BHTSettingsEffectiveValue(key);
+    return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : NO;
 }
 
 + (NSInteger)integerForKey:(NSString*)key {
-    id value = [[NSUserDefaults standardUserDefaults] objectForKey:key];
-    if (value != nil) {
-        return [value integerValue];
-    }
-    return [[self settingForKey:key][@"default"] integerValue];
+    id value = BHTSettingsEffectiveValue(key);
+    return [value respondsToSelector:@selector(integerValue)] ? [value integerValue] : 0;
 }
 
 @end
