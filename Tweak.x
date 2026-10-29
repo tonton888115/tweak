@@ -2115,7 +2115,97 @@ static void BHTApplyCopyButtonStyle(UIButton *copyButton, T1ProfileHeaderView *h
         }
         return YES;                       // default off when unset
     }
-    
+
+    // b87: session token appended to shared/copied links (&t=)
+    if ([key isEqualToString:@"rehire_share_update_url_enabled"]) {
+        return NO;
+    }
+
+    return %orig;
+}
+%end
+
+// MARK: b87 strip tracking params from shared links (ported from NeoFreeBird/app Misc.x)
+// The switch above turns the &t= token off at the source; the hooks below drop ?s=/&t=/&a= from
+// the URLs X builds for share/copy. 11.35 has the same builders as 12.x (TFNTwitterStatus's
+// T1 category, Q-typed sParam), and the share sheet re-appends per-app params in
+// -[T1ActivityItemProvider _tfn_prepareURL:activityType:], so its result is cleaned as well.
+// Only x.com / twitter.com links are touched: entity URLs of other sites (YouTube ?t= etc.) pass.
+static BOOL BHTIsTwitterHost(NSString *host) {
+    host = host.lowercaseString;
+    return [host isEqualToString:@"x.com"] || [host hasSuffix:@".x.com"] ||
+           [host isEqualToString:@"twitter.com"] || [host hasSuffix:@".twitter.com"];
+}
+
+static NSURL *BHTCleanedShareURL(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]] || url.query == nil || !BHTIsTwitterHost(url.host)) {
+        return url;
+    }
+    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    if (components == nil) {
+        return url;
+    }
+    NSMutableArray<NSURLQueryItem*> *safeParams = [NSMutableArray arrayWithCapacity:0];
+    for (NSURLQueryItem *item in components.queryItems) {
+        if (![item.name isEqualToString:@"s"] && ![item.name isEqualToString:@"t"] && ![item.name isEqualToString:@"a"]) {
+            [safeParams addObject:item];
+        }
+    }
+    components.queryItems = safeParams.count > 0 ? safeParams : nil;
+    return components.URL ?: url;
+}
+
+static NSString *BHTCleanedShareURLString(NSString *urlString) {
+    if (![urlString isKindOfClass:[NSString class]]) {
+        return urlString;
+    }
+    NSURL *url = [NSURL URLWithString:urlString];
+    NSURL *cleaned = BHTCleanedShareURL(url);
+    return cleaned == url ? urlString : (cleaned.absoluteString ?: urlString);
+}
+
+%hook TFNTwitterStatus
+- (NSString *)twitterURLForShareWithSParam:(unsigned long long)sParam {
+    return BHTCleanedShareURLString(%orig);
+}
+
++ (NSString *)twitterURLForShareWithSParam:(unsigned long long)sParam username:(NSString *)username statusID:(long long)statusID {
+    return BHTCleanedShareURLString(%orig);
+}
+%end
+
+// Profile links
+%hook TFSTwitterUserReference
+- (NSString *)twitterURLForShare {
+    return BHTCleanedShareURLString(%orig);
+}
+
+- (NSString *)twitterURLForCopy {
+    return BHTCleanedShareURLString(%orig);
+}
+%end
+
+%hook T1ActivityItemProvider
+- (NSURL *)_tfn_prepareURL:(NSURL *)url activityType:(NSString *)activityType {
+    return BHTCleanedShareURL(%orig);
+}
+%end
+
+// The switch can also be read through the account-level feature switches, not only TPS.
+%hook TFSFeatureSwitches
+- (BOOL)boolForKey:(NSString *)key {
+    if ([key isEqualToString:@"rehire_share_update_url_enabled"]) {
+        return NO;
+    }
+    return %orig;
+}
+%end
+
+%hook TFSInstrumentedFeatureSwitches
+- (BOOL)boolForKey:(NSString *)key {
+    if ([key isEqualToString:@"rehire_share_update_url_enabled"]) {
+        return NO;
+    }
     return %orig;
 }
 %end
@@ -4706,8 +4796,11 @@ static char kManualRefreshInProgressKey;
             if (UIPasteboard.generalPasteboard.hasURLs) {
                 NSURL *pasteboardURL = UIPasteboard.generalPasteboard.URL;
                 NSArray<NSString*>* params = trackingParams[pasteboardURL.host];
+                // b87: copied links now arrive already stripped (no query), so a host swap alone must still run
+                NSString *selectedHost = [[NSUserDefaults standardUserDefaults] objectForKey:@"tweet_url_host"];
+                BOOL needsHostSwap = selectedHost.length > 0 && ![pasteboardURL.host isEqualToString:selectedHost];
 
-                if ([pasteboardURL.absoluteString isEqualToString:_lastCopiedURL] == NO && params != nil && pasteboardURL.query != nil) {
+                if ([pasteboardURL.absoluteString isEqualToString:_lastCopiedURL] == NO && params != nil && (pasteboardURL.query != nil || needsHostSwap)) {
                     // to prevent endless copy loop
                     _lastCopiedURL = pasteboardURL.absoluteString;
                     NSURLComponents *cleanedURL = [NSURLComponents componentsWithURL:pasteboardURL resolvingAgainstBaseURL:NO];

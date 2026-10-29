@@ -4316,7 +4316,7 @@ static void nfb_layoutColumnsOverlayForPaging(UIViewController *paging) {
         static NSString *lastLayoutKey = nil;
         if (![key isEqualToString:lastLayoutKey]) {
             lastLayoutKey = [key copy];
-            NFBLogEvent([NSString stringWithFormat:@"layout[b86] %@ off=%.0f", key, nativeScrollView.contentOffset.x]);
+            NFBLogEvent([NSString stringWithFormat:@"layout[b87] %@ off=%.0f", key, nativeScrollView.contentOffset.x]);
         }
     }
     nfb_setColumnsSegmentedHiddenForPaging(paging, YES);
@@ -6898,7 +6898,7 @@ static void nfb_layoutActiveHomePaging(void) {
     if (gNFBLayoutActiveHomePagingRunning) {
         if (gNFBLogRecording) {
             static NSString *lastLayoutReentryKey = nil;
-            NSString *key = @"layout[b86] activeHome reentry deferred";
+            NSString *key = @"layout[b87] activeHome reentry deferred";
             if (![key isEqualToString:lastLayoutReentryKey]) { lastLayoutReentryKey = [key copy]; NFBLogEvent(key); }
         }
         nfb_requestLayoutActiveHomePagingOnNextTurn();
