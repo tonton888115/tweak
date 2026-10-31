@@ -553,3 +553,5 @@
 "NFB_NET_DOWNDETECTOR" = "🌐 X outage reports (Downdetector)";
 "NFB_NET_SPEED_RESULT" = "Download: %.1f Mbps\nX last load: %@";
 "NFB_NET_SPEED_FAILED" = "Measurement failed: %@";
+"NFB_NET_SPEED_TITLE" = "Connection speed";
+"NFB_NET_MEASURING_10MB" = "Measuring… (~10 MB)";

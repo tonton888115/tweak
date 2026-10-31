@@ -551,3 +551,5 @@
 "NFB_NET_DOWNDETECTOR" = "🌐 X の障害情報（Downdetector）";
 "NFB_NET_SPEED_RESULT" = "ダウンロード: %.1f Mbps\nX の直近の読み込み: %@";
 "NFB_NET_SPEED_FAILED" = "測定できませんでした: %@";
+"NFB_NET_SPEED_TITLE" = "回線速度";
+"NFB_NET_MEASURING_10MB" = "測定中…（約10MB）";

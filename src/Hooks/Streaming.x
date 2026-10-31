@@ -65,6 +65,8 @@ static void nfb_noteLoadBegan(id owner);
 static void nfb_noteLoadEnded(id owner);
 static void nfb_runSpeedTest(NSUInteger bytes, void (^done)(double mbps, NSError *error));
 static void nfb_installNetBadge(void);
+static NSString *gNFBPrevSessionVerdict = nil;   // session black box (crash audit), set at launch
+static NSString *gNFBPrevSessionText = nil;
 void NFBNoteTabSelectionChanged(void);
 void NFBLogEvent(NSString *msg);
 NSString *NFBHeatSummary(void);   // HeatProbe.x
@@ -266,6 +268,44 @@ static BOOL nfb_vcIsOrContains(UIViewController *outer, UIViewController *inner)
     return NO;
 }
 
+// Title of the home tab whose page is or contains vc ("おすすめ", "フォロー中", a list name), read
+// from the segmented controller's data source, the same source the Columns tab uses for its
+// headers. X 12.38's For You and Following pages both report scribePage "home" (the 2026-10-31
+// diag showed Following selected with recommended=1), so the title is what tells them apart.
+// Only the displayed page is looked up (the one a refresh can target); the answer is cached per
+// page, since a page controller keeps its tab.
+static char kNFBHomeTabTitleKey;
+static NSString *nfb_homeTabTitleOfPage(UIViewController *vc) {
+    UIViewController *segmented = nfb_parentControllerNamed(vc, @"LegacySegmentedViewController");
+    if (!segmented || ![segmented respondsToSelector:@selector(selectedViewController)] ||
+        ![segmented respondsToSelector:@selector(selectedIndex)] || ![segmented respondsToSelector:@selector(dataSource)]) return nil;
+    // Only the displayed page: viewControllerAtTabIndex: can build pages that are not loaded yet.
+    id selected = ((id(*)(id, SEL))objc_msgSend)(segmented, @selector(selectedViewController));
+    if (![selected isKindOfClass:UIViewController.class]) return nil;
+    BOOL match = NO;
+    for (UIViewController *c = vc; c && !match; c = c.parentViewController) match = (c == selected);
+    for (UIViewController *c = (UIViewController *)selected; c && !match; c = c.parentViewController) match = (c == vc);
+    if (!match) return nil;
+    NSInteger index = ((NSInteger(*)(id, SEL))objc_msgSend)(segmented, @selector(selectedIndex));
+    id dataSource = ((id(*)(id, SEL))objc_msgSend)(segmented, @selector(dataSource));
+    SEL descSel = @selector(segmentedViewController:descriptorAtIndex:);
+    if (index < 0 || ![dataSource respondsToSelector:descSel]) return nil;
+    id descriptor = nil;
+    @try {
+        descriptor = ((id(*)(id, SEL, id, NSInteger))objc_msgSend)(dataSource, descSel, segmented, index);
+    } @catch (NSException *e) {
+        descriptor = nil;
+    }
+    for (NSString *getter in @[@"firstLabelText", @"tabAccessibilityLabel"]) {
+        SEL sel = NSSelectorFromString(getter);
+        if (![descriptor respondsToSelector:sel]) continue;
+        id value = ((id(*)(id, SEL))objc_msgSend)(descriptor, sel);
+        if ([value isKindOfClass:NSAttributedString.class]) value = [(NSAttributedString *)value string];
+        if ([value isKindOfClass:NSString.class] && [(NSString *)value length]) return value;
+    }
+    return nil;
+}
+
 // For You must never auto-refresh. X 12.x removed the container's homeTimelineViewController /
 // latestTimelineViewController; the Swift container instead reports the selected variant through
 // isHomeSelected ("home" = For You) for its activeContentViewController.
@@ -282,13 +322,20 @@ static BOOL nfb_isRecommendedHomeTimeline(UIViewController *vc) {
         if (homeVC) return nfb_vcIsOrContains((UIViewController *)homeVC, vc);
     }
     if ([NSStringFromClass(vc.class) containsString:@"PinnedTimelineViewController"]) return NO;
-    // X 12.38 dropped -isHomeSelected. Each home page reports its own scribe page instead:
-    // "home" is For You, "home_latest" is Following.
-    NSString *scribePage = nfb_resp(vc, @selector(scribePage)) ?
-        ((id(*)(id, SEL))objc_msgSend)(vc, @selector(scribePage)) : nil;
-    if ([scribePage isKindOfClass:NSString.class]) {
-        if ([scribePage isEqualToString:@"home_latest"]) return NO;
-        if ([scribePage isEqualToString:@"home"]) return YES;
+    // X 12.38 dropped -isHomeSelected and both home pages report scribePage "home": the tab title
+    // decides. The page itself is cached; the lookup is a short walk of the tab list.
+    UIViewController *page = vc;
+    while (page && !nfb_isTimelinePageController(page)) page = page.parentViewController;
+    page = page ?: vc;
+    NSNumber *cachedRecommended = objc_getAssociatedObject(page, &kNFBHomeTabTitleKey);
+    if (cachedRecommended) return cachedRecommended.boolValue;
+    NSString *tabTitle = nfb_homeTabTitleOfPage(page);
+    if (tabTitle.length) {
+        BOOL recommended = nfb_textLooksRecommendedTab(tabTitle);
+        objc_setAssociatedObject(page, &kNFBHomeTabTitleKey, @(recommended), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        NFBLogEvent([NSString stringWithFormat:@"homeTab title=%@ recommended=%d page=%@", tabTitle, recommended ? 1 : 0,
+            NSStringFromClass(page.class)]);
+        return recommended;
     }
     if (container && nfb_resp(container, @selector(isHomeSelected))) {
         // isHomeSelected describes the DISPLAYED page only. A home-items page that is not the
@@ -1054,6 +1101,7 @@ static char gNFBCrashLogPathC[1024];
 static char gNFBCrashImageInfoC[512];
 static const int kNFBCrashSignals[] = {SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE};
 static struct sigaction gNFBPrevSigActions[sizeof(kNFBCrashSignals) / sizeof(int)];
+static char gNFBBlackboxPathC[1024];   // session black box (below); the crash handlers mark it
 
 static void nfb_uncaughtExceptionHandler(NSException *exception) {
     @try {
@@ -1067,6 +1115,15 @@ static void nfb_uncaughtExceptionHandler(NSException *exception) {
             [line writeToFile:nfb_logFilePath() atomically:NO encoding:NSUTF8StringEncoding error:nil];
         }
     } @catch (NSException *e) {}
+    if (gNFBBlackboxPathC[0]) {
+        int bfd = open(gNFBBlackboxPathC, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (bfd >= 0) {
+            NSString *mark = [NSString stringWithFormat:@"\n!!! CRASH exception=%@ reason=%@\n", exception.name ?: @"?", exception.reason ?: @"?"];
+            const char *c = mark.UTF8String;
+            if (c) write(bfd, c, strlen(c));
+            close(bfd);
+        }
+    }
     if (gNFBPreviousExceptionHandler) gNFBPreviousExceptionHandler(exception);
 }
 
@@ -1100,6 +1157,15 @@ static void nfb_signalCrashHandler(int sig, siginfo_t *info, void *context) {
         backtrace_symbols_fd(frames, n, fd);
         nfb_crashWrite(fd, "=== CRASH END ===\n");
         close(fd);
+    }
+    if (gNFBBlackboxPathC[0]) {
+        int bfd = open(gNFBBlackboxPathC, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (bfd >= 0) {
+            nfb_crashWrite(bfd, "\n!!! CRASH signal=");
+            nfb_crashWrite(bfd, nfb_crashSignalName(sig));
+            nfb_crashWrite(bfd, "\n");
+            close(bfd);
+        }
     }
     for (size_t i = 0; i < sizeof(kNFBCrashSignals) / sizeof(int); i++) {
         if (kNFBCrashSignals[i] != sig) continue;
@@ -1156,6 +1222,9 @@ static char kNFBLoadStartKey;
 static double gNFBLastMbps = -1.0;            // last speed test (download), Mbps
 static BOOL gNFBSpeedTestRunning = NO;
 static NSUInteger gNFBConsecutiveBadLoads = 0; // timeouts / >= 8s loads in a row (outage hint)
+static NSString *gNFBLastLoadOp = nil;           // GraphQL operation of the last timeline response
+static CFTimeInterval gNFBLastTimelineResponseAt = 0.0;
+static NSUInteger gNFBTimelineResponses = 0;
 
 static NSString *nfb_cellularGeneration(void) {
     static CTTelephonyNetworkInfo *info = nil;
@@ -1234,6 +1303,8 @@ static void nfb_noteLoadBegan(id owner) {
         id strongOwner = weakOwner;
         if (strongOwner && objc_getAssociatedObject(strongOwner, &kNFBLoadStartKey) == start) {
             objc_setAssociatedObject(strongOwner, &kNFBLoadStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            // X answered a timeline request meanwhile: the load was merged or ended quietly.
+            if (gNFBLastTimelineResponseAt > start.doubleValue) return;
             gNFBLastLoadTimedOut = YES;
             if (gNFBNetPath != 0) gNFBConsecutiveBadLoads++;
             NFBLogEvent(@"netBadge load timed out (12s)");
@@ -1302,10 +1373,70 @@ static void nfb_installNetBadge(void) {
     nfb_updateNetBadge();
 }
 
+// X's own answer time where its networking (TwitterNetworkLayer) finishes a request: every
+// timeline load - pull, tab tap, auto-refresh, paging down - is a GraphQL "...Timeline" operation.
+// TFNDataViewController's loadTopDidBegin/End never fire for the X 12.38 home timeline (diag:
+// lastLoad stayed -1), so this is the badge's main source. Runs on X's network queues.
+static BOOL nfb_isOutageError(NSError *error) {
+    for (NSError *e = error; e; e = e.userInfo[NSUnderlyingErrorKey]) {
+        if (![e.domain isEqualToString:NSURLErrorDomain]) continue;
+        switch (e.code) {
+            case NSURLErrorTimedOut:
+            case NSURLErrorCannotFindHost:
+            case NSURLErrorCannotConnectToHost:
+            case NSURLErrorNetworkConnectionLost:
+            case NSURLErrorDNSLookupFailed:
+            case NSURLErrorNotConnectedToInternet:
+            case NSURLErrorSecureConnectionFailed:
+                return YES;
+            default:
+                return NO;
+        }
+    }
+    return NO;
+}
+
+static void nfb_noteTimelineResponse(id info, id metrics, NSError *error) {
+    NSURL *url = [info respondsToSelector:@selector(finalURL)] ? ((id(*)(id, SEL))objc_msgSend)(info, @selector(finalURL)) : nil;
+    if (![url isKindOfClass:NSURL.class]) return;
+    NSString *path = url.path;
+    NSString *op = path.lastPathComponent;
+    if (![path containsString:@"/graphql/"] || ![op hasSuffix:@"Timeline"]) return;
+    double seconds = [metrics respondsToSelector:@selector(allAttemptsDuration)] ?
+        ((double(*)(id, SEL))objc_msgSend)(metrics, @selector(allAttemptsDuration)) : -1.0;
+    NSInteger status = [info respondsToSelector:@selector(statusCode)] ?
+        ((NSInteger(*)(id, SEL))objc_msgSend)(info, @selector(statusCode)) : 0;
+    BOOL bad = status >= 500 || (status == 0 && nfb_isOutageError(error));
+    // Cancelled or otherwise failed requests without an answer say nothing about X.
+    if (!bad && (status == 0 || seconds < 0.0)) return;
+    NSString *opCopy = [op copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gNFBLastTimelineResponseAt = CACurrentMediaTime();
+        gNFBTimelineResponses++;
+        gNFBLastLoadOp = opCopy;
+        if (bad) {
+            gNFBLastLoadTimedOut = YES;
+            if (gNFBNetPath != 0) gNFBConsecutiveBadLoads++;
+            NFBLogEvent([NSString stringWithFormat:@"netBadge %@ failed status=%ld err=%@", opCopy, (long)status,
+                error.localizedDescription ?: @"-"]);
+        } else {
+            gNFBLastLoadSeconds = seconds;
+            gNFBLastLoadTimedOut = NO;
+            gNFBConsecutiveBadLoads = seconds >= 8.0 ? gNFBConsecutiveBadLoads + 1 : 0;
+        }
+        nfb_updateNetBadge();
+    });
+}
+
 static NSString *nfb_netDiagLine(void) {
-    return [NSString stringWithFormat:@"net path=%ld lastLoad=%.2fs timedOut=%d badLoads=%lu mbps=%.1f testing=%d badge=%d",
-        (long)gNFBNetPath, gNFBLastLoadSeconds, gNFBLastLoadTimedOut ? 1 : 0, (unsigned long)gNFBConsecutiveBadLoads,
-        gNFBLastMbps, gNFBSpeedTestRunning ? 1 : 0, gNFBNetBadge.superview ? 1 : 0];
+    CGRect bf = gNFBNetBadge.window ? [gNFBNetBadge convertRect:gNFBNetBadge.bounds toView:nil] : CGRectZero;
+    return [NSString stringWithFormat:@"net path=%ld lastLoad=%.2fs op=%@ responses=%lu lastResponse=%.0fs ago timedOut=%d badLoads=%lu mbps=%.1f testing=%d badge=%d hidden=%d f=(%.0f,%.0f,%.0f,%.0f) text=%@",
+        (long)gNFBNetPath, gNFBLastLoadSeconds, gNFBLastLoadOp ?: @"-", (unsigned long)gNFBTimelineResponses,
+        gNFBLastTimelineResponseAt > 0.0 ? CACurrentMediaTime() - gNFBLastTimelineResponseAt : -1.0,
+        gNFBLastLoadTimedOut ? 1 : 0, (unsigned long)gNFBConsecutiveBadLoads,
+        gNFBLastMbps, gNFBSpeedTestRunning ? 1 : 0, gNFBNetBadge.superview ? 1 : 0, gNFBNetBadge.hidden ? 1 : 0,
+        bf.origin.x, bf.origin.y, bf.size.width, bf.size.height,
+        [gNFBNetBadge.text stringByReplacingOccurrencesOfString:@"\n" withString:@" / "] ?: @"-"];
 }
 
 #pragma mark - tap / long-press handler
@@ -1457,29 +1588,99 @@ static NSString *nfb_netDiagLine(void) {
     [[self topVC] presentViewController:wrapper animated:YES completion:nil];
 }
 
+// The top controller that can present right now: an action sheet whose handler is running may
+// still be on its way out, and a controller that is being dismissed cannot present.
+- (UIViewController *)presenterVC {
+    UIViewController *top = [self topVC];
+    while (top && top.isBeingDismissed && top.presentingViewController) top = top.presentingViewController;
+    return top;
+}
+
+// Presents once the action sheet has gone (the menu handlers run while it animates out).
+- (void)presentSoon:(UIViewController *)vc completion:(void (^)(BOOL presented))completion {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIViewController *top = [self presenterVC];
+        if (!top || top.presentedViewController) {
+            NFBLogEvent([NSString stringWithFormat:@"presentSoon %@ no presenter top=%@ presented=%@", NSStringFromClass(vc.class),
+                top ? NSStringFromClass(top.class) : @"nil", top.presentedViewController ? NSStringFromClass(top.presentedViewController.class) : @"-"]);
+            if (completion) completion(NO);
+            return;
+        }
+        if ([vc isKindOfClass:UIAlertController.class] && vc.popoverPresentationController) {
+            vc.popoverPresentationController.sourceView = gStreamButton;
+            vc.popoverPresentationController.sourceRect = gStreamButton.bounds;
+        }
+        [top presentViewController:vc animated:YES completion:^{
+            if (completion) completion(YES);
+        }];
+    });
+}
+
 - (void)speedTest {
+    NFBLogEvent([NSString stringWithFormat:@"speedTest menu path=%ld running=%d", (long)gNFBNetPath, gNFBSpeedTestRunning ? 1 : 0]);
     if (gNFBNetPath == 0) {
         [self toast:nfb_loc(@"NFB_NET_OFFLINE", @"Offline")];
         return;
     }
+    // Shown at once and filled in when the ~10 MB download is done (a few seconds on Wi-Fi).
+    UIAlertController *progress = [UIAlertController alertControllerWithTitle:nfb_loc(@"NFB_NET_SPEED_TITLE", @"Connection speed")
+        message:nfb_loc(@"NFB_NET_MEASURING_10MB", @"Measuring… (~10 MB)") preferredStyle:UIAlertControllerStyleAlert];
+    [progress addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentSoon:progress completion:nil];
     __weak typeof(self) weakSelf = self;
-    nfb_runSpeedTest(10000000, ^(double mbps, NSError *error) {
+    void (^report)(double, NSError *) = ^(double mbps, NSError *error) {
         NSString *msg = mbps >= 0.0 ?
             [NSString stringWithFormat:nfb_loc(@"NFB_NET_SPEED_RESULT", @"Download: %.1f Mbps\nX last load: %@"), mbps,
                 gNFBLastLoadSeconds >= 0.0 ? [NSString stringWithFormat:@"%.1fs", gNFBLastLoadSeconds] : @"—"] :
             [NSString stringWithFormat:nfb_loc(@"NFB_NET_SPEED_FAILED", @"Measurement failed: %@"), error.localizedDescription ?: @"?"];
-        [weakSelf toast:msg];
+        if (progress.presentingViewController && !progress.isBeingDismissed) progress.message = msg;
+        else [weakSelf toast:msg];
+    };
+    if (gNFBSpeedTestRunning) {
+        // The automatic Wi-Fi test is running: report its result instead of a second download.
+        [self waitForSpeedTest:report tries:60];
+        return;
+    }
+    nfb_runSpeedTest(10000000, report);
+}
+
+- (void)waitForSpeedTest:(void (^)(double, NSError *))report tries:(NSUInteger)tries {
+    if (!gNFBSpeedTestRunning) {
+        report(gNFBLastMbps, nil);
+        return;
+    }
+    if (tries == 0) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self waitForSpeedTest:report tries:tries - 1];
     });
 }
 
 // Downdetector has no public API and its pages are bot-protected, so the app does not read it in
-// the background; this opens the X page (Japan) in an in-app Safari sheet.
+// the background; this opens the X page (Japan) in an in-app Safari sheet, or in Safari when the
+// sheet cannot be shown.
 - (void)openDowndetector {
-    UIViewController *top = [self topVC];
     NSURL *url = [NSURL URLWithString:@"https://downdetector.jp/shougai/twitter/"];
-    if (!top || !url) return;
-    SFSafariViewController *safari = [[SFSafariViewController alloc] initWithURL:url];
-    [top presentViewController:safari animated:YES completion:nil];
+    if (!url) return;
+    SFSafariViewController *safari = nil;
+    @try {
+        safari = [[SFSafariViewController alloc] initWithURL:url];
+    } @catch (NSException *e) {
+        NFBLogEvent([NSString stringWithFormat:@"downdetector SFSafariViewController failed: %@", e.reason ?: e.name]);
+    }
+    void (^openInSafari)(NSString *) = ^(NSString *why) {
+        NFBLogEvent([NSString stringWithFormat:@"downdetector -> Safari (%@)", why]);
+        [UIApplication.sharedApplication openURL:url options:@{} completionHandler:^(BOOL ok) {
+            NFBLogEvent([NSString stringWithFormat:@"downdetector Safari open=%d", ok ? 1 : 0]);
+        }];
+    };
+    if (!safari) {
+        openInSafari(@"no sheet");
+        return;
+    }
+    [self presentSoon:safari completion:^(BOOL presented) {
+        NFBLogEvent([NSString stringWithFormat:@"downdetector sheet presented=%d", presented ? 1 : 0]);
+        if (!presented) openInSafari(@"no presenter");
+    }];
 }
 
 - (void)toast:(NSString *)msg {
@@ -1519,8 +1720,9 @@ static NSString *nfb_netDiagLine(void) {
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
     NSArray<NSString *> *saved = [nfb_logSavedFileContents() componentsSeparatedByString:@"\n"];
     NSArray<NSString *> *savedTail = saved.count > 150 ? [saved subarrayWithRange:NSMakeRange(saved.count - 150, 150)] : saved;
-    NSString *text = [NSString stringWithFormat:@"%@\n\n=== recent events (this session) ===\n%@\n\n=== older saved log (last 150 lines; may be from previous builds) ===\n%@\n",
-        nfb_buildDiagnosticReport(), [gNFBRecentEvents componentsJoinedByString:@"\n"] ?: @"-", [savedTail componentsJoinedByString:@"\n"]];
+    NSString *text = [NSString stringWithFormat:@"%@\n\n=== recent events (this session) ===\n%@\n\n=== previous session (black box) ===\n%@\n\n=== older saved log (last 150 lines; may be from previous builds) ===\n%@\n",
+        nfb_buildDiagnosticReport(), [gNFBRecentEvents componentsJoinedByString:@"\n"] ?: @"-", gNFBPrevSessionText ?: @"-",
+        [savedTail componentsJoinedByString:@"\n"]];
     if (![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
         [self showDiag];
         return;
@@ -2011,6 +2213,114 @@ static void nfb_startHealthLogOnce(void) {
     });
 }
 
+#pragma mark - session black box (crash audit)
+
+// The crash recorder sees ObjC exceptions and fatal signals. iOS also ends an app in ways no
+// handler sees: the watchdog (a hang at launch or resume), memory pressure (jetsam), or a crash
+// delivered as a Mach exception that never becomes a signal. So the last state is kept on disk:
+// at every foreground / background change and every 30s while active, the app state, a health
+// line and the last events are written to nfb_blackbox.txt. At the next launch that file becomes
+// nfb_blackbox_prev.txt and is judged: a "!!! CRASH" mark = a recorded crash; ended "active" or
+// "inactive" without one = ended from outside while in use; ended "background" = normally
+// reclaimed by iOS. The verdict goes into the events and the diagnostics file.
+static NSString *gNFBAppState = @"launch";
+
+static NSString *nfb_documentsFile(NSString *name) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
+    return [dir stringByAppendingPathComponent:name];
+}
+
+static NSString *nfb_crashHandlerStatus(void) {
+    struct sigaction current;
+    memset(&current, 0, sizeof(current));
+    NSString *sig = @"?";
+    if (sigaction(SIGSEGV, NULL, &current) == 0) {
+        sig = (current.sa_flags & SA_SIGINFO) && current.sa_sigaction == nfb_signalCrashHandler ? @"ours" :
+            ((current.sa_handler == SIG_DFL) ? @"default" : @"other");
+    }
+    NSUncaughtExceptionHandler *exc = NSGetUncaughtExceptionHandler();
+    return [NSString stringWithFormat:@"crashHandlers signal=%@ exception=%@ logger=%d", sig,
+        exc == &nfb_uncaughtExceptionHandler ? @"ours" : (exc ? @"other" : @"none"), gNFBCrashLogPathC[0] ? 1 : 0];
+}
+
+static void nfb_blackboxWrite(NSString *reason) {
+    NSArray<NSString *> *events = gNFBRecentEvents ?: @[];
+    NSArray<NSString *> *tail = events.count > 60 ? [events subarrayWithRange:NSMakeRange(events.count - 60, 60)] : events;
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    double uptime = gNFBLaunchTime > 0.0 ? CACurrentMediaTime() - gNFBLaunchTime : -1.0;
+    NSString *text = [NSString stringWithFormat:@"state=%@ reason=%@ at=%@ uptime=%.0fs build=%s (%s)\n%@\n%@\n%@\n",
+        gNFBAppState, reason, [fmt stringFromDate:NSDate.date], uptime, NFB_VERSION_STRING, NFB_COMMIT_STRING,
+        nfb_healthLine(), nfb_crashHandlerStatus(), [tail componentsJoinedByString:@"\n"]];
+    [text writeToFile:nfb_documentsFile(@"nfb_blackbox.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void nfb_blackboxSetState(NSString *state, NSString *reason) {
+    gNFBAppState = state;
+    nfb_blackboxWrite(reason);
+}
+
+static void nfb_blackboxStart(void) {
+    NSString *path = nfb_documentsFile(@"nfb_blackbox.txt");
+    NSString *prevPath = nfb_documentsFile(@"nfb_blackbox_prev.txt");
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *prev = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if (prev.length) {
+        [fm removeItemAtPath:prevPath error:nil];
+        [fm moveItemAtPath:path toPath:prevPath error:nil];
+        NSString *first = [prev componentsSeparatedByString:@"\n"].firstObject ?: @"";
+        NSString *verdict;
+        if ([prev containsString:@"\n!!! CRASH"]) verdict = @"previous session CRASHED (recorded; see the saved log)";
+        else if ([first hasPrefix:@"state=active"] || [first hasPrefix:@"state=inactive"] || [first hasPrefix:@"state=launch"])
+            verdict = @"previous session ENDED WHILE IN USE without a crash record (iOS watchdog / memory kill, or a crash the handlers cannot see)";
+        else if ([first hasPrefix:@"state=background"]) verdict = @"previous session ended in the background (normally reclaimed by iOS)";
+        else if ([first hasPrefix:@"state=terminated"]) verdict = @"previous session was closed (app switcher / terminate)";
+        else verdict = @"previous session: unknown end";
+        gNFBPrevSessionVerdict = [NSString stringWithFormat:@"%@ | last: %@", verdict, first];
+        gNFBPrevSessionText = prev;
+        NFBLogEvent([@"prevSession " stringByAppendingString:gNFBPrevSessionVerdict]);
+    }
+    const char *c = path.fileSystemRepresentation;
+    if (c) {
+        strncpy(gNFBBlackboxPathC, c, sizeof(gNFBBlackboxPathC) - 1);
+        gNFBBlackboxPathC[sizeof(gNFBBlackboxPathC) - 1] = '\0';
+    }
+    nfb_blackboxWrite(@"start");
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    NSOperationQueue *main = NSOperationQueue.mainQueue;
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:main usingBlock:^(__unused NSNotification *n) {
+        nfb_blackboxSetState(@"active", @"didBecomeActive");
+    }];
+    [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:main usingBlock:^(__unused NSNotification *n) {
+        nfb_blackboxSetState(@"inactive", @"willResignActive");
+    }];
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:main usingBlock:^(__unused NSNotification *n) {
+        nfb_blackboxSetState(@"background", @"didEnterBackground");
+    }];
+    [nc addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:main usingBlock:^(__unused NSNotification *n) {
+        nfb_blackboxSetState(@"inactive", @"willEnterForeground");
+    }];
+    [nc addObserverForName:UIApplicationWillTerminateNotification object:nil queue:main usingBlock:^(__unused NSNotification *n) {
+        nfb_blackboxSetState(@"terminated", @"willTerminate");
+    }];
+    [nc addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:main usingBlock:^(__unused NSNotification *n) {
+        NFBLogEvent([@"memoryWarning " stringByAppendingString:nfb_healthLine()]);
+        nfb_blackboxWrite(@"memoryWarning");
+    }];
+    NSTimer *timer = [NSTimer timerWithTimeInterval:30.0 repeats:YES block:^(__unused NSTimer *t) {
+        if ([gNFBAppState isEqualToString:@"active"]) nfb_blackboxWrite(@"tick");
+    }];
+    timer.tolerance = 5.0;
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+}
+
+__attribute__((constructor)) static void nfb_blackboxAtLaunch(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        nfb_blackboxStart();
+    });
+}
+
 static void nfb_streamStart(UIViewController *vc) {
     BOOL on = nfb_streamEnabled();
     nfb_startHealthLogOnce();
@@ -2164,6 +2474,8 @@ static NSString *nfb_buildDiagnosticReport(void) {
     [s appendFormat:@"%@\n", NFBHeatSummary()];
     [s appendFormat:@"%@\n", nfb_healthLine()];
     [s appendFormat:@"%@\n", nfb_netDiagLine()];
+    [s appendFormat:@"%@\n", nfb_crashHandlerStatus()];
+    [s appendFormat:@"prevSession %@\n", gNFBPrevSessionVerdict ?: @"(none recorded: first launch with the black box)"];
     NSString *diagPage = nfb_currentSelectedTabPage();
     [s appendFormat:@"streaming on=%d interval=%ld page=%@ via=%s tabCtl=%d button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",
         nfb_streamEnabled() ? 1 : 0, (long)nfb_streamInterval(), diagPage ?: @"(nil)", gNFBTabPageVia, gNFBTabBarController ? 1 : 0,
@@ -2293,6 +2605,17 @@ static NSString *nfb_buildDiagnosticReport(void) {
     gActiveItemsVC = self;
     nfb_noteActiveTimelineScroll(scrollView);
     nfb_visibilityForScroll(scrollView);
+}
+
+%end
+
+// X's answer time for every timeline request (network badge).
+%hook TNLResponse
+
+- (instancetype)initInternalWithRequest:(id)request operationError:(NSError *)error info:(id)info metrics:(id)metrics {
+    id response = %orig;
+    nfb_noteTimelineResponse(info, metrics, error);
+    return response;
 }
 
 %end
