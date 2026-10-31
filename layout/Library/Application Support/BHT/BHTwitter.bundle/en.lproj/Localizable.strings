@@ -519,6 +519,9 @@
 "NFB_COLUMNS_MANAGE" = "📐 Manage columns (reorder / show)…";
 "NFB_COLUMNS_MANAGE_TITLE" = "Manage columns";
 "NFB_COLUMNS_MANAGE_EMPTY" = "Open the Columns tab once to list its timelines here.";
+"NFB_COLUMNS_KIND_TAB" = "App tab";
+"NFB_COLUMNS_TAB_STOPPED" = "App tab - stopped: the app quit right after this column opened last time (turn on to retry)";
+"NFB_COLUMNS_MANAGE_TABS_NOTE" = "App tabs (Notifications, Search, ...) become columns when turned on. Each opens a second copy of that screen, so every one you turn on uses memory. App-tab columns are not auto-refreshed.";
 "NFB_COLUMNS_AUTO_DISABLED" = "The Columns tab was turned off because the app quit unexpectedly twice while it was open.";
 "NFB_RESET" = "Reset";
 "NFB_DIAG_SHARE" = "📤 Save diagnostics to iCloud Drive";

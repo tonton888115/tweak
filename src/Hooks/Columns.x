@@ -14,10 +14,13 @@
 //  Home itself always stays the normal Home, and any other tab turns columns off again.
 //  While columns are shown, the Home segment strip and the Spaces bar are hidden (restored on leave).
 //
+//  App-tab columns: X's own tabs (Notifications, Search, Bookmarks, …) can be added as columns too.
+//  Each is a second instance of that tab hosted in the Home collection view (see "app-tab columns").
+//
 //  Prefs: nfb_columns_enabled (the Columns tab), nfb_columns_host (page ID of the replaced tab),
 //  nfb_columns_full_width (iPad: drop the right trends pane via T1AppSplitViewController's own
-//  split-mode inputs), nfb_columns_order (titles), nfb_columns_visibility (title -> BOOL; For You
-//  defaults to hidden).
+//  split-mode inputs), nfb_columns_order (timeline titles and "tab:<page>" keys),
+//  nfb_columns_visibility (key -> BOOL; For You and every app tab default to hidden).
 //
 
 #import "HookHelpers.h"
@@ -43,6 +46,8 @@ static NSString * const kNFBColsEnabledKey = @"nfb_columns_enabled";
 static NSString * const kNFBColsFullWidthKey = @"nfb_columns_full_width";
 static NSString * const kNFBColsOrderKey = @"nfb_columns_order";
 static NSString * const kNFBColsVisibilityKey = @"nfb_columns_visibility";
+static NSString * const kNFBColsTabInFlightKey = @"nfb_columns_tab_inflight";   // app-tab columns being opened
+static NSString * const kNFBColsTabFailedKey = @"nfb_columns_tab_failed";       // ... that the app died opening
 
 static BOOL gNFBColsEnabled = NO;          // Columns tab feature (pref), cached
 static BOOL gNFBColsEnabledLoaded = NO;
@@ -58,8 +63,13 @@ static char kNFBColsSavedPagingKey;        // NSNumber(pagingEnabled) on the col
 static char kNFBColsSavedScrollKey;        // NSNumber(scrollEnabled): iPad may disable swipe paging
 static char kNFBColsDesiredOffsetKey;      // NSNumber(x) on the collection view
 static char kNFBColsKickedKey;             // one empty-content load kick per page
+static BOOL gNFBColsRawTabTitle = NO;      // read a T1TabView's own title (no "Columns" relabel)
 
 static void nfb_colsScheduleKick(void);
+static NSArray<NSDictionary *> *nfb_colsTabCandidates(void);
+static NSSet<NSString *> *nfb_colsTabFailed(void);
+static BOOL nfb_colsTabSkippedNow(NSString *identity);
+static void nfb_colsScheduleTabLayout(void);
 static UICollectionView *nfb_colsCollectionViewOfPager(UIViewController *pager);
 
 static NSString *nfb_colsLoc(NSString *key, NSString *fallback) {
@@ -111,10 +121,14 @@ static BOOL nfb_colsTitleLooksRecommended(NSString *text) {
 @property (nonatomic) NSInteger itemCount;
 @property (nonatomic, copy) NSArray<NSString *> *titles;        // per item index
 @property (nonatomic, copy) NSArray<NSNumber *> *slots;         // visible item indices in display order
-@property (nonatomic, copy) NSDictionary<NSNumber *, NSNumber *> *slotOfItem;
+@property (nonatomic, copy) NSDictionary<NSNumber *, NSNumber *> *slotOfItem;   // item -> column number
+@property (nonatomic, copy) NSArray<NSDictionary *> *tabColumns;  // visible app tabs: id, page, title, entry, slot
+@property (nonatomic) NSInteger columnCount;                     // timeline + app-tab columns
 @end
 @implementation NFBColumnsModel
 @end
+
+static NSString *nfb_colsTabDiag(NFBColumnsModel *model);
 
 static UIViewController *nfb_colsViewControllerOfView(UIView *view) {
     for (UIView *v = view; v; v = v.superview) {
@@ -213,23 +227,55 @@ static NFBColumnsModel *nfb_colsBuildModel(UIViewController *pager, NSInteger co
     model.titles = nfb_colsTitlesForPager(pager, count);
     NSArray *savedOrder = [[NSUserDefaults standardUserDefaults] arrayForKey:kNFBColsOrderKey] ?: @[];
     NSDictionary *visibility = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kNFBColsVisibilityKey] ?: @{};
-    NSMutableArray<NSNumber *> *ordered = [NSMutableArray array];
-    for (NSString *title in savedOrder) {
-        NSUInteger idx = [model.titles indexOfObject:title];
-        if (idx != NSNotFound && ![ordered containsObject:@(idx)]) [ordered addObject:@(idx)];
+    NSArray<NSDictionary *> *candidates = nfb_colsTabCandidates();
+    NSMutableDictionary<NSString *, NSDictionary *> *tabs = [NSMutableDictionary dictionary];
+    for (NSDictionary *tab in candidates) tabs[tab[@"id"]] = tab;
+    // Display order of every column key: timelines by title, app tabs by "tab:<page>".
+    NSMutableArray<NSString *> *keys = [NSMutableArray array];
+    for (id key in savedOrder) {
+        if (![key isKindOfClass:NSString.class] || [keys containsObject:key]) continue;
+        if ([model.titles containsObject:key] || tabs[key]) [keys addObject:key];
     }
-    for (NSInteger i = 0; i < count; i++) {
-        if (![ordered containsObject:@(i)]) [ordered addObject:@(i)];
+    for (NSString *title in model.titles) if (![keys containsObject:title]) [keys addObject:title];
+    for (NSDictionary *tab in candidates) if (![keys containsObject:tab[@"id"]]) [keys addObject:tab[@"id"]];
+    NSSet<NSString *> *failed = nfb_colsTabFailed();
+    NSMutableArray<NSNumber *> *ordered = [NSMutableArray array];   // every timeline, display order
+    NSMutableArray *columns = [NSMutableArray array];               // NSNumber item / NSDictionary tab
+    BOOL anyTimeline = NO;
+    for (NSString *key in keys) {
+        NSUInteger item = [model.titles indexOfObject:key];
+        if (item != NSNotFound) {
+            [ordered addObject:@(item)];
+            if (nfb_colsTitleVisible(key, visibility)) {
+                [columns addObject:@(item)];
+                anyTimeline = YES;
+            }
+        } else if (tabs[key] && [visibility[key] boolValue] && ![failed containsObject:key] && !nfb_colsTabSkippedNow(key)) {
+            [columns addObject:tabs[key]];
+        }
+    }
+    if (!anyTimeline) {   // never hide every timeline
+        NSArray *tabColumns = [columns copy];
+        [columns setArray:ordered];
+        [columns addObjectsFromArray:tabColumns];
     }
     NSMutableArray<NSNumber *> *slots = [NSMutableArray array];
-    for (NSNumber *item in ordered) {
-        if (nfb_colsTitleVisible(model.titles[item.unsignedIntegerValue], visibility)) [slots addObject:item];
-    }
-    if (!slots.count) [slots addObjectsFromArray:ordered];   // never hide everything
+    NSMutableArray<NSDictionary *> *tabColumns = [NSMutableArray array];
     NSMutableDictionary *slotOfItem = [NSMutableDictionary dictionary];
-    [slots enumerateObjectsUsingBlock:^(NSNumber *item, NSUInteger idx, BOOL *stop) { slotOfItem[item] = @(idx); }];
+    [columns enumerateObjectsUsingBlock:^(id column, NSUInteger idx, BOOL *stop) {
+        if ([column isKindOfClass:NSNumber.class]) {
+            [slots addObject:column];
+            slotOfItem[column] = @(idx);
+        } else {
+            NSMutableDictionary *tab = [column mutableCopy];
+            tab[@"slot"] = @(idx);
+            [tabColumns addObject:tab];
+        }
+    }];
     model.slots = slots;
     model.slotOfItem = slotOfItem;
+    model.tabColumns = tabColumns;
+    model.columnCount = (NSInteger)columns.count;
     return model;
 }
 
@@ -493,6 +539,7 @@ NSString *NFBColumnsDiagnostic(void) {
             objc_getAssociatedObject(cv, &kNFBColsDesiredOffsetKey) ?: @"-", (long)model.itemCount,
             [model.slots componentsJoinedByString:@","] ?: @"-"];
         [s appendFormat:@"columns titles=%@\n", [model.titles componentsJoinedByString:@" | "] ?: @"-"];
+        [s appendString:nfb_colsTabDiag(model)];
         for (NSDictionary *entry in NFBColumnsVisibleEntries()) {
             UIViewController *page = entry[@"vc"];
             [s appendFormat:@"columns visible slot=%@ item=%@ title=%@ rec=%@ page=%@ loaded=%d\n", entry[@"slot"], entry[@"item"],
@@ -915,6 +962,362 @@ static void nfb_colsEnsureHostVisible(UIViewController *nav) {
     NFBLogEvent([NSString stringWithFormat:@"columns host %@ added to the tab bar", host]);
 }
 
+#pragma mark - app-tab columns (X's own tabs next to the timelines)
+
+// Notifications, Search, Bookmarks, Lists, … as columns (the 11.35 fork's app-tab columns). Each
+// column is a second instance of the tab, built the way X 12.38.1 opens one
+// (-[T1TabbedAppNavigationViewController tabbedViewController:viewControllerAtIndex:]: the entry's
+// contentControllerFactory -> createContentController = a new tab navigation controller,
+// rootTabViewController = a new root page), never the live tab. It is hosted view-only in the Home
+// collection view at its column's x (11.35 b39: adopting tab controllers as children crashed while
+// they loaded) and gets its appearance calls by hand, without which it never loads. Every app tab
+// is off until turned on in Manage columns; its order / on-off live with the timelines' ("tab:<page>").
+
+static NSArray *gNFBColsTabEntries = nil;   // every tab entry X built (Theme.x's setVisibleTabEntries: hook)
+static NSArray<NSDictionary *> *gNFBColsTabCandidatesCache = nil;
+static NSArray *gNFBColsTabCandidatesFor = nil;
+static NSMutableDictionary<NSString *, UINavigationController *> *gNFBColsTabNavs = nil;   // id -> our instance
+static NSMutableSet<NSString *> *gNFBColsTabShown = nil;     // ids whose view is in the columns now
+static NSMutableSet<NSString *> *gNFBColsTabSkipped = nil;   // could not be built this session
+static NSString *gNFBColsTabFailedAtLaunch = nil;
+static NSUInteger gNFBColsTabInvalidatedGen = 0;
+static BOOL gNFBColsTabLayoutPending = NO;
+static __weak UIViewController *gNFBColsTabBarController = nil;
+static char kNFBColsTabEntryKey;             // the entry an instance was built from
+static char kNFBColsTabPagerLockedKey;       // NSNumber(original scrollEnabled) on a locked inner pager
+static char kNFBColsTabLockCheckKey;         // NSNumber(time) of the last inner-pager walk
+
+void NFBColumnsNoteTabEntries(NSArray *entries) {
+    if (![entries isKindOfClass:NSArray.class]) return;
+    BOOL same = gNFBColsTabEntries.count == entries.count;
+    for (NSUInteger i = 0; same && i < entries.count; i++) same = gNFBColsTabEntries[i] == entries[i];
+    if (same) return;
+    gNFBColsTabEntries = [entries copy];
+    gNFBColsGen++;
+    nfb_colsScheduleTabLayout();
+}
+
+static id nfb_colsTabFactory(id entry) {
+    id factory = [entry respondsToSelector:@selector(contentControllerFactory)] ?
+        ((id(*)(id, SEL))objc_msgSend)(entry, @selector(contentControllerFactory)) : nil;
+    for (id candidate in @[ factory ?: entry, entry ]) {
+        if ([candidate respondsToSelector:@selector(createContentController)] &&
+            [candidate respondsToSelector:@selector(rootTabViewController)]) return candidate;
+    }
+    return nil;
+}
+
+// Every tab X can build except Home (its timelines are the columns already) and the More drawer.
+static NSArray<NSDictionary *> *nfb_colsTabCandidates(void) {
+    NSArray *entries = gNFBColsTabEntries;
+    if (!entries) {
+        UIViewController *tabbed = nfb_colsFindControllerOfClass(@"T1TabbedAppNavigationViewController");
+        id visible = [tabbed respondsToSelector:@selector(visibleTabEntries)] ?
+            ((id(*)(id, SEL))objc_msgSend)(tabbed, @selector(visibleTabEntries)) : nil;
+        entries = [visible isKindOfClass:NSArray.class] ? visible : @[];
+    }
+    if (gNFBColsTabCandidatesCache && gNFBColsTabCandidatesFor == entries) return gNFBColsTabCandidatesCache;
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    NSMutableSet<NSString *> *pages = [NSMutableSet set];
+    for (id entry in entries) {
+        T1TabView *tabView = [entry respondsToSelector:@selector(tabView)] ? ((id(*)(id, SEL))objc_msgSend)(entry, @selector(tabView)) : nil;
+        NSString *page = [tabView respondsToSelector:@selector(scribePage)] ? tabView.scribePage : nil;
+        if (!page.length || [page isEqualToString:CustomTabBarHomePageID] || [pages containsObject:page]) continue;
+        if ([NSStringFromClass([entry class]) containsString:@"HomeTimeline"] || !nfb_colsTabFactory(entry)) continue;
+        long long panelID = [entry respondsToSelector:@selector(panelID)] ?
+            ((long long(*)(id, SEL))objc_msgSend)(entry, @selector(panelID)) : -1;
+        if (panelID >= 0 && !panelIsGenuinelyAvailable(panelID)) continue;
+        gNFBColsRawTabTitle = YES;
+        NSString *title = [tabView respondsToSelector:@selector(title)] ? tabView.title : nil;
+        gNFBColsRawTabTitle = NO;
+        [pages addObject:page];
+        [out addObject:@{ @"id": [@"tab:" stringByAppendingString:page], @"page": page,
+                          @"title": title.length ? title : page, @"entry": entry }];
+    }
+    gNFBColsTabCandidatesCache = [out copy];
+    gNFBColsTabCandidatesFor = entries;
+    return gNFBColsTabCandidatesCache;
+}
+
+static NSSet<NSString *> *nfb_colsTabFailed(void) {
+    NSArray *list = [NSUserDefaults.standardUserDefaults arrayForKey:kNFBColsTabFailedKey];
+    return list.count ? [NSSet setWithArray:list] : [NSSet set];
+}
+
+static BOOL nfb_colsTabSkippedNow(NSString *identity) {
+    return [gNFBColsTabSkipped containsObject:identity];
+}
+
+static void nfb_colsTabClearFailed(NSString *identity) {
+    [gNFBColsTabSkipped removeObject:identity];
+    NSMutableArray *list = [[NSUserDefaults.standardUserDefaults arrayForKey:kNFBColsTabFailedKey] ?: @[] mutableCopy];
+    if (![list containsObject:identity]) return;
+    [list removeObject:identity];
+    [NSUserDefaults.standardUserDefaults setObject:list forKey:kNFBColsTabFailedKey];
+}
+
+// Columns being opened: if the app dies before one has been on screen for a few seconds, it is
+// stopped at the next launch (nfb_colsLaunchGuard). Written through at once, the app may die next.
+static void nfb_colsTabMarkInFlight(NSString *identity, BOOL inFlight) {
+    NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
+    NSMutableArray *list = [[defs arrayForKey:kNFBColsTabInFlightKey] ?: @[] mutableCopy];
+    if (inFlight == [list containsObject:identity]) return;
+    if (inFlight) [list addObject:identity];
+    else [list removeObject:identity];
+    if (list.count) [defs setObject:list forKey:kNFBColsTabInFlightKey];
+    else [defs removeObjectForKey:kNFBColsTabInFlightKey];
+    [defs synchronize];
+}
+
+// iPad: a column is phone-width, so lay the tab out like on a phone (Compact width, iOS 17+).
+static void nfb_colsTabCompactWidth(UIViewController *nav) {
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) return;
+    SEL getter = NSSelectorFromString(@"traitOverrides");
+    id overrides = [nav respondsToSelector:getter] ? ((id(*)(id, SEL))objc_msgSend)(nav, getter) : nil;
+    SEL setter = NSSelectorFromString(@"setHorizontalSizeClass:");
+    if ([overrides respondsToSelector:setter]) {
+        ((void(*)(id, SEL, NSInteger))objc_msgSend)(overrides, setter, UIUserInterfaceSizeClassCompact);
+    }
+}
+
+static void nfb_colsTabHide(NSString *identity, UINavigationController *nav);
+
+static UINavigationController *nfb_colsTabNav(NSDictionary *column) {
+    NSString *identity = column[@"id"];
+    id entry = column[@"entry"];
+    UINavigationController *nav = gNFBColsTabNavs[identity];
+    if (nav && objc_getAssociatedObject(nav, &kNFBColsTabEntryKey) == entry) return nav;
+    if (nav) {   // X rebuilt its tabs (e.g. account switch): start over from the new entry
+        nfb_colsTabHide(identity, nav);
+        [gNFBColsTabNavs removeObjectForKey:identity];
+    }
+    if ([gNFBColsTabSkipped containsObject:identity]) return nil;
+    id factory = nfb_colsTabFactory(entry);
+    if (!factory) return nil;
+    nfb_colsTabMarkInFlight(identity, YES);
+    CFTimeInterval t0 = CACurrentMediaTime();
+    id created = nil;
+    id root = nil;
+    NSString *problem = nil;
+    @try {
+        created = ((id(*)(id, SEL))objc_msgSend)(factory, @selector(createContentController));
+        root = ((id(*)(id, SEL))objc_msgSend)(factory, @selector(rootTabViewController));
+    } @catch (NSException *e) {
+        problem = [NSString stringWithFormat:@"threw %@", e.name];
+    }
+    if (!problem && (![created isKindOfClass:UINavigationController.class] || ![root isKindOfClass:UIViewController.class])) {
+        problem = [NSString stringWithFormat:@"got nav=%@ root=%@", created ? NSStringFromClass([created class]) : @"nil",
+            root ? NSStringFromClass([root class]) : @"nil"];
+    }
+    // Never a screen someone else shows: one that already has a parent or presenter is not ours.
+    if (!problem && ([(UIViewController *)created parentViewController] || [(UIViewController *)root parentViewController] ||
+                     [(UIViewController *)created presentingViewController])) {
+        problem = @"already in use";
+    }
+    if (problem) {
+        nfb_colsTabMarkInFlight(identity, NO);
+        if (!gNFBColsTabSkipped) gNFBColsTabSkipped = [NSMutableSet set];
+        [gNFBColsTabSkipped addObject:identity];
+        NFBLogEvent([NSString stringWithFormat:@"columns tabCol %@ not created: %@", identity, problem]);
+        gNFBColsGen++;   // no empty slot for it
+        [gNFBColsCollectionView.collectionViewLayout invalidateLayout];
+        return nil;
+    }
+    nav = created;
+    nav.viewControllers = @[ root ];
+    // The rest of what X does when it opens a tab: the avatar (side menu) button and nav items.
+    UIViewController *tabbed = nfb_colsFindControllerOfClass(@"T1TabbedAppNavigationViewController");
+    id live = [tabbed respondsToSelector:@selector(currentTabNavigationController)] ?
+        ((id(*)(id, SEL))objc_msgSend)(tabbed, @selector(currentTabNavigationController)) : nil;
+    id dash = [live respondsToSelector:@selector(dashPresenter)] ? ((id(*)(id, SEL))objc_msgSend)(live, @selector(dashPresenter)) : nil;
+    if (dash && [nav respondsToSelector:@selector(setDashPresenter:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(nav, @selector(setDashPresenter:), dash);
+    }
+    if ([tabbed respondsToSelector:@selector(_t1_updateDashBarButtonItemForTabNavigationController:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(tabbed, @selector(_t1_updateDashBarButtonItemForTabNavigationController:), nav);
+    }
+    if ([nav respondsToSelector:@selector(updateNavigationItemForViewController:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(nav, @selector(updateNavigationItemForViewController:), root);
+    }
+    nfb_colsTabCompactWidth(nav);
+    objc_setAssociatedObject(nav, &kNFBColsTabEntryKey, entry, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!gNFBColsTabNavs) gNFBColsTabNavs = [NSMutableDictionary dictionary];
+    gNFBColsTabNavs[identity] = nav;
+    NFBLogEvent([NSString stringWithFormat:@"columns tabCol created id=%@ nav=%@ root=%@ %.0fms", identity,
+        NSStringFromClass(nav.class), NSStringFromClass([root class]), (CACurrentMediaTime() - t0) * 1000.0]);
+    return nav;
+}
+
+// Inside a column a horizontal swipe moves the columns: the tab's own horizontal pagers (the
+// Notifications / Explore top tabs) stop scrolling sideways while hosted; their tab strip still
+// switches pages. Vertical lists are not walked into.
+static void nfb_colsLockTabPagers(UIViewController *nav, BOOL lock) {
+    if (![nav isViewLoaded]) return;
+    if (lock) {
+        NSNumber *last = objc_getAssociatedObject(nav, &kNFBColsTabLockCheckKey);
+        CFTimeInterval now = CACurrentMediaTime();
+        if (last && now - last.doubleValue < 1.0) return;
+        objc_setAssociatedObject(nav, &kNFBColsTabLockCheckKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:nav.view];
+    NSUInteger hops = 0, locked = 0;
+    while (queue.count && hops++ < 300) {
+        UIView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        if ([v isKindOfClass:UIScrollView.class]) {
+            UIScrollView *sv = (UIScrollView *)v;
+            if (!sv.pagingEnabled && ![NSStringFromClass(sv.class) containsString:@"PagingCollectionView"]) continue;
+            NSNumber *saved = objc_getAssociatedObject(sv, &kNFBColsTabPagerLockedKey);
+            if (lock && sv.contentSize.width > sv.bounds.size.width + 1.0) {
+                if (!saved) objc_setAssociatedObject(sv, &kNFBColsTabPagerLockedKey, @(sv.scrollEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                if (sv.scrollEnabled) {
+                    sv.scrollEnabled = NO;
+                    locked++;
+                }
+            } else if (!lock && saved) {
+                sv.scrollEnabled = saved.boolValue;
+                objc_setAssociatedObject(sv, &kNFBColsTabPagerLockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        }
+        [queue addObjectsFromArray:v.subviews];
+    }
+    if (locked) NFBLogEvent([NSString stringWithFormat:@"columns tabCol lockedPagers=%lu nav=%@", (unsigned long)locked, NSStringFromClass(nav.class)]);
+}
+
+static void nfb_colsTabHide(NSString *identity, UINavigationController *nav) {
+    if (![gNFBColsTabShown containsObject:identity]) return;
+    [gNFBColsTabShown removeObject:identity];
+    [nav beginAppearanceTransition:NO animated:NO];
+    [nav.viewIfLoaded removeFromSuperview];
+    [nav endAppearanceTransition];
+    nfb_colsLockTabPagers(nav, NO);
+    NFBLogEvent([NSString stringWithFormat:@"columns tabCol removed id=%@", identity]);
+}
+
+// A tab column spans from under Home's navigation bar to above the bottom tab bar (the iPad sidebar
+// is beside the content, not below it); returned in collection view coordinates.
+static void nfb_colsTabBand(UICollectionView *cv, CGFloat *y, CGFloat *height) {
+    CGRect cvRect = [cv convertRect:cv.bounds toView:nil];
+    CGFloat top = CGRectGetMinY(cvRect), bottom = CGRectGetMaxY(cvRect);
+    UINavigationBar *bar = nfb_colsSegmentedOfPager(gNFBColsPager).navigationController.navigationBar;
+    if (bar.window && !bar.hidden && bar.alpha > 0.01) top = MAX(top, CGRectGetMaxY([bar convertRect:bar.bounds toView:nil]));
+    UIViewController *tabBarController = gNFBColsTabBarController;
+    if (!tabBarController.viewIfLoaded.window) {
+        tabBarController = nfb_colsFindControllerOfClass(@"T1TabBarViewController");
+        gNFBColsTabBarController = tabBarController;
+    }
+    for (UIView *tabView in nfb_colsTabViews(tabBarController)) {
+        if (![tabView isKindOfClass:UIView.class] || !tabView.window || tabView.hidden) continue;
+        // The bar holding the tab buttons: the first ancestor at least half as wide as the columns.
+        UIView *barView = tabView;
+        while (barView.superview && barView.bounds.size.width < cvRect.size.width * 0.5) barView = barView.superview;
+        CGRect barRect = [barView convertRect:barView.bounds toView:nil];
+        if (barRect.size.height < 160.0 && CGRectGetMinY(barRect) > top + 200.0) bottom = MIN(bottom, CGRectGetMinY(barRect));
+        break;
+    }
+    *y = [cv convertPoint:CGPointMake(0.0, top) fromView:nil].y;
+    *height = MAX(200.0, bottom - top);
+}
+
+static void nfb_colsLayoutTabColumns(void) {
+    UICollectionView *cv = gNFBColsCollectionView;
+    BOOL on = nfb_colsActiveNow() && cv.window != nil;
+    NFBColumnsModel *model = on ? nfb_colsModelForLayout(cv.collectionViewLayout) : nil;
+    NSMutableSet<NSString *> *placed = [NSMutableSet set];
+    if (model.tabColumns.count) {
+        CGFloat cw = nfb_colsColumnWidth(cv.bounds.size.width);
+        // The model changed outside a pref change (X rebuilt its tabs): the content size follows.
+        if (model.gen != gNFBColsTabInvalidatedGen && fabs(cv.contentSize.width - MAX(cw * model.columnCount, cv.bounds.size.width)) > 1.0) {
+            gNFBColsTabInvalidatedGen = model.gen;
+            [cv.collectionViewLayout invalidateLayout];
+        }
+        CGFloat y = 0.0, height = 0.0;
+        nfb_colsTabBand(cv, &y, &height);
+        for (NSDictionary *column in model.tabColumns) {
+            NSString *identity = column[@"id"];
+            UINavigationController *nav = nfb_colsTabNav(column);
+            if (!nav) continue;
+            [placed addObject:identity];
+            UIView *view = nav.view;
+            CGRect frame = CGRectMake(cw * [column[@"slot"] doubleValue], y, cw, height);
+            if (view.superview != cv) {
+                view.clipsToBounds = YES;
+                [cv addSubview:view];
+            }
+            if (!CGRectEqualToRect(view.frame, frame)) view.frame = frame;
+            if (![gNFBColsTabShown containsObject:identity]) {
+                if (!gNFBColsTabShown) gNFBColsTabShown = [NSMutableSet set];
+                [gNFBColsTabShown addObject:identity];
+                [nav beginAppearanceTransition:YES animated:NO];
+                [nav endAppearanceTransition];
+                NFBLogEvent([NSString stringWithFormat:@"columns tabCol shown id=%@ slot=%@ f=(%.0f,%.0f,%.0f,%.0f)", identity,
+                    column[@"slot"], frame.origin.x, frame.origin.y, frame.size.width, frame.size.height]);
+                // Once it has loaded a little: lock the pagers it built meanwhile; after 4s it is no
+                // longer a suspect for a crash.
+                for (NSNumber *delay in @[ @1.5, @4.0 ]) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        if (delay.doubleValue > 3.0) nfb_colsTabMarkInFlight(identity, NO);
+                        nfb_colsScheduleTabLayout();
+                    });
+                }
+            }
+            nfb_colsLockTabPagers(nav, YES);
+        }
+    }
+    for (NSString *identity in gNFBColsTabShown.allObjects) {
+        if (![placed containsObject:identity]) nfb_colsTabHide(identity, gNFBColsTabNavs[identity]);
+    }
+    // Tabs that are no longer columns let go of their screen; the rest stay for the next visit.
+    if (gNFBColsTabNavs.count && (on || !nfb_colsEnabled())) {
+        NSMutableSet<NSString *> *keep = [NSMutableSet set];
+        for (NSDictionary *column in model.tabColumns) [keep addObject:column[@"id"]];
+        for (NSString *identity in gNFBColsTabNavs.allKeys) {
+            if (![keep containsObject:identity]) [gNFBColsTabNavs removeObjectForKey:identity];
+        }
+    }
+}
+
+static void nfb_colsScheduleTabLayout(void) {
+    if (gNFBColsTabLayoutPending) return;
+    gNFBColsTabLayoutPending = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gNFBColsTabLayoutPending = NO;
+        nfb_colsLayoutTabColumns();
+    });
+}
+
+static NSString *nfb_colsTabDiag(NFBColumnsModel *model) {
+    NSMutableString *s = [NSMutableString string];
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    for (NSDictionary *tab in nfb_colsTabCandidates()) [candidates addObject:[NSString stringWithFormat:@"%@=%@", tab[@"page"], tab[@"title"]]];
+    [s appendFormat:@"columns tabs entries=%lu candidates=%@ cols=%ld shown=%@ cached=%@ failed=%@ inflight=%@ skipped=%@ stoppedAtLaunch=%@\n",
+        (unsigned long)gNFBColsTabEntries.count, [candidates componentsJoinedByString:@","] ?: @"-", (long)model.columnCount,
+        [gNFBColsTabShown.allObjects componentsJoinedByString:@","] ?: @"-", [gNFBColsTabNavs.allKeys componentsJoinedByString:@","] ?: @"-",
+        [nfb_colsTabFailed().allObjects componentsJoinedByString:@","] ?: @"-",
+        [[NSUserDefaults.standardUserDefaults arrayForKey:kNFBColsTabInFlightKey] componentsJoinedByString:@","] ?: @"-",
+        [gNFBColsTabSkipped.allObjects componentsJoinedByString:@","] ?: @"-", gNFBColsTabFailedAtLaunch ?: @"-"];
+    for (NSDictionary *column in model.tabColumns) {
+        UINavigationController *nav = gNFBColsTabNavs[column[@"id"]];
+        UIView *view = nav.viewIfLoaded;
+        UIScrollView *list = nil;   // the first vertical list: did the tab load anything?
+        NSMutableArray<UIView *> *queue = view ? [NSMutableArray arrayWithObject:view] : [NSMutableArray array];
+        NSUInteger hops = 0;
+        while (queue.count && hops++ < 300 && !list) {
+            UIView *v = queue.firstObject;
+            [queue removeObjectAtIndex:0];
+            if ([v isKindOfClass:UIScrollView.class] && !((UIScrollView *)v).pagingEnabled && v.bounds.size.height > 150.0) list = (UIScrollView *)v;
+            [queue addObjectsFromArray:v.subviews];
+        }
+        CGRect f = view.frame;
+        [s appendFormat:@"columns tabCol id=%@ slot=%@ nav=%@ top=%@ stack=%lu super=%@ f=(%.0f,%.0f,%.0f,%.0f) window=%d list=%@ content=%.0f\n",
+            column[@"id"], column[@"slot"], nav ? NSStringFromClass(nav.class) : @"nil",
+            nav.topViewController ? NSStringFromClass(nav.topViewController.class) : @"-", (unsigned long)nav.viewControllers.count,
+            view.superview ? NSStringFromClass(view.superview.class) : @"nil", f.origin.x, f.origin.y, f.size.width, f.size.height,
+            view.window ? 1 : 0, list ? NSStringFromClass(list.class) : @"-", list ? list.contentSize.height : -1.0];
+    }
+    return s;
+}
+
 static void nfb_colsSetActiveOnNav(BOOL active, UIViewController *nav, UIViewController *tabBarController) {
     if (active && !nfb_colsEnabled()) return;
     if (!nav) nav = nfb_colsFindControllerOfClass(@"T1TabbedAppNavigationViewController");
@@ -939,6 +1342,7 @@ static void nfb_colsSetActiveOnNav(BOOL active, UIViewController *nav, UIViewCon
         nfb_colsFitColumnTables(NO);
     }
     gNFBColsActive = active;
+    if (!active && changed) nfb_colsLayoutTabColumns();   // the app-tab columns leave with the Columns tab
     [NSUserDefaults.standardUserDefaults setBool:active forKey:@"nfb_columns_session"];
     nfb_colsApplyToHome();
     if (active) {
@@ -948,6 +1352,7 @@ static void nfb_colsSetActiveOnNav(BOOL active, UIViewController *nav, UIViewCon
             nfb_colsApplyToHome();
             nfb_colsSyncPageAppearance(YES);
             nfb_colsFitColumnTables(YES);
+            nfb_colsScheduleTabLayout();
         });
         nfb_colsScheduleKick();
     } else if ([nav respondsToSelector:@selector(_t1_syncTabBarSelectionWithSelectedController)]) {
@@ -971,6 +1376,7 @@ void NFBColumnsPrefsChanged(void) {
     nfb_colsRefreshTabViews(nav, tabBarController);
     NFBNoteTabSelectionChanged();
     NFBStreamPrefsChanged();
+    nfb_colsScheduleTabLayout();
 }
 
 // Empty columns: pages that were never "current" may not have fetched yet. Nudge each once.
@@ -1044,12 +1450,32 @@ static void nfb_colsLaunchGuard(void) {
     } else {
         [defs setInteger:0 forKey:@"nfb_columns_unclean"];
     }
+    // An app-tab column that was being opened when the app died stays off until turned on again.
+    NSArray *inFlight = [defs arrayForKey:kNFBColsTabInFlightKey];
+    if (inFlight.count) {
+        NSMutableArray *failed = [[defs arrayForKey:kNFBColsTabFailedKey] ?: @[] mutableCopy];
+        for (id identity in inFlight) if (![failed containsObject:identity]) [failed addObject:identity];
+        [defs setObject:failed forKey:kNFBColsTabFailedKey];
+        [defs removeObjectForKey:kNFBColsTabInFlightKey];
+        gNFBColsTabFailedAtLaunch = [inFlight componentsJoinedByString:@","];
+    }
     gNFBColsEnabled = [BHTSettings boolForKey:kNFBColsEnabledKey];
     gNFBColsEnabledLoaded = YES;
     [defs setBool:NO forKey:@"nfb_columns_session"];   // columns start inactive (Home is Home)
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil
         queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n) {
             [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"nfb_columns_session"];
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:kNFBColsTabInFlightKey];   // they opened fine
+        }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n) {
+            NSUInteger released = 0;
+            for (NSString *identity in gNFBColsTabNavs.allKeys) {
+                if ([gNFBColsTabShown containsObject:identity]) continue;
+                [gNFBColsTabNavs removeObjectForKey:identity];
+                released++;
+            }
+            if (released) NFBLogEvent([NSString stringWithFormat:@"columns tabCol memoryWarning released=%lu", (unsigned long)released]);
         }];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification object:nil
         queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n) {
@@ -1060,6 +1486,9 @@ static void nfb_colsLaunchGuard(void) {
 static void nfb_colsHomeAppearedOnce(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        if (gNFBColsTabFailedAtLaunch) {
+            NFBLogEvent([NSString stringWithFormat:@"columns tabCol stopped after the app quit while opening: %@", gNFBColsTabFailedAtLaunch]);
+        }
         if (gNFBColsPendingAutoDisableAlert) {
             gNFBColsPendingAutoDisableAlert = NO;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1072,7 +1501,8 @@ static void nfb_colsHomeAppearedOnce(void) {
 #pragma mark - management screen
 
 @interface NFBColumnsManagerViewController : UITableViewController
-@property (nonatomic, strong) NSMutableArray<NSString *> *titles;   // display order, all columns
+@property (nonatomic, strong) NSMutableArray<NSString *> *titles;   // display order, all columns (keys)
+@property (nonatomic, copy) NSDictionary<NSString *, NSString *> *tabTitles;   // app-tab key -> its name
 @end
 
 @implementation NFBColumnsManagerViewController
@@ -1096,11 +1526,19 @@ static void nfb_colsHomeAppearedOnce(void) {
     UIViewController *pager = gNFBColsPager;
     NSInteger count = (cv && cv.numberOfSections > 0) ? [cv numberOfItemsInSection:0] : 0;
     NSArray<NSString *> *native = pager ? nfb_colsTitlesForPager(pager, count) : @[];
+    NSArray<NSDictionary *> *tabs = nfb_colsTabCandidates();
+    NSMutableDictionary<NSString *, NSString *> *tabTitles = [NSMutableDictionary dictionary];
+    for (NSDictionary *tab in tabs) tabTitles[tab[@"id"]] = tab[@"title"];
     NSArray *savedOrder = [[NSUserDefaults standardUserDefaults] arrayForKey:kNFBColsOrderKey] ?: @[];
     NSMutableArray<NSString *> *titles = [NSMutableArray array];
-    for (NSString *t in savedOrder) if ([native containsObject:t] && ![titles containsObject:t]) [titles addObject:t];
+    for (NSString *t in savedOrder) {
+        if (![t isKindOfClass:NSString.class] || [titles containsObject:t]) continue;
+        if ([native containsObject:t] || tabTitles[t]) [titles addObject:t];
+    }
     for (NSString *t in native) if (![titles containsObject:t]) [titles addObject:t];
+    for (NSDictionary *tab in tabs) if (![titles containsObject:tab[@"id"]]) [titles addObject:tab[@"id"]];
     self.titles = titles;
+    self.tabTitles = tabTitles;
 }
 
 - (void)close {
@@ -1110,6 +1548,8 @@ static void nfb_colsHomeAppearedOnce(void) {
 - (void)reset {
     [NSUserDefaults.standardUserDefaults removeObjectForKey:kNFBColsOrderKey];
     [NSUserDefaults.standardUserDefaults removeObjectForKey:kNFBColsVisibilityKey];
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:kNFBColsTabFailedKey];
+    [gNFBColsTabSkipped removeAllObjects];
     NFBColumnsPrefsChanged();
     [self reloadTitles];
     [self.tableView reloadData];
@@ -1120,19 +1560,28 @@ static void nfb_colsHomeAppearedOnce(void) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    return self.titles.count ? nil : nfb_colsLoc(@"NFB_COLUMNS_MANAGE_EMPTY", @"Open Home once with columns mode on to list its timelines here.");
+    if (!self.titles.count) return nfb_colsLoc(@"NFB_COLUMNS_MANAGE_EMPTY", @"Open Home once with columns mode on to list its timelines here.");
+    return self.tabTitles.count ? nfb_colsLoc(@"NFB_COLUMNS_MANAGE_TABS_NOTE",
+        @"App tabs (Notifications, Search, ...) become columns when turned on. Each opens a second copy of that screen, so every one you turn on uses memory. App-tab columns are not auto-refreshed.") : nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"col"] ?:
-        [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"col"];
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"col2"] ?:
+        [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"col2"];
     NSString *title = self.titles[indexPath.row];
-    cell.textLabel.text = title;
+    NSString *tabTitle = self.tabTitles[title];
+    BOOL stopped = tabTitle && [nfb_colsTabFailed() containsObject:title];
+    cell.textLabel.text = tabTitle ?: title;
+    cell.detailTextLabel.text = !tabTitle ? nil : (stopped ?
+        nfb_colsLoc(@"NFB_COLUMNS_TAB_STOPPED", @"App tab - stopped: the app quit right after this column opened last time (turn on to retry)") :
+        nfb_colsLoc(@"NFB_COLUMNS_KIND_TAB", @"App tab"));
+    cell.detailTextLabel.textColor = stopped ? UIColor.systemOrangeColor : UIColor.secondaryLabelColor;
+    cell.detailTextLabel.numberOfLines = 0;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     cell.showsReorderControl = YES;
     UISwitch *sw = [UISwitch new];
     NSDictionary *visibility = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kNFBColsVisibilityKey] ?: @{};
-    sw.on = nfb_colsTitleVisible(title, visibility);
+    sw.on = tabTitle ? ([visibility[title] boolValue] && !stopped) : nfb_colsTitleVisible(title, visibility);
     sw.accessibilityIdentifier = title;
     [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
     cell.accessoryView = sw;
@@ -1141,15 +1590,22 @@ static void nfb_colsHomeAppearedOnce(void) {
 }
 
 - (void)switchChanged:(UISwitch *)sender {
+    NSString *key = sender.accessibilityIdentifier;
+    BOOL isTab = self.tabTitles[key] != nil;
     NSMutableDictionary *visibility = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:kNFBColsVisibilityKey] ?: @{} mutableCopy];
-    if (!sender.on) {
+    if (!sender.on && !isTab) {
         NSUInteger visibleCount = 0;
-        for (NSString *t in self.titles) if (nfb_colsTitleVisible(t, visibility)) visibleCount++;
-        if (visibleCount <= 1) { sender.on = YES; return; }   // keep at least one column
+        for (NSString *t in self.titles) if (!self.tabTitles[t] && nfb_colsTitleVisible(t, visibility)) visibleCount++;
+        if (visibleCount <= 1) { sender.on = YES; return; }   // keep at least one timeline column
     }
-    visibility[sender.accessibilityIdentifier] = @(sender.on);
+    if (isTab && sender.on) nfb_colsTabClearFailed(key);   // turning a stopped tab on again = retry
+    visibility[key] = @(sender.on);
     [[NSUserDefaults standardUserDefaults] setObject:visibility forKey:kNFBColsVisibilityKey];
     NFBColumnsPrefsChanged();
+    NSUInteger row = [self.titles indexOfObject:key];
+    if (isTab && row != NSNotFound) {
+        [self.tableView reloadRowsAtIndexPaths:@[ [NSIndexPath indexPathForRow:(NSInteger)row inSection:0] ] withRowAnimation:UITableViewRowAnimationNone];
+    }
 }
 
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1244,7 +1700,7 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
     UICollectionView *cv = self.collectionView;
     NFBColumnsModel *model = nfb_colsModelForLayout(self);
     CGFloat cw = nfb_colsColumnWidth(cv.bounds.size.width);
-    size.width = MAX(cw * (CGFloat)model.slots.count, cv.bounds.size.width);
+    size.width = MAX(cw * (CGFloat)model.columnCount, cv.bounds.size.width);
     return size;
 }
 
@@ -1297,6 +1753,7 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
     if (nfb_colsActiveForLayout(self)) {
         gNFBColsScroll.prepares++;
         NFBHeatCount(NFBHeatColumnsLayout);
+        nfb_colsScheduleTabLayout();   // app-tab columns follow a resize / a changed column set
     }
 }
 
@@ -1348,6 +1805,7 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
         CGFloat x = MIN(MAX(desired.doubleValue, 0.0), maxX);
         if (fabs(cv.contentOffset.x - x) > 1.0) [cv setContentOffset:CGPointMake(x, cv.contentOffset.y) animated:NO];
     }
+    if (!cv.isDragging && !cv.isDecelerating && !cv.isTracking) nfb_colsScheduleTabLayout();
 }
 
 // Columns mode owns the Home collection view's horizontal scrolling. The pager's own handling
@@ -1626,7 +2084,7 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
 }
 
 - (NSString *)title {
-    if (nfb_colsEnabled() && [self.scribePage isEqualToString:NFBColumnsHostPageID()]) return nfb_colsTabTitle();
+    if (!gNFBColsRawTabTitle && nfb_colsEnabled() && [self.scribePage isEqualToString:NFBColumnsHostPageID()]) return nfb_colsTabTitle();
     return %orig;
 }
 

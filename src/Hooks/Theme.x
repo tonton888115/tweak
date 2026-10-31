@@ -634,9 +634,12 @@ static NSString* scribePageForEntry(id<T1AppNavigationTabEntry> entry) {
     return [entry tabView].scribePage;
 }
 
+void NFBColumnsNoteTabEntries(NSArray* entries); // Columns.x: app-tab columns can be any of these
+
 // Operates on the tab ENTRIES, not the button views: the app derives both the
 // buttons and their content view controllers from this one array.
 static NSArray* orderedTabEntries(NSArray* entries) {
+    NFBColumnsNoteTabEntries(entries);
     // Record the underlying tab views so the editor can show real titles and icons.
     NSMutableArray* tabViews = [NSMutableArray new];
     for (id<T1AppNavigationTabEntry> entry in entries) {

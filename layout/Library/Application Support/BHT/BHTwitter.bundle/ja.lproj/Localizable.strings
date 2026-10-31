@@ -517,6 +517,9 @@
 "NFB_COLUMNS_MANAGE" = "📐 カラムの管理（並べ替え・表示）…";
 "NFB_COLUMNS_MANAGE_TITLE" = "カラムの管理";
 "NFB_COLUMNS_MANAGE_EMPTY" = "カラムタブを一度開くと、ここにタイムラインが並びます。";
+"NFB_COLUMNS_KIND_TAB" = "アプリタブ";
+"NFB_COLUMNS_TAB_STOPPED" = "アプリタブ・停止中（前回この列を開いた直後にアプリが終了しました。ON にすると再挑戦）";
+"NFB_COLUMNS_MANAGE_TABS_NOTE" = "アプリタブ（通知・検索など）は ON にすると列として追加されます。その画面をもう1つ開くので、ON にした数だけメモリを使います。アプリタブの列は自動更新しません。";
 "NFB_COLUMNS_AUTO_DISABLED" = "カラムタブを開いている間にアプリが2回続けて異常終了したため、カラムタブをOFFにしました。";
 "NFB_RESET" = "リセット";
 "NFB_DIAG_SHARE" = "📤 診断を iCloud Drive に保存";
