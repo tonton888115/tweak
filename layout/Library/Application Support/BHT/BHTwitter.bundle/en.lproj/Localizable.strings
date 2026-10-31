@@ -539,3 +539,10 @@
 "NFB_NET_SPEED_FAILED" = "Measurement failed: %@";
 "NFB_NET_SPEED_TITLE" = "Connection speed";
 "NFB_NET_MEASURING_10MB" = "Measuring… (~10 MB)";
+"NFB_NET_MENU_LAST" = "Speed ↓%.0f Mbps (measured %@)";
+"NFB_NET_MENU_NONE" = "Speed: not measured yet";
+"NFB_NET_MENU_AUTO" = "Measured automatically every 5 min on this Wi-Fi while shown (~3 MB each)";
+"NFB_NET_MENU_MANUAL" = "Not measured automatically on this connection (mobile data / hotspot / Low Data Mode) - use 📶";
+"NFB_AGO_SECONDS" = "%lds ago";
+"NFB_AGO_MINUTES" = "%ld min ago";
+"NFB_AGO_HOURS" = "%ld h ago";

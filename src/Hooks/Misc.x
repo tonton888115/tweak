@@ -269,6 +269,30 @@ static void BHTPasteboardSetString(id pasteboard, SEL selector, NSString* string
 
 %end
 
+// The share sheet's last step, per target app, appends its own query again (fork b87; X 12.38.1
+// still builds it with stringWithFormat: there). Only X's own links: a shared link to another site
+// (YouTube ?t= and the like) passes untouched.
+%hook T1ActivityItemProvider
+
+- (id)_tfn_prepareURL:(id)url activityType:(NSString*)activityType {
+    id prepared = %orig;
+    NSURL* preparedURL = [prepared isKindOfClass:[NSURL class]] ? prepared : nil;
+    NSString* host = preparedURL.host.lowercaseString;
+    NSString* selectedHost = [[NSUserDefaults standardUserDefaults] objectForKey:@"sharing_domain"];
+    BOOL isTwitterHost = [host isEqualToString:@"x.com"] || [host hasSuffix:@".x.com"] ||
+                         [host isEqualToString:@"twitter.com"] ||
+                         [host hasSuffix:@".twitter.com"] ||
+                         (selectedHost.length > 0 && [host isEqualToString:selectedHost.lowercaseString]);
+    if (preparedURL.query.length == 0 || !isTwitterHost) {
+        return prepared;
+    }
+
+    NSURL* cleaned = [NSURL URLWithString:CleanedShareURLString(preparedURL.absoluteString)];
+    return cleaned ?: prepared;
+}
+
+%end
+
 // MARK: - Disable screenshot and screen recording detection
 
 %hook NSNotificationCenter

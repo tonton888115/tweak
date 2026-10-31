@@ -537,3 +537,10 @@
 "NFB_NET_SPEED_FAILED" = "測定できませんでした: %@";
 "NFB_NET_SPEED_TITLE" = "回線速度";
 "NFB_NET_MEASURING_10MB" = "測定中…（約10MB）";
+"NFB_NET_MENU_LAST" = "回線速度 ↓%.0f Mbps（%@に測定）";
+"NFB_NET_MENU_NONE" = "回線速度: まだ測っていません";
+"NFB_NET_MENU_AUTO" = "この Wi-Fi では表示中 5 分ごとに自動で測ります（1 回約 3MB）";
+"NFB_NET_MENU_MANUAL" = "この回線では自動で測りません（モバイル回線・テザリング・低データモード）。📶 で測れます";
+"NFB_AGO_SECONDS" = "%ld秒前";
+"NFB_AGO_MINUTES" = "%ld分前";
+"NFB_AGO_HOURS" = "%ld時間前";

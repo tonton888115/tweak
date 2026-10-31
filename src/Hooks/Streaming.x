@@ -64,7 +64,7 @@ static NSString *nfb_buildDiagnosticReport(void);
 void NFBUpdateStreamButtonVisibility(void);
 static void nfb_noteLoadBegan(id owner);
 static void nfb_noteLoadEnded(id owner);
-static void nfb_runSpeedTest(NSUInteger bytes, void (^done)(double mbps, NSError *error));
+static void nfb_runSpeedTest(NSUInteger bytes, NSString *reason, void (^done)(double mbps, NSError *error));
 static void nfb_installNetBadge(void);
 static NSString *gNFBPrevSessionVerdict = nil;   // session black box (crash audit), set at launch
 NSString *NFBPinnedTimelinesDiag(void);            // HomeBars.x
@@ -1175,7 +1175,8 @@ static void nfb_installCrashLoggerOnce(void) {
 #pragma mark - network / X response badge (fork b78-b79)
 
 // A small two-line pill under the stream button:
-//   1) connection + last measured download speed   e.g. "Wi-Fi ↓42 Mbps"
+//   1) connection + download speed   e.g. "Wi-Fi ↓42 Mbps" (a speed test under 15 minutes old) or
+//      "↓≈42 Mbps" (estimated from X's own large downloads); an older number is not shown.
 //   2) how long X took to answer the last timeline load   e.g. "X 0.8秒" (green < 1.5s, orange < 4s,
 //      red >= 4s), "X 応答なし" after 12s, "X 障害?" when that keeps happening while the link is up.
 // Load time = TFNDataViewController loadTopDidBegin -> loadTopDidEnd (pull / auto-refresh) and the
@@ -1197,6 +1198,10 @@ static double gNFBPassiveMbps = -1.0;
 static CFTimeInterval gNFBPassiveAt = 0.0;
 static NSUInteger gNFBPassiveSamples = 0;
 static double gNFBTestMbpsAt = 0.0;               // when gNFBLastMbps was measured by a test
+// Automatic tests run on Wi-Fi only, never on a hotspot (expensive) or Low Data Mode (constrained) link.
+static BOOL gNFBNetExpensive = NO;
+static BOOL gNFBNetConstrained = NO;
+static CFTimeInterval gNFBLastSpeedTestStartedAt = -1000.0;   // any test, automatic or from the menu
 // X API health: the last 40 api.(twitter|x).com answers (1 = answered, 0 = 5xx / timeout / no
 // connection, 2 = rate limited). Several failures in a short time while the link is up = outage hint.
 static uint8_t gNFBApiResults[40];
@@ -1236,13 +1241,14 @@ static BOOL nfb_apiRateLimitedRecent(CFTimeInterval window) {
 static void nfb_updateNetBadge(void) {
     if (!gNFBNetBadge) return;
     NSString *kind = gNFBNetPath == 1 ? @"Wi-Fi" : (gNFBNetPath == 2 ? nfb_cellularGeneration() : @"Net");
+    CFTimeInterval now = CACurrentMediaTime();
     NSString *line1;
     if (gNFBNetPath == 0) line1 = nfb_loc(@"NFB_NET_OFFLINE", @"Offline");
     else if (gNFBSpeedTestRunning) line1 = [NSString stringWithFormat:@"%@ %@", kind, nfb_loc(@"NFB_NET_MEASURING", @"measuring…")];
-    else if (gNFBPassiveMbps >= 0.0 && gNFBPassiveAt > gNFBTestMbpsAt && CACurrentMediaTime() - gNFBPassiveAt < 300.0)
+    else if (gNFBLastMbps >= 0.0 && now - gNFBTestMbpsAt < 900.0) line1 = [NSString stringWithFormat:@"%@ ↓%.0f Mbps", kind, gNFBLastMbps];
+    else if (gNFBPassiveMbps >= 0.0 && now - gNFBPassiveAt < 300.0)
         line1 = [NSString stringWithFormat:@"%@ ↓≈%.0f Mbps", kind, gNFBPassiveMbps];   // estimate from X's downloads
-    else if (gNFBLastMbps >= 0.0) line1 = [NSString stringWithFormat:@"%@ ↓%.0f Mbps", kind, gNFBLastMbps];
-    else line1 = kind;
+    else line1 = kind;   // nothing recent: an old number would read as the speed right now
     NSString *line2;
     UIColor *color2;
     if (gNFBNetPath == 0) {
@@ -1271,6 +1277,18 @@ static void nfb_updateNetBadge(void) {
     gNFBNetBadge.attributedText = text;
 }
 
+// Automatic test: Wi-Fi that is not a hotspot or in Low Data Mode, app in use, badge on screen.
+static BOOL nfb_autoSpeedTestAllowed(void) {
+    if (gNFBNetPath != 1 || gNFBNetExpensive || gNFBNetConstrained || gNFBSpeedTestRunning) return NO;
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return NO;
+    return gNFBNetBadge.window && !gStreamButton.hidden && gStreamButton.alpha > 0.5;
+}
+
+static void nfb_maybeAutoSpeedTest(NSString *reason, CFTimeInterval minGap) {
+    if (!nfb_autoSpeedTestAllowed() || CACurrentMediaTime() - gNFBLastSpeedTestStartedAt < minGap) return;
+    nfb_runSpeedTest(3000000, reason, nil);
+}
+
 static void nfb_startNetMonitorOnce(void) {
     static dispatch_once_t once;
     static nw_path_monitor_t monitor = nil;
@@ -1283,20 +1301,34 @@ static void nfb_startNetMonitorOnce(void) {
             else if (nw_path_uses_interface_type(path, nw_interface_type_wifi)) gNFBNetPath = 1;
             else if (nw_path_uses_interface_type(path, nw_interface_type_cellular)) gNFBNetPath = 2;
             else gNFBNetPath = 3;
+            gNFBNetExpensive = nw_path_is_expensive(path);
+            gNFBNetConstrained = nw_path_is_constrained(path);
             if (gNFBNetPath != previous) {   // a different link: old speeds no longer apply
                 gNFBLastMbps = -1.0;
                 gNFBPassiveMbps = -1.0;
             }
             nfb_updateNetBadge();
-            static CFTimeInterval lastAutoTest = -1000.0;
-            if (gNFBNetPath == 1 && previous != 1 && CACurrentMediaTime() - lastAutoTest > 600.0) {
-                lastAutoTest = CACurrentMediaTime();
+            // Joined Wi-Fi (launch, reconnect): measure it; a flapping link at most once a minute.
+            if (gNFBNetPath == 1 && previous != 1) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    if (gNFBNetPath == 1) nfb_runSpeedTest(3000000, nil);
+                    nfb_maybeAutoSpeedTest(@"wifi", 60.0);
                 });
             }
         });
         nw_path_monitor_start(monitor);
+        // Then again every 5 minutes while the badge is on screen, and soon after coming back from
+        // the background, so the number follows the link instead of keeping the first one.
+        NSTimer *timer = [NSTimer timerWithTimeInterval:60.0 repeats:YES block:^(__unused NSTimer *t) {
+            nfb_maybeAutoSpeedTest(@"periodic", 300.0);
+        }];
+        timer.tolerance = 15.0;
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSDefaultRunLoopMode];
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
+            queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                nfb_maybeAutoSpeedTest(@"resume", 300.0);
+            });
+        }];
     });
 }
 
@@ -1330,11 +1362,13 @@ static void nfb_noteLoadEnded(id owner) {
 }
 
 // Download speed: fetches `bytes` of throwaway data from Cloudflare's public speed-test endpoint
-// (the one speed.cloudflare.com uses) and reports Mbps. On demand from the menu (10 MB), and once
-// automatically after joining Wi-Fi (3 MB, at most every 10 minutes); never automatic on cellular.
-static void nfb_runSpeedTest(NSUInteger bytes, void (^done)(double mbps, NSError *error)) {
+// (the one speed.cloudflare.com uses) and reports Mbps. On demand from the menu (10 MB); on Wi-Fi
+// also automatically (3 MB): after joining it, every 5 minutes while the badge is on screen and
+// after coming back to the app. Never automatic on cellular, a hotspot or in Low Data Mode.
+static void nfb_runSpeedTest(NSUInteger bytes, NSString *reason, void (^done)(double mbps, NSError *error)) {
     if (gNFBSpeedTestRunning) return;
     gNFBSpeedTestRunning = YES;
+    gNFBLastSpeedTestStartedAt = CACurrentMediaTime();
     nfb_updateNetBadge();
     NSURLSessionConfiguration *cfg = NSURLSessionConfiguration.ephemeralSessionConfiguration;
     cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
@@ -1353,7 +1387,7 @@ static void nfb_runSpeedTest(NSUInteger bytes, void (^done)(double mbps, NSError
                 gNFBLastMbps = mbps;
                 gNFBTestMbpsAt = CACurrentMediaTime();
             }
-            NFBLogEvent([NSString stringWithFormat:@"speedTest bytes=%lu got=%lu %.2fs mbps=%.1f err=%@", (unsigned long)bytes,
+            NFBLogEvent([NSString stringWithFormat:@"speedTest %@ bytes=%lu got=%lu %.2fs mbps=%.1f err=%@", reason, (unsigned long)bytes,
                 (unsigned long)data.length, seconds, mbps, error.localizedDescription ?: @"-"]);
             nfb_updateNetBadge();
             if (done) done(mbps, error);
@@ -1485,15 +1519,36 @@ static void nfb_noteTimelineResponse(id info, id metrics, NSError *error) {
 
 static NSString *nfb_netDiagLine(void) {
     CGRect bf = gNFBNetBadge.window ? [gNFBNetBadge convertRect:gNFBNetBadge.bounds toView:nil] : CGRectZero;
-    return [NSString stringWithFormat:@"net passive=%.1fMbps samples=%lu age=%.0fs apiFails2m=%lu limited1m=%d apiResults=%lu | path=%ld lastLoad=%.2fs op=%@ responses=%lu lastResponse=%.0fs ago timedOut=%d badLoads=%lu mbps=%.1f testing=%d badge=%d hidden=%d f=(%.0f,%.0f,%.0f,%.0f) text=%@",
+    return [NSString stringWithFormat:@"net passive=%.1fMbps samples=%lu age=%.0fs apiFails2m=%lu limited1m=%d apiResults=%lu | path=%ld lastLoad=%.2fs op=%@ responses=%lu lastResponse=%.0fs ago timedOut=%d badLoads=%lu mbps=%.1f testAge=%.0fs exp=%d lowData=%d testing=%d badge=%d hidden=%d f=(%.0f,%.0f,%.0f,%.0f) text=%@",
         gNFBPassiveMbps, (unsigned long)gNFBPassiveSamples, gNFBPassiveAt > 0.0 ? CACurrentMediaTime() - gNFBPassiveAt : -1.0,
         (unsigned long)nfb_apiFailuresRecent(120.0), nfb_apiRateLimitedRecent(60.0) ? 1 : 0, (unsigned long)gNFBApiResultCount,
         (long)gNFBNetPath, gNFBLastLoadSeconds, gNFBLastLoadOp ?: @"-", (unsigned long)gNFBTimelineResponses,
         gNFBLastTimelineResponseAt > 0.0 ? CACurrentMediaTime() - gNFBLastTimelineResponseAt : -1.0,
         gNFBLastLoadTimedOut ? 1 : 0, (unsigned long)gNFBConsecutiveBadLoads,
-        gNFBLastMbps, gNFBSpeedTestRunning ? 1 : 0, gNFBNetBadge.superview ? 1 : 0, gNFBNetBadge.hidden ? 1 : 0,
+        gNFBLastMbps, gNFBLastMbps >= 0.0 ? CACurrentMediaTime() - gNFBTestMbpsAt : -1.0,
+        gNFBNetExpensive ? 1 : 0, gNFBNetConstrained ? 1 : 0, gNFBSpeedTestRunning ? 1 : 0, gNFBNetBadge.superview ? 1 : 0, gNFBNetBadge.hidden ? 1 : 0,
         bf.origin.x, bf.origin.y, bf.size.width, bf.size.height,
         [gNFBNetBadge.text stringByReplacingOccurrencesOfString:@"\n" withString:@" / "] ?: @"-"];
+}
+
+static NSString *nfb_agoText(CFTimeInterval seconds) {
+    long s = (long)MAX(0.0, seconds);
+    if (s < 60) return [NSString stringWithFormat:nfb_loc(@"NFB_AGO_SECONDS", @"%lds ago"), s];
+    if (s < 3600) return [NSString stringWithFormat:nfb_loc(@"NFB_AGO_MINUTES", @"%ld min ago"), s / 60];
+    return [NSString stringWithFormat:nfb_loc(@"NFB_AGO_HOURS", @"%ld h ago"), s / 3600];
+}
+
+// For the long-press menu: the last measurement, how old it is, and whether this link is measured
+// automatically.
+static NSString *nfb_speedStatusLine(void) {
+    NSString *line = gNFBLastMbps >= 0.0 ?
+        [NSString stringWithFormat:nfb_loc(@"NFB_NET_MENU_LAST", @"Speed ↓%.0f Mbps (measured %@)"), gNFBLastMbps,
+            nfb_agoText(CACurrentMediaTime() - gNFBTestMbpsAt)] :
+        nfb_loc(@"NFB_NET_MENU_NONE", @"Speed: not measured yet");
+    BOOL automatic = gNFBNetPath == 1 && !gNFBNetExpensive && !gNFBNetConstrained;
+    return [NSString stringWithFormat:@"%@\n%@", line, automatic ?
+        nfb_loc(@"NFB_NET_MENU_AUTO", @"Measured automatically every 5 min on this Wi-Fi while shown (~3 MB each)") :
+        nfb_loc(@"NFB_NET_MENU_MANUAL", @"Not measured automatically on this connection (mobile data / hotspot / Low Data Mode) - use 📶")];
 }
 
 #pragma mark - tap / long-press handler
@@ -1566,6 +1621,7 @@ static NSString *nfb_netDiagLine(void) {
     NSInteger iv = nfb_streamInterval();
     NSString *status = [NSString stringWithFormat:nfb_loc(@"NFB_STREAM_MENU_STATUS", @"Auto-refresh %@ / every %lds (tap the button to turn it on/off)"),
         on ? @"ON" : @"OFF", (long)iv];
+    status = [NSString stringWithFormat:@"%@\n\n%@", status, nfb_speedStatusLine()];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:nfb_loc(@"NFB_STREAM_MENU_TITLE", @"Auto-refresh timeline (streaming)")
         message:status
         preferredStyle:UIAlertControllerStyleActionSheet];
@@ -1667,7 +1723,7 @@ static NSString *nfb_netDiagLine(void) {
         [self waitForSpeedTest:report tries:60];
         return;
     }
-    nfb_runSpeedTest(10000000, report);
+    nfb_runSpeedTest(10000000, @"menu", report);
 }
 
 - (void)waitForSpeedTest:(void (^)(double, NSError *))report tries:(NSUInteger)tries {
@@ -1866,14 +1922,25 @@ static void nfb_updateStreamStateIconForVC(UIViewController *vc) {
     gStreamStateIcon.hidden = NO;
 }
 
+// Scroll callbacks fire every frame; the stream state behind the icon (columns, scroll views, tab)
+// is re-evaluated once the scroll has been quiet for 0.3s (fork b81), never in the middle of it.
 static BOOL gNFBStateIconPending = NO;
-static void nfb_scheduleStateIconUpdate(void) {
-    if (gNFBStateIconPending) return;
-    gNFBStateIconPending = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+static CFTimeInterval gNFBStateIconRequestedAt = 0.0;
+static void nfb_runStateIconUpdateWhenIdle(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (CACurrentMediaTime() - gNFBStateIconRequestedAt < 0.3) {
+            nfb_runStateIconUpdateWhenIdle();   // still scrolling: look again later
+            return;
+        }
         gNFBStateIconPending = NO;
         nfb_updateStreamStateIconForVC(gActiveItemsVC);
     });
+}
+static void nfb_scheduleStateIconUpdate(void) {
+    gNFBStateIconRequestedAt = CACurrentMediaTime();
+    if (gNFBStateIconPending) return;
+    gNFBStateIconPending = YES;
+    nfb_runStateIconUpdateWhenIdle();
 }
 
 static void nfb_installButton(UIWindow *win) {
@@ -1975,7 +2042,7 @@ static void nfb_resetStreamButtonAlpha(void) {
 }
 
 // Fade with the header: hide while scrolling down, show at top / scrolling up. Runs on every scroll
-// frame, so only cheap work here; the stream state icon is refreshed at most ~3x/s.
+// frame, so only cheap work here; the stream state icon is refreshed once the scroll settles.
 static void nfb_visibilityForScroll(UIScrollView *sv) {
     if (!gStreamButton || gStreamButton.window == nil) return;
     nfb_noteActiveTimelineScroll(sv);
@@ -2386,7 +2453,9 @@ static void nfb_streamStart(UIViewController *vc) {
         if (nfb_streamShouldFire(target)) nfb_streamTrigger(target);
     }];
     timer.tolerance = MIN(1.0, MAX(0.25, interval * 0.1));
-    [[NSRunLoop mainRunLoop] addTimer:timer forMode:UITrackingRunLoopMode];
+    // Default run loop mode only (fork b81): while a timeline or the columns are dragged or
+    // decelerate the run loop is in UITrackingRunLoopMode, so the tick (checks + the refresh)
+    // waits until the scroll ends instead of running mid-scroll.
     gNFBStreamTimer = timer;
 }
 
