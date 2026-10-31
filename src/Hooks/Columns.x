@@ -64,6 +64,15 @@ static char kNFBColsSavedScrollKey;        // NSNumber(scrollEnabled): iPad may 
 static char kNFBColsDesiredOffsetKey;      // NSNumber(x) on the collection view
 static char kNFBColsKickedKey;             // one empty-content load kick per page
 static BOOL gNFBColsRawTabTitle = NO;      // read a T1TabView's own title (no "Columns" relabel)
+static BOOL gNFBColsSettingScroll = NO;          // our own scrollEnabled write, not X's wish
+static NSUInteger gNFBColsScrollOffBlocked = 0;  // times X tried to turn the columns' swipe off
+
+// Horizontal scroll stats (diagnostics; see nfb_colsScrollStatsFlush).
+static struct {
+    NSUInteger frames, slow, invalidations, prepares, selects;
+    NSUInteger rejectVertical, rejectEdge, stockVetoes;
+    double lastT, maxGap, startX;
+} gNFBColsScroll;
 
 static void nfb_colsScheduleKick(void);
 static NSArray<NSDictionary *> *nfb_colsTabCandidates(void);
@@ -539,6 +548,9 @@ NSString *NFBColumnsDiagnostic(void) {
             objc_getAssociatedObject(cv, &kNFBColsDesiredOffsetKey) ?: @"-", (long)model.itemCount,
             [model.slots componentsJoinedByString:@","] ?: @"-"];
         [s appendFormat:@"columns titles=%@\n", [model.titles componentsJoinedByString:@" | "] ?: @"-"];
+        [s appendFormat:@"columns swipe scroll=%d xScrollOff=%lu pending rejectV=%lu rejectEdge=%lu xVeto=%lu\n", cv.scrollEnabled ? 1 : 0,
+            (unsigned long)gNFBColsScrollOffBlocked, (unsigned long)gNFBColsScroll.rejectVertical,
+            (unsigned long)gNFBColsScroll.rejectEdge, (unsigned long)gNFBColsScroll.stockVetoes];
         [s appendString:nfb_colsTabDiag(model)];
         for (NSDictionary *entry in NFBColumnsVisibleEntries()) {
             UIViewController *page = entry[@"vc"];
@@ -830,6 +842,17 @@ static void nfb_colsRefreshSplit(UIViewController *container) {
     }
 }
 
+// The pager sets its scrolling to `horizontalPagingEnabled && no page transition` after every
+// programmatic page change (X 12.38.1), which turns the columns' swipe off where swipe paging is
+// off. While columns are shown it stays on (setScrollEnabled: hook); X's last value is kept in
+// kNFBColsSavedScrollKey for leaving columns.
+static void nfb_colsForceScrollable(UICollectionView *cv) {
+    if (cv.scrollEnabled) return;
+    gNFBColsSettingScroll = YES;
+    cv.scrollEnabled = YES;
+    gNFBColsSettingScroll = NO;
+}
+
 static void nfb_colsApplyToPager(UIViewController *pager) {
     UICollectionView *cv = nfb_colsCollectionViewOfPager(pager);
     if (!cv) return;
@@ -844,7 +867,7 @@ static void nfb_colsApplyToPager(UIViewController *pager) {
             objc_setAssociatedObject(cv, &kNFBColsSavedScrollKey, @(cv.scrollEnabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         if (cv.pagingEnabled) cv.pagingEnabled = NO;
-        if (!cv.scrollEnabled) cv.scrollEnabled = YES;
+        nfb_colsForceScrollable(cv);
         // Normal deceleration: a strong flick crosses several columns (snapped at the landing point).
         cv.decelerationRate = UIScrollViewDecelerationRateNormal;
         objc_setAssociatedObject(cv, &kNFBColsDesiredOffsetKey, @0, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1674,17 +1697,16 @@ static BOOL nfb_colsOwnsScroll(UIScrollView *scrollView) {
 #pragma mark - horizontal scroll stats (diagnostics)
 
 // One summary line per horizontal drag in columns mode: frame gaps (hitches), time spent in the
-// pager's own scrollViewDidScroll, layout invalidations/prepares and Home tab selections it caused.
-static struct {
-    NSUInteger frames, slow, invalidations, prepares, selects;
-    double lastT, maxGap;
-} gNFBColsScroll;
-
+// pager's own scrollViewDidScroll, layout invalidations/prepares and Home tab selections it caused,
+// where it went, and the swipe-start decisions since the previous line (refused as vertical / at an
+// end, and starts X's own rule would have refused). The counters are declared at the top.
 static void nfb_colsScrollStatsFlush(NSString *why) {
     if (gNFBColsScroll.frames) {
-        NFBLogEvent([NSString stringWithFormat:@"columns scroll[%@] frames=%lu maxGapMs=%.0f slow(>25ms)=%lu suppressedInvalidations=%lu prepares=%lu selects=%lu",
+        NFBLogEvent([NSString stringWithFormat:@"columns scroll[%@] frames=%lu maxGapMs=%.0f slow(>25ms)=%lu suppressedInvalidations=%lu prepares=%lu selects=%lu x=%.0f->%.0f rejectV=%lu rejectEdge=%lu xVeto=%lu xScrollOff=%lu",
             why, (unsigned long)gNFBColsScroll.frames, gNFBColsScroll.maxGap * 1000.0, (unsigned long)gNFBColsScroll.slow,
-            (unsigned long)gNFBColsScroll.invalidations, (unsigned long)gNFBColsScroll.prepares, (unsigned long)gNFBColsScroll.selects]);
+            (unsigned long)gNFBColsScroll.invalidations, (unsigned long)gNFBColsScroll.prepares, (unsigned long)gNFBColsScroll.selects,
+            gNFBColsScroll.startX, gNFBColsCollectionView.contentOffset.x, (unsigned long)gNFBColsScroll.rejectVertical,
+            (unsigned long)gNFBColsScroll.rejectEdge, (unsigned long)gNFBColsScroll.stockVetoes, (unsigned long)gNFBColsScrollOffBlocked]);
     }
     memset(&gNFBColsScroll, 0, sizeof(gNFBColsScroll));
 }
@@ -1797,7 +1819,7 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
     gNFBColsPager = self;
     gNFBColsCollectionView = cv;
     if (cv.pagingEnabled) cv.pagingEnabled = NO;
-    if (!cv.scrollEnabled) cv.scrollEnabled = YES;
+    nfb_colsForceScrollable(cv);
     // The pager re-centres on its "current page" after layout changes; keep our column instead.
     NSNumber *desired = objc_getAssociatedObject(cv, &kNFBColsDesiredOffsetKey);
     if (desired && !cv.isDragging && !cv.isDecelerating && !cv.isTracking) {
@@ -1843,6 +1865,7 @@ static void nfb_colsScrollStatsFlush(NSString *why) {
     }
     if (!(scrollView.isDragging || scrollView.isDecelerating || scrollView.isTracking)) return;
     CFTimeInterval now = CACurrentMediaTime();
+    if (!gNFBColsScroll.frames) gNFBColsScroll.startX = scrollView.contentOffset.x;
     if (gNFBColsScroll.lastT > 0.0) {
         double gap = now - gNFBColsScroll.lastT;
         if (gap < 1.0) {
@@ -1995,19 +2018,46 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
 // distance moved so far: the instantaneous velocity is noisy on a slow swipe, and a rejected
 // horizontal swipe ended as a tap on the tweet under the finger (fork b70 learned the same).
 // Only a clearly vertical start goes to the timeline; a diagonal one still moves columns.
+// X's own answer is for page paging and is never used for columns (X 12.38.1
+// -[PagingCollectionView gestureRecognizerShouldBegin:]): it wants |vx| > 2|vy| from the
+// instantaneous velocity, and refuses a rightward swipe on the pager's first page and a leftward one
+// on its last (so the side menu can have it). In columns mode the pager's page never moves (its
+// scroll callbacks are skipped), so one direction was refused from the start and every diagonal swipe
+// scrolled the timeline under the finger instead. Columns stop only at their real ends.
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gesture {
-    if (nfb_colsActiveNow() && self == gNFBColsCollectionView && gesture == self.panGestureRecognizer) {
-        CGPoint t = [self.panGestureRecognizer translationInView:self];
-        if (fabs(t.x) < 0.5 && fabs(t.y) < 0.5) t = [self.panGestureRecognizer velocityInView:self];
-        if (fabs(t.y) > fabs(t.x) * 1.3) return NO;
+    if (!nfb_colsActiveNow() || self != gNFBColsCollectionView || gesture != self.panGestureRecognizer) return %orig;
+    CGPoint t = [self.panGestureRecognizer translationInView:self];
+    if (fabs(t.x) < 0.5 && fabs(t.y) < 0.5) t = [self.panGestureRecognizer velocityInView:self];
+    BOOL stock = %orig;   // diagnostics only (no side effects): would X have refused it?
+    if (fabs(t.y) > fabs(t.x) * 1.3) {
+        gNFBColsScroll.rejectVertical++;
+        return NO;
     }
-    return %orig;
+    CGFloat maxX = MAX(0.0, self.contentSize.width - self.bounds.size.width);
+    if ((t.x > 0.0 && self.contentOffset.x <= 0.5) || (t.x < 0.0 && self.contentOffset.x >= maxX - 0.5)) {
+        gNFBColsScroll.rejectEdge++;   // nothing to move toward (no bounce): the edge gestures may have it
+        return NO;
+    }
+    if (!stock) gNFBColsScroll.stockVetoes++;
+    return YES;
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
     if (nfb_colsActiveNow() && self == gNFBColsCollectionView && gesture == self.panGestureRecognizer &&
         [other.view isKindOfClass:UIScrollView.class] && other.view != self) return NO;
     return %orig;
+}
+
+// See nfb_colsForceScrollable: X's "off" is remembered for leaving columns, not applied.
+- (void)setScrollEnabled:(BOOL)enabled {
+    if (!gNFBColsSettingScroll && nfb_colsActiveNow() && self == gNFBColsCollectionView) {
+        objc_setAssociatedObject(self, &kNFBColsSavedScrollKey, @(enabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!enabled) {
+            gNFBColsScrollOffBlocked++;
+            return;
+        }
+    }
+    %orig;
 }
 
 - (void)setContentOffset:(CGPoint)offset {

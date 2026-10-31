@@ -13,6 +13,8 @@
 //     display links (by target class), thermal state, low power mode.
 //  When one thread burns more than a third of a core, a few stack samples of
 //  it follow as image+offset frames, symbolised offline against the IPA.
+//  A main thread pass that runs for more than 0.5 s ("stall main" line) gets
+//  its stack sampled while it is still stuck.
 //
 
 #import "HookHelpers.h"
@@ -251,6 +253,42 @@ static NSString* NFBHeatDescribeFrames(const uintptr_t* frames, int count) {
     return out;
 }
 
+// MARK: - Main thread stalls
+
+// A main run loop pass still running after 0.5 s is a freeze the user feels. Its stack is taken
+// while it is stuck (again at 2 s if it lasts), at most 6 lines a minute. Sampler thread only.
+static uint64_t NFBHeatStallPass;
+static int NFBHeatStallPassSamples;
+static uint64_t NFBHeatStallMinute;
+static int NFBHeatStallMinuteLines;
+
+static void NFBHeatCheckStall(void) {
+    uint64_t since = atomic_load_explicit(&NFBHeatMainAwakeSince, memory_order_relaxed);
+    uint64_t now = NFBHeatNowNs();
+    if (!since || now <= since || NFBHeatMainThread == MACH_PORT_NULL) return;
+    if (since != NFBHeatStallPass) {
+        NFBHeatStallPass = since;
+        NFBHeatStallPassSamples = 0;
+    }
+    uint64_t busy = now - since;
+    uint64_t due = NFBHeatStallPassSamples == 0 ? 500000000ull : 2000000000ull;
+    if (NFBHeatStallPassSamples >= 2 || busy < due) return;
+    if (now - NFBHeatStallMinute > 60000000000ull) {
+        NFBHeatStallMinute = now;
+        NFBHeatStallMinuteLines = 0;
+    }
+    if (NFBHeatStallMinuteLines >= 6) return;
+    NFBHeatStallPassSamples++;
+    NFBHeatStallMinuteLines++;
+    uintptr_t frames[40];
+    int frameCount = NFBHeatCaptureStack(NFBHeatMainThread, frames, 40);
+    NSString* line = [NSString stringWithFormat:@"stall main %.0fms (still running)%@", busy / 1e6,
+                                                frameCount > 0 ? NFBHeatDescribeFrames(frames, frameCount) : @" | no stack"];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NFBLogEvent(line);
+    });
+}
+
 static NSMutableDictionary<NSNumber*, NSNumber*>* NFBHeatLastThreadSeconds;  // sampler thread only
 
 // Returns the threads sorted by CPU seconds used since the previous call; the
@@ -404,6 +442,7 @@ static void* NFBHeatSamplerMain(__unused void* arg) {
         // Sleep in short steps so a thermal change can request a line at once.
         for (int step = 0; step < (int)(NFBHeatWindow * 4); step++) {
             usleep(250000);
+            if (!atomic_load_explicit(&NFBHeatInBackground, memory_order_relaxed)) NFBHeatCheckStall();
             if (atomic_exchange_explicit(&NFBHeatWakeEarly, false, memory_order_relaxed)) break;
         }
         if (atomic_load_explicit(&NFBHeatInBackground, memory_order_relaxed)) {
