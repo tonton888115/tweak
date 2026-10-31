@@ -959,10 +959,6 @@ static void nfb_colsSetActiveOnNav(BOOL active, UIViewController *nav, UIViewCon
     if (changed) NFBLogEvent([NSString stringWithFormat:@"columns tab active=%d", active ? 1 : 0]);
 }
 
-void NFBColumnsSetActive(BOOL active) {
-    nfb_colsSetActiveOnNav(active, nil, nil);
-}
-
 void NFBColumnsPrefsChanged(void) {
     gNFBColsGen++;
     gNFBColsEnabled = [BHTSettings boolForKey:kNFBColsEnabledKey];
@@ -1537,11 +1533,15 @@ static CGFloat nfb_colsFixProgrammaticOffset(UICollectionView *cv, CGFloat x, BO
 
 // Columns: a horizontal swipe moves columns, a vertical one scrolls the timeline under the finger,
 // never both at once (X lets the pager pan run together with the page's vertical pan and then
-// locks the axis in its own scroll callbacks, which columns mode skips).
+// locks the axis in its own scroll callbacks, which columns mode skips). The axis comes from the
+// distance moved so far: the instantaneous velocity is noisy on a slow swipe, and a rejected
+// horizontal swipe ended as a tap on the tweet under the finger (fork b70 learned the same).
+// Only a clearly vertical start goes to the timeline; a diagonal one still moves columns.
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gesture {
     if (nfb_colsActiveNow() && self == gNFBColsCollectionView && gesture == self.panGestureRecognizer) {
-        CGPoint v = [self.panGestureRecognizer velocityInView:self];
-        if (fabs(v.y) > fabs(v.x)) return NO;
+        CGPoint t = [self.panGestureRecognizer translationInView:self];
+        if (fabs(t.x) < 0.5 && fabs(t.y) < 0.5) t = [self.panGestureRecognizer velocityInView:self];
+        if (fabs(t.y) > fabs(t.x) * 1.3) return NO;
     }
     return %orig;
 }

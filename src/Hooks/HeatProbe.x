@@ -380,8 +380,13 @@ static void NFBHeatSample(NSString* reason) {
             rates.length ? rates : @" -", network];
         dispatch_async(dispatch_get_main_queue(), ^{
             NSProcessInfo* process = NSProcessInfo.processInfo;
-            NSString* line = [NSString stringWithFormat:@"%@ | %@ thermal=%ld lowPower=%d", head,
-                                                        NFBHeatMediaSummary(), (long)process.thermalState,
+            task_vm_info_data_t vm;
+            mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
+            double memMB = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &vmCount) == KERN_SUCCESS
+                               ? vm.phys_footprint / 1048576.0
+                               : -1.0;
+            NSString* line = [NSString stringWithFormat:@"%@ | %@ mem=%.0fMB thermal=%ld lowPower=%d", head,
+                                                        NFBHeatMediaSummary(), memMB, (long)process.thermalState,
                                                         process.isLowPowerModeEnabled ? 1 : 0];
             NFBHeatLastLine = line;
             if (cpu > NFBHeatPeakCPU) NFBHeatPeakCPU = cpu;

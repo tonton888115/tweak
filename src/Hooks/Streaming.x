@@ -5,7 +5,8 @@
 //  Native Home-timeline auto-refresh ("streaming"). A floating control sits top-right; a
 //  countdown ring depletes each interval and at 0 the visible timeline reloads — but only
 //  while the user is at the very top, otherwise a "New Tweets" pill is shown instead.
-//  TAP = on/off. LONG-PRESS = options (refresh now, interval, log recording, diagnostics).
+//  TAP = on/off. LONG-PRESS = a short menu (interval, speed test, Downdetector, columns, settings,
+//  diagnostics to iCloud Drive).
 //  For You is never auto-refreshed. Pinned lists and the Search "Latest" tab are.
 //
 //  Ported from the 11.35-based fork (StreamingTimeline.x, b74) to X 12.28.1:
@@ -71,7 +72,6 @@ static NSString *gNFBPrevSessionText = nil;
 void NFBNoteTabSelectionChanged(void);
 void NFBLogEvent(NSString *msg);
 NSString *NFBHeatSummary(void);   // HeatProbe.x
-void NFBLogSnapshot(NSString *reason);
 void NFBStreamPrefsChanged(void);
 // Columns.x
 BOOL NFBColumnsActive(void);
@@ -79,10 +79,8 @@ BOOL NFBColumnsTabEnabled(void);
 NSArray<NSDictionary *> *NFBColumnsVisibleEntries(void);
 NSArray<NSDictionary *> *NFBColumnsAllEntries(void);
 NSInteger NFBColumnsPageRecommended(UIViewController *vc);
-void NFBColumnsSetActive(BOOL active);
 NSString *NFBColumnsHostPageID(void);
 void NFBColumnsShowManager(UIViewController *presenter);
-void NFBColumnsShowHostPicker(UIViewController *presenter, void (^changed)(void));   // Columns.x
 NSString *NFBColumnsDiagnostic(void);
 
 // UI strings: BHTBundle key with an inline English fallback (BHTBundle returns the KEY for
@@ -1028,18 +1026,13 @@ static NSTimer *gNFBStreamTimer = nil;
 static __weak UIViewController *gNFBStreamTimerOwner = nil;
 static NSTimeInterval gNFBStreamTimerInterval = 0.0;
 
-#pragma mark - operation log recorder (start/stop from the long-press menu)
-// Records timestamped events while recording, mirrored to Documents/nfb_oplog.txt so the log
-// survives an app kill; NFBLogEvent returns immediately unless recording.
+#pragma mark - event log and crash records
+// Events are always kept for this session (last ~600, in memory) and go into the diagnostics
+// file and the session black box. Crash records live in Documents/nfb_crashes.txt.
 
-static BOOL gNFBLogRecording = NO;
-static NSMutableArray<NSString *> *gNFBLog = nil;
-static NSTimeInterval gNFBLogStart = 0.0;
-static NSFileHandle *gNFBLogFile = nil;
-
-static NSString *nfb_logFilePath(void) {
+static NSString *nfb_crashLogPath(void) {
     NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
-    return [dir stringByAppendingPathComponent:@"nfb_oplog.txt"];
+    return [dir stringByAppendingPathComponent:@"nfb_crashes.txt"];
 }
 
 static NSMutableArray<NSString *> *gNFBRecentEvents = nil;   // last events of this session (always on)
@@ -1053,50 +1046,19 @@ void NFBLogEvent(NSString *msg) {
     }
     [gNFBRecentEvents addObject:[NSString stringWithFormat:@"+%8.2f %@", CACurrentMediaTime() - gNFBSessionStart, msg ?: @""]];
     if (gNFBRecentEvents.count > 600) [gNFBRecentEvents removeObjectsInRange:NSMakeRange(0, 100)];
-    if (!gNFBLogRecording) return;
-    if (!gNFBLog) gNFBLog = [NSMutableArray array];
-    NSString *line = [NSString stringWithFormat:@"+%7.2f %@", CACurrentMediaTime() - gNFBLogStart, msg ?: @""];
-    [gNFBLog addObject:line];
-    if (gNFBLog.count >= 6000) {
-        [gNFBLog removeObjectsInRange:NSMakeRange(0, MIN((NSUInteger)1000, gNFBLog.count))];
-    }
-    @try { [gNFBLogFile writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]]; } @catch (NSException *e) {}
 }
 
-static void nfb_logStart(void) {
-    gNFBLog = [NSMutableArray array];
-    gNFBLogStart = CACurrentMediaTime();
-    @try {
-        NSString *path = nfb_logFilePath();
-        [[NSData data] writeToFile:path atomically:NO];
-        gNFBLogFile = [NSFileHandle fileHandleForWritingAtPath:path];
-    } @catch (NSException *e) { gNFBLogFile = nil; }
-    gNFBLogRecording = YES;
-    NFBLogEvent(@"=== REC START ===");
+// The last crash records (the file keeps growing only when the app crashes).
+static NSString *nfb_crashRecords(void) {
+    NSString *s = [NSString stringWithContentsOfFile:nfb_crashLogPath() encoding:NSUTF8StringEncoding error:nil];
+    if (!s.length) return nil;
+    NSArray<NSString *> *lines = [s componentsSeparatedByString:@"\n"];
+    return lines.count > 200 ? [[lines subarrayWithRange:NSMakeRange(lines.count - 200, 200)] componentsJoinedByString:@"\n"] : s;
 }
 
-static NSString *nfb_logStop(void) {
-    if (gNFBLogRecording) {
-        NFBLogEvent(@"=== FINAL DIAG START ===");
-        for (NSString *line in [nfb_buildDiagnosticReport() componentsSeparatedByString:@"\n"]) {
-            if (line.length) NFBLogEvent(line);
-        }
-        NFBLogEvent(@"=== REC STOP ===");
-    }
-    gNFBLogRecording = NO;
-    @try { [gNFBLogFile closeFile]; } @catch (NSException *e) {}
-    gNFBLogFile = nil;
-    return gNFBLog.count ? [gNFBLog componentsJoinedByString:@"\n"] : nfb_loc(@"NFB_LOG_EMPTY", @"(no log)");
-}
-
-static NSString *nfb_logSavedFileContents(void) {
-    NSString *s = [NSString stringWithContentsOfFile:nfb_logFilePath() encoding:NSUTF8StringEncoding error:nil];
-    return s.length ? s : nfb_loc(@"NFB_SAVED_LOG_EMPTY", @"(no saved log)");
-}
-
-// Crash capture: uncaught ObjC exceptions and fatal signals are appended to the same file so a
-// device crash can be read back after relaunch ("Copy saved log"). Installed lazily on the first
-// Home appearance so the app's own reporter is already in place; both chain to it.
+// Crash capture: uncaught ObjC exceptions and fatal signals are appended to nfb_crashes.txt, read
+// back into the next diagnostics file. Installed lazily on the first Home appearance so the app's
+// own reporter is already in place; both chain to it.
 static NSUncaughtExceptionHandler *gNFBPreviousExceptionHandler = NULL;
 static char gNFBCrashLogPathC[1024];
 static char gNFBCrashImageInfoC[512];
@@ -1112,11 +1074,11 @@ static void nfb_uncaughtExceptionHandler(NSException *exception) {
         NSString *line = [NSString stringWithFormat:@"\n=== CRASH (uncaught exception) ===\nname: %@\nreason: %@\nstack:\n%@\n=== CRASH END ===\n",
             exception.name ?: @"?", exception.reason ?: @"?",
             [exception.callStackSymbols componentsJoinedByString:@"\n"] ?: @"-"];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:nfb_logFilePath()];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:nfb_crashLogPath()];
         if (fh) {
             @try { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } @catch (NSException *e) {}
         } else {
-            [line writeToFile:nfb_logFilePath() atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            [line writeToFile:nfb_crashLogPath() atomically:NO encoding:NSUTF8StringEncoding error:nil];
         }
     } @catch (NSException *e) {}
     if (gNFBBlackboxPathC[0]) {
@@ -1187,7 +1149,7 @@ static void nfb_installCrashLoggerOnce(void) {
     dispatch_once(&once, ^{
         gNFBPreviousExceptionHandler = NSGetUncaughtExceptionHandler();
         NSSetUncaughtExceptionHandler(&nfb_uncaughtExceptionHandler);
-        const char *path = nfb_logFilePath().fileSystemRepresentation;
+        const char *path = nfb_crashLogPath().fileSystemRepresentation;
         if (path) {
             strncpy(gNFBCrashLogPathC, path, sizeof(gNFBCrashLogPathC) - 1);
             gNFBCrashLogPathC[sizeof(gNFBCrashLogPathC) - 1] = '\0';
@@ -1536,7 +1498,7 @@ static NSString *nfb_netDiagLine(void) {
 
 #pragma mark - tap / long-press handler
 
-@interface NFBStreamHandler : NSObject
+@interface NFBStreamHandler : NSObject <UIDocumentPickerDelegate>
 + (instancetype)shared;
 - (void)tap;
 - (void)newTweetsTap;
@@ -1597,35 +1559,17 @@ static NSString *nfb_netDiagLine(void) {
     if (g.state == UIGestureRecognizerStateBegan) [self showMain];
 }
 
+// Tap = auto-refresh on/off. Long press = this short menu; everything else is in NeoFreeBird's
+// settings (Timelines page).
 - (void)showMain {
     BOOL on = nfb_streamEnabled();
     NSInteger iv = nfb_streamInterval();
-    NSString *status = [NSString stringWithFormat:nfb_loc(@"NFB_STREAM_MENU_STATUS", @"Status: %@ / interval: %lds"), on ? @"ON" : @"OFF", (long)iv];
+    NSString *status = [NSString stringWithFormat:nfb_loc(@"NFB_STREAM_MENU_STATUS", @"Auto-refresh %@ / every %lds (tap the button to turn it on/off)"),
+        on ? @"ON" : @"OFF", (long)iv];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:nfb_loc(@"NFB_STREAM_MENU_TITLE", @"Auto-refresh timeline (streaming)")
         message:status
         preferredStyle:UIAlertControllerStyleActionSheet];
-    if (gNFBLogRecording) {
-        [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_LOG_STOP_AND_COPY", @"⏹ Stop log recording and copy") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-            [self stopLogAndShow];
-        }]];
-    } else {
-        [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_LOG_START", @"⏺ Start log recording (clears the previous log)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            nfb_logStart();
-            [self toast:nfb_loc(@"NFB_LOG_START_TOAST", @"Recording started. Reproduce the issue, then long-press again → \"Stop and copy\". If the app gets stuck, relaunch and use \"Copy saved log\".")];
-        }]];
-    }
-    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_LOG_COPY_SAVED", @"📄 Copy saved log (no stop needed, survives a kill)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [self copySavedLog];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_REFRESH_NOW", @"🔄 Refresh now") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        UIViewController *vc = gActiveItemsVC ?: nfb_findHomeContainer();
-        if (vc) nfb_streamTrigger(vc);
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:(on ? nfb_loc(@"NFB_STREAM_OFF", @"Turn auto-refresh OFF") : nfb_loc(@"NFB_STREAM_ON", @"Turn auto-refresh ON")) style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        nfb_setStreamEnabled(!on);
-        NFBStreamPrefsChanged();
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_INTERVAL_CHANGE", @"⏱ Change refresh interval…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_INTERVAL_CHANGE", @"⏱ Refresh interval…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self showInterval];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_NET_SPEEDTEST", @"📶 Measure connection speed (~10 MB)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
@@ -1634,30 +1578,17 @@ static NSString *nfb_netDiagLine(void) {
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_NET_DOWNDETECTOR", @"🌐 X outage reports (Downdetector)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self openDowndetector];
     }]];
-    BOOL columnsTab = [BHTSettings boolForKey:@"nfb_columns_enabled"];
-    BOOL columnsOn = NFBColumnsActive();
-    if (columnsTab) {
-        [ac addAction:[UIAlertAction actionWithTitle:(columnsOn ? nfb_loc(@"NFB_COLUMNS_OFF", @"Back to Home (leave columns)") : nfb_loc(@"NFB_COLUMNS_ON", @"Open the Columns tab")) style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            NFBColumnsSetActive(!columnsOn);
-        }]];
-    }
-    if (columnsTab) {
+    if ([BHTSettings boolForKey:@"nfb_columns_enabled"]) {
         [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_COLUMNS_MANAGE", @"📐 Manage columns (reorder / show)…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             NFBColumnsShowManager([self topVC]);
         }]];
-        [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_COLUMNS_HOST_MENU", @"🗂 Tab to replace with Columns…") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            NFBColumnsShowHostPicker([self topVC], nil);
-        }]];
     }
     // NeoFreeBird v7 has no row in X's own settings: its page opens from a long press on the
-    // logo above the home timeline. This menu is where the fork builds kept it.
+    // logo above the home timeline, or here.
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_OPEN_SETTINGS", @"⚙️ NeoFreeBird settings") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self openSettings];
     }]];
-    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_DIAG_SHOW", @"🔍 Diagnostics (copy & send)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [self showDiag];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_DIAG_SHARE", @"📤 Save diagnostics as a file (e.g. to iCloud Drive)") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_DIAG_SHARE", @"📤 Save diagnostics to iCloud Drive") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self shareDiagFile];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"CANCEL_ACTION_LABEL", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
@@ -1784,50 +1715,44 @@ static NSString *nfb_netDiagLine(void) {
     [self present:ac];
 }
 
-- (void)showText:(NSString *)text title:(NSString *)title {
-    UIPasteboard.generalPasteboard.string = text;
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:text preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_RECOPY", @"Copy again") style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        UIPasteboard.generalPasteboard.string = text;
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:nfb_loc(@"NFB_CLOSE", @"Close") style:UIAlertActionStyleCancel handler:nil]];
-    [self present:ac];
-}
-
-- (void)stopLogAndShow {
-    [self showText:nfb_logStop() title:nfb_loc(@"NFB_LOG_COPIED_TITLE", @"Recorded log (copied)")];
-}
-
-- (void)copySavedLog {
-    [self showText:nfb_logSavedFileContents() title:nfb_loc(@"NFB_SAVED_LOG_COPIED_TITLE", @"Saved log (copied)")];
-}
-
-- (void)showDiag {
-    [self showText:nfb_buildDiagnosticReport() title:nfb_loc(@"NFB_DIAG_TITLE", @"Diagnostics")];
-}
-
-// Diagnostics + the saved operation log as one .txt, handed to the share sheet so it can go
-// straight to Files -> iCloud Drive (readable from a PC without copy/paste).
+// Everything in one .txt (report, this session's events, the previous session's black box, crash
+// records), saved through the Files picker so it lands in iCloud Drive in one step; Files
+// remembers the last folder. The share sheet is the fallback.
 - (void)shareDiagFile {
     NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
     fmt.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *name = [NSString stringWithFormat:@"NeoFreeBird-diag-%@.txt", [fmt stringFromDate:[NSDate date]]];
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
-    NSArray<NSString *> *saved = [nfb_logSavedFileContents() componentsSeparatedByString:@"\n"];
-    NSArray<NSString *> *savedTail = saved.count > 150 ? [saved subarrayWithRange:NSMakeRange(saved.count - 150, 150)] : saved;
-    NSString *text = [NSString stringWithFormat:@"%@\n\n=== recent events (this session) ===\n%@\n\n=== previous session (black box) ===\n%@\n\n=== older saved log (last 150 lines; may be from previous builds) ===\n%@\n",
+    NSString *text = [NSString stringWithFormat:@"%@\n\n=== recent events (this session) ===\n%@\n\n=== previous session (black box) ===\n%@\n\n=== crash records ===\n%@\n",
         nfb_buildDiagnosticReport(), [gNFBRecentEvents componentsJoinedByString:@"\n"] ?: @"-", gNFBPrevSessionText ?: @"-",
-        [savedTail componentsJoinedByString:@"\n"]];
+        nfb_crashRecords() ?: @"(none)"];
     if (![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
-        [self showDiag];
+        [self toast:nfb_loc(@"NFB_DIAG_SAVE_FAILED", @"Could not write the diagnostics file.")];
         return;
     }
-    UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
-    if (share.popoverPresentationController) {
-        share.popoverPresentationController.sourceView = gStreamButton;
-        share.popoverPresentationController.sourceRect = gStreamButton.bounds;
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIViewController *picker = nil;
+    if (@available(iOS 14.0, *)) {
+        UIDocumentPickerViewController *exporter = [[UIDocumentPickerViewController alloc] initForExportingURLs:@[url] asCopy:YES];
+        exporter.delegate = self;
+        picker = exporter;
     }
-    [[self topVC] presentViewController:share animated:YES completion:nil];
+    if (!picker) {
+        UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+        if (share.popoverPresentationController) {
+            share.popoverPresentationController.sourceView = gStreamButton;
+            share.popoverPresentationController.sourceRect = gStreamButton.bounds;
+        }
+        picker = share;
+    }
+    [self presentSoon:picker completion:^(BOOL presented) {
+        if (!presented) NFBLogEvent(@"diag save: picker not presented");
+    }];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NFBLogEvent([NSString stringWithFormat:@"diag saved to %@", urls.firstObject.path.stringByDeletingLastPathComponent.lastPathComponent ?: @"?"]);
 }
 
 - (void)showInterval {
@@ -2291,16 +2216,11 @@ static NSString *nfb_healthLine(void) {
         count, footprintMB, (long)info.thermalState, info.isLowPowerModeEnabled ? 1 : 0];
 }
 
-// One line every 30s into the session log (cheap: a thread list walk) plus every thermal change.
+// A health line on every thermal change (the 30s heat line carries CPU and memory).
 static void nfb_startHealthLogOnce(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         if (gNFBLaunchTime <= 0.0) gNFBLaunchTime = CACurrentMediaTime();
-        NSTimer *timer = [NSTimer timerWithTimeInterval:30.0 repeats:YES block:^(__unused NSTimer *t) {
-            NFBLogEvent(nfb_healthLine());
-        }];
-        timer.tolerance = 5.0;
-        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
         [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil
             queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n) {
             NFBLogEvent([@"thermal changed: " stringByAppendingString:nfb_healthLine()]);
@@ -2360,13 +2280,14 @@ static void nfb_blackboxStart(void) {
     NSString *path = nfb_documentsFile(@"nfb_blackbox.txt");
     NSString *prevPath = nfb_documentsFile(@"nfb_blackbox_prev.txt");
     NSFileManager *fm = NSFileManager.defaultManager;
+    [fm removeItemAtPath:nfb_documentsFile(@"nfb_oplog.txt") error:nil];   // the removed log recorder's file
     NSString *prev = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     if (prev.length) {
         [fm removeItemAtPath:prevPath error:nil];
         [fm moveItemAtPath:path toPath:prevPath error:nil];
         NSString *first = [prev componentsSeparatedByString:@"\n"].firstObject ?: @"";
         NSString *verdict;
-        if ([prev containsString:@"\n!!! CRASH"]) verdict = @"previous session CRASHED (recorded; see the saved log)";
+        if ([prev containsString:@"\n!!! CRASH"]) verdict = @"previous session CRASHED (recorded; see crash records)";
         else if ([first hasPrefix:@"state=active"] || [first hasPrefix:@"state=inactive"] || [first hasPrefix:@"state=launch"])
             verdict = @"previous session ENDED WHILE IN USE without a crash record (iOS watchdog / memory kill, or a crash the handlers cannot see)";
         else if ([first hasPrefix:@"state=background"]) verdict = @"previous session ended in the background (normally reclaimed by iOS)";
@@ -2490,19 +2411,6 @@ static NSString *nfb_identifierForTimelineVariant(NSInteger variant) {
 }
 
 #pragma mark - diagnostics
-
-void NFBLogSnapshot(NSString *reason) {
-    if (!gNFBLogRecording) return;
-    UIViewController *active = gActiveItemsVC;
-    UIViewController *selected = active ? nfb_selectedTimelineVC(active) : nil;
-    NFBLogEvent([NSString stringWithFormat:@"snap[%@] page=%@ active=%@ selected=%@ recommended=%d atTop=%d streamOn=%d btnHidden=%d",
-        reason ?: @"?", nfb_currentSelectedTabPage() ?: @"(nil)",
-        active ? NSStringFromClass(active.class) : @"nil",
-        selected ? NSStringFromClass(selected.class) : @"nil",
-        selected ? (nfb_isRecommendedHomeTimeline(selected) ? 1 : 0) : -1,
-        selected ? (nfb_visibleTimelineAtTop(selected) ? 1 : 0) : -1,
-        nfb_streamEnabled() ? 1 : 0, (gStreamButton && gStreamButton.hidden) ? 1 : 0]);
-}
 
 #if NFB_DIAG
 static NSString *nfb_refreshMethodsOf(Class cls) {
@@ -2676,13 +2584,11 @@ static NSString *nfb_buildDiagnosticReport(void) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     nfb_installCrashLoggerOnce();
-    NFBLogSnapshot(@"homeContainer.appear");
     nfb_installButton(self.view.window);
 }
 
 - (void)viewDidDisappear:(BOOL)animated {
     %orig;
-    NFBLogSnapshot(@"homeContainer.disappear");
     nfb_removeButton();
 }
 
