@@ -367,6 +367,10 @@ static BOOL ItemIsRetweet(id viewModel) {
 @property (nonatomic) BOOL inSearch;
 @property (nonatomic) BOOL inEditHistory;
 
+// The signed-in account: verdicts read "is this my own post" and "do I follow
+// this author", so another account must not reuse them.
+@property (nonatomic) long long accountUserID;
+
 // Conversation lookups, filled in by -resolveConversationLookupsInSections:
 // once per section update and only when hiding verified replies needs them.
 @property (nonatomic) long long conversationRootUserID;
@@ -583,6 +587,7 @@ static NSSet<NSNumber*>* ConversationAuthorRepliedToUserIDs(NSArray* sections,
 + (instancetype)contextForDataViewController:(TFNItemsDataViewController*)dataViewController {
     BHTimelineFilterContext* context = [self new];
 
+    context.accountUserID = CurrentAccountUserID();
     context.inConversation =
         IsInHierarchyOfClass(dataViewController, @"T1ConversationContainerViewController");
     context.inProfile = IsInHierarchyOfClass(dataViewController, @"T1ProfileViewController");
@@ -628,7 +633,8 @@ static NSSet<NSNumber*>* ConversationAuthorRepliedToUserIDs(NSArray* sections,
         return NO;
     }
 
-    return self.hideWhoToFollow == other.hideWhoToFollow &&
+    return self.accountUserID == other.accountUserID &&
+           self.hideWhoToFollow == other.hideWhoToFollow &&
            self.hidePrompts == other.hidePrompts && self.hideVerified == other.hideVerified &&
            self.hideBlockedRetweets == other.hideBlockedRetweets &&
            self.inConversation == other.inConversation && self.inProfile == other.inProfile &&
@@ -702,28 +708,44 @@ static BOOL IsGraphQLResponse(NSURL* url) {
     return [url.path.pathComponents containsObject:@"graphql"];
 }
 
+// Only the containers on the way to a removed entry are copied; everything else
+// is handed back as parsed (a timeline response can hold thousands of nodes).
 static id RemoveVideoCarouselEntries(id node, BOOL* removed) {
     if ([node isKindOfClass:[NSArray class]]) {
-        NSMutableArray* kept = [NSMutableArray array];
-        for (id value in (NSArray*)node) {
+        NSArray* array = node;
+        NSMutableArray* kept = nil;
+        NSUInteger index = 0;
+        for (id value in array) {
             id entryID = [value isKindOfClass:[NSDictionary class]] ? value[@"entry_id"] : nil;
-            if ([entryID isKindOfClass:[NSString class]] &&
-                [entryID hasPrefix:@"video-carousel-"]) {
-                *removed = YES;
-                continue;
+            BOOL drop = [entryID isKindOfClass:[NSString class]] &&
+                        [entryID hasPrefix:@"video-carousel-"];
+            id filtered = drop ? nil : RemoveVideoCarouselEntries(value, removed);
+            if (!kept && (drop || filtered != value)) {
+                kept = [NSMutableArray arrayWithCapacity:array.count];
+                [kept addObjectsFromArray:[array subarrayWithRange:NSMakeRange(0, index)]];
             }
-
-            [kept addObject:RemoveVideoCarouselEntries(value, removed)];
+            if (drop) {
+                *removed = YES;
+            } else if (kept) {
+                [kept addObject:filtered];
+            }
+            index++;
         }
-        return kept;
+        return kept ?: node;
     }
 
     if ([node isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary* copy = [node mutableCopy];
-        for (NSString* key in node) {
-            copy[key] = RemoveVideoCarouselEntries(node[key], removed);
+        NSDictionary* dictionary = node;
+        NSMutableDictionary* copy = nil;
+        for (NSString* key in dictionary) {
+            id value = dictionary[key];
+            id filtered = RemoveVideoCarouselEntries(value, removed);
+            if (filtered != value) {
+                if (!copy) copy = [dictionary mutableCopy];
+                copy[key] = filtered;
+            }
         }
-        return copy;
+        return copy ?: node;
     }
 
     return node;
