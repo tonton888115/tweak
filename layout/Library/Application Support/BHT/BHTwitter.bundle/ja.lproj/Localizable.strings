@@ -545,6 +545,7 @@
 "NFB_NET_OFFLINE" = "オフライン";
 "NFB_NET_MEASURING" = "測定中…";
 "NFB_NET_X_OUTAGE" = "X 障害?";
+"NFB_NET_X_LIMITED" = "X 制限中";
 "NFB_NET_X_NO_REPLY" = "X 応答なし";
 "NFB_NET_X_SECONDS" = "X %.1f秒";
 "NFB_NET_SPEEDTEST" = "📶 回線速度を測る（約10MB）";

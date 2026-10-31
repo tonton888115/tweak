@@ -6,11 +6,22 @@
 #import <string.h>
 #import "HookHelpers.h"
 
+void NFBLogEvent(NSString* msg);  // Streaming.x
+
 // MARK: - Hide custom timelines
 
 static __weak NSObject* PinnedTimelinesRepository;
 static NSArray* LastPinnedTimelineModels;
 static BOOL PinnedTimelinesWriteBypass = NO;
+// Fork diagnostics: how many pinned lists the repository last published (and how often).
+static NSUInteger PinnedTimelinesPublishCount = 0;
+static NSInteger PinnedTimelinesLastCount = -1;
+
+NSString* NFBPinnedTimelinesDiag(void) {
+    return [NSString stringWithFormat:@"pinnedLists published=%lu last=%ld kept=%lu repo=%d",
+                                      (unsigned long)PinnedTimelinesPublishCount, (long)PinnedTimelinesLastCount,
+                                      (unsigned long)LastPinnedTimelineModels.count, PinnedTimelinesRepository ? 1 : 0];
+}
 
 // Applies a toggle without relaunching. Hiding rewrites the UNCHANGED pinned
 // list purely to republish — updatePinnedTimelines: persists server-side, so
@@ -72,6 +83,11 @@ static void SyncHomeAddTabButton(id container, BOOL hidden) {
         LastPinnedTimelineModels = [models copy];
     }
     BOOL hide = [BHTSettings boolForKey:@"hide_custom_timelines"];
+    PinnedTimelinesPublishCount++;
+    if ((NSInteger)models.count != PinnedTimelinesLastCount) {
+        NFBLogEvent([NSString stringWithFormat:@"pinnedLists published count=%lu hide=%d", (unsigned long)models.count, hide ? 1 : 0]);
+    }
+    PinnedTimelinesLastCount = (NSInteger)models.count;
 
     %orig(repository, hide ? @[] : models);
     SyncHomeAddTabButton(self, hide);

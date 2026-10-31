@@ -66,6 +66,7 @@ static void nfb_noteLoadEnded(id owner);
 static void nfb_runSpeedTest(NSUInteger bytes, void (^done)(double mbps, NSError *error));
 static void nfb_installNetBadge(void);
 static NSString *gNFBPrevSessionVerdict = nil;   // session black box (crash audit), set at launch
+NSString *NFBPinnedTimelinesDiag(void);            // HomeBars.x
 static NSString *gNFBPrevSessionText = nil;
 void NFBNoteTabSelectionChanged(void);
 void NFBLogEvent(NSString *msg);
@@ -1225,6 +1226,17 @@ static NSUInteger gNFBConsecutiveBadLoads = 0; // timeouts / >= 8s loads in a ro
 static NSString *gNFBLastLoadOp = nil;           // GraphQL operation of the last timeline response
 static CFTimeInterval gNFBLastTimelineResponseAt = 0.0;
 static NSUInteger gNFBTimelineResponses = 0;
+// Passive download speed: X's own image downloads of >= 200 KB (bytes / transfer time), smoothed.
+// No extra traffic; the speed test stays the accurate measurement.
+static double gNFBPassiveMbps = -1.0;
+static CFTimeInterval gNFBPassiveAt = 0.0;
+static NSUInteger gNFBPassiveSamples = 0;
+static double gNFBTestMbpsAt = 0.0;               // when gNFBLastMbps was measured by a test
+// X API health: the last 40 api.(twitter|x).com answers (1 = answered, 0 = 5xx / timeout / no
+// connection, 2 = rate limited). Several failures in a short time while the link is up = outage hint.
+static uint8_t gNFBApiResults[40];
+static CFTimeInterval gNFBApiResultAt[40];
+static NSUInteger gNFBApiResultCount = 0;
 
 static NSString *nfb_cellularGeneration(void) {
     static CTTelephonyNetworkInfo *info = nil;
@@ -1238,12 +1250,32 @@ static NSString *nfb_cellularGeneration(void) {
     return @"3G";
 }
 
+// Main thread only.
+static NSUInteger nfb_apiFailuresRecent(CFTimeInterval window) {
+    CFTimeInterval now = CACurrentMediaTime();
+    NSUInteger failures = 0;
+    for (NSUInteger i = 0; i < MIN(gNFBApiResultCount, (NSUInteger)40); i++) {
+        if (gNFBApiResults[i] == 0 && now - gNFBApiResultAt[i] < window) failures++;
+    }
+    return failures;
+}
+
+static BOOL nfb_apiRateLimitedRecent(CFTimeInterval window) {
+    CFTimeInterval now = CACurrentMediaTime();
+    for (NSUInteger i = 0; i < MIN(gNFBApiResultCount, (NSUInteger)40); i++) {
+        if (gNFBApiResults[i] == 2 && now - gNFBApiResultAt[i] < window) return YES;
+    }
+    return NO;
+}
+
 static void nfb_updateNetBadge(void) {
     if (!gNFBNetBadge) return;
     NSString *kind = gNFBNetPath == 1 ? @"Wi-Fi" : (gNFBNetPath == 2 ? nfb_cellularGeneration() : @"Net");
     NSString *line1;
     if (gNFBNetPath == 0) line1 = nfb_loc(@"NFB_NET_OFFLINE", @"Offline");
     else if (gNFBSpeedTestRunning) line1 = [NSString stringWithFormat:@"%@ %@", kind, nfb_loc(@"NFB_NET_MEASURING", @"measuring…")];
+    else if (gNFBPassiveMbps >= 0.0 && gNFBPassiveAt > gNFBTestMbpsAt && CACurrentMediaTime() - gNFBPassiveAt < 300.0)
+        line1 = [NSString stringWithFormat:@"%@ ↓≈%.0f Mbps", kind, gNFBPassiveMbps];   // estimate from X's downloads
     else if (gNFBLastMbps >= 0.0) line1 = [NSString stringWithFormat:@"%@ ↓%.0f Mbps", kind, gNFBLastMbps];
     else line1 = kind;
     NSString *line2;
@@ -1251,6 +1283,12 @@ static void nfb_updateNetBadge(void) {
     if (gNFBNetPath == 0) {
         line2 = @"X —";
         color2 = UIColor.systemRedColor;
+    } else if (nfb_apiFailuresRecent(120.0) >= 3) {
+        line2 = nfb_loc(@"NFB_NET_X_OUTAGE", @"X outage?");
+        color2 = UIColor.systemRedColor;
+    } else if (nfb_apiRateLimitedRecent(60.0)) {
+        line2 = nfb_loc(@"NFB_NET_X_LIMITED", @"X rate limit");
+        color2 = UIColor.systemOrangeColor;
     } else if (gNFBLastLoadTimedOut) {
         line2 = gNFBConsecutiveBadLoads >= 2 ? nfb_loc(@"NFB_NET_X_OUTAGE", @"X outage?") : nfb_loc(@"NFB_NET_X_NO_REPLY", @"X no reply");
         color2 = UIColor.systemRedColor;
@@ -1280,7 +1318,10 @@ static void nfb_startNetMonitorOnce(void) {
             else if (nw_path_uses_interface_type(path, nw_interface_type_wifi)) gNFBNetPath = 1;
             else if (nw_path_uses_interface_type(path, nw_interface_type_cellular)) gNFBNetPath = 2;
             else gNFBNetPath = 3;
-            if (gNFBNetPath != previous) gNFBLastMbps = -1.0;   // a different link: old speed no longer applies
+            if (gNFBNetPath != previous) {   // a different link: old speeds no longer apply
+                gNFBLastMbps = -1.0;
+                gNFBPassiveMbps = -1.0;
+            }
             nfb_updateNetBadge();
             static CFTimeInterval lastAutoTest = -1000.0;
             if (gNFBNetPath == 1 && previous != 1 && CACurrentMediaTime() - lastAutoTest > 600.0) {
@@ -1343,7 +1384,10 @@ static void nfb_runSpeedTest(NSUInteger bytes, void (^done)(double mbps, NSError
         [session finishTasksAndInvalidate];
         dispatch_async(dispatch_get_main_queue(), ^{
             gNFBSpeedTestRunning = NO;
-            if (mbps >= 0.0) gNFBLastMbps = mbps;
+            if (mbps >= 0.0) {
+                gNFBLastMbps = mbps;
+                gNFBTestMbpsAt = CACurrentMediaTime();
+            }
             NFBLogEvent([NSString stringWithFormat:@"speedTest bytes=%lu got=%lu %.2fs mbps=%.1f err=%@", (unsigned long)bytes,
                 (unsigned long)data.length, seconds, mbps, error.localizedDescription ?: @"-"]);
             nfb_updateNetBadge();
@@ -1396,17 +1440,58 @@ static BOOL nfb_isOutageError(NSError *error) {
     return NO;
 }
 
+static void nfb_noteApiResult(uint8_t result) {
+    NSUInteger slot = gNFBApiResultCount % 40;
+    gNFBApiResults[slot] = result;
+    gNFBApiResultAt[slot] = CACurrentMediaTime();
+    gNFBApiResultCount++;
+}
+
 static void nfb_noteTimelineResponse(id info, id metrics, NSError *error) {
     NSURL *url = [info respondsToSelector:@selector(finalURL)] ? ((id(*)(id, SEL))objc_msgSend)(info, @selector(finalURL)) : nil;
     if (![url isKindOfClass:NSURL.class]) return;
+    NSString *host = url.host.lowercaseString;
     NSString *path = url.path;
     NSString *op = path.lastPathComponent;
-    if (![path containsString:@"/graphql/"] || ![op hasSuffix:@"Timeline"]) return;
     double seconds = [metrics respondsToSelector:@selector(allAttemptsDuration)] ?
         ((double(*)(id, SEL))objc_msgSend)(metrics, @selector(allAttemptsDuration)) : -1.0;
     NSInteger status = [info respondsToSelector:@selector(statusCode)] ?
         ((NSInteger(*)(id, SEL))objc_msgSend)(info, @selector(statusCode)) : 0;
     BOOL bad = status >= 500 || (status == 0 && nfb_isOutageError(error));
+
+    // X's API as a whole (api.twitter.com / api.x.com): answered, failed or rate limited.
+    if ([host hasPrefix:@"api."] && ([host hasSuffix:@"twitter.com"] || [host hasSuffix:@"x.com"]) &&
+        (bad || status >= 200)) {
+        uint8_t result = bad ? 0 : (status == 429 ? 2 : 1);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            nfb_noteApiResult(result);
+            if (result != 1) nfb_updateNetBadge();
+        });
+    }
+
+    // Passive speed from X's own large image downloads.
+    if (status == 200 && seconds > 0.05 && [host hasSuffix:@"twimg.com"]) {
+        long long bytes = -1;
+        id response = [info respondsToSelector:@selector(URLResponse)] ? ((id(*)(id, SEL))objc_msgSend)(info, @selector(URLResponse)) : nil;
+        if ([response isKindOfClass:NSURLResponse.class]) bytes = [(NSURLResponse *)response expectedContentLength];
+        if (bytes <= 0 && [info respondsToSelector:@selector(data)]) {
+            id data = ((id(*)(id, SEL))objc_msgSend)(info, @selector(data));
+            if ([data isKindOfClass:NSData.class]) bytes = (long long)[(NSData *)data length];
+        }
+        if (bytes >= 200000) {
+            double mbps = bytes * 8.0 / seconds / 1e6;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                // A different link since the last sample starts over.
+                BOOL fresh = gNFBPassiveMbps < 0.0 || CACurrentMediaTime() - gNFBPassiveAt > 300.0;
+                gNFBPassiveMbps = fresh ? mbps : gNFBPassiveMbps * 0.7 + mbps * 0.3;
+                gNFBPassiveAt = CACurrentMediaTime();
+                gNFBPassiveSamples++;
+                nfb_updateNetBadge();
+            });
+        }
+    }
+
+    if (![path containsString:@"/graphql/"] || ![op hasSuffix:@"Timeline"]) return;
     // Cancelled or otherwise failed requests without an answer say nothing about X.
     if (!bad && (status == 0 || seconds < 0.0)) return;
     NSString *opCopy = [op copy];
@@ -1430,7 +1515,9 @@ static void nfb_noteTimelineResponse(id info, id metrics, NSError *error) {
 
 static NSString *nfb_netDiagLine(void) {
     CGRect bf = gNFBNetBadge.window ? [gNFBNetBadge convertRect:gNFBNetBadge.bounds toView:nil] : CGRectZero;
-    return [NSString stringWithFormat:@"net path=%ld lastLoad=%.2fs op=%@ responses=%lu lastResponse=%.0fs ago timedOut=%d badLoads=%lu mbps=%.1f testing=%d badge=%d hidden=%d f=(%.0f,%.0f,%.0f,%.0f) text=%@",
+    return [NSString stringWithFormat:@"net passive=%.1fMbps samples=%lu age=%.0fs apiFails2m=%lu limited1m=%d apiResults=%lu | path=%ld lastLoad=%.2fs op=%@ responses=%lu lastResponse=%.0fs ago timedOut=%d badLoads=%lu mbps=%.1f testing=%d badge=%d hidden=%d f=(%.0f,%.0f,%.0f,%.0f) text=%@",
+        gNFBPassiveMbps, (unsigned long)gNFBPassiveSamples, gNFBPassiveAt > 0.0 ? CACurrentMediaTime() - gNFBPassiveAt : -1.0,
+        (unsigned long)nfb_apiFailuresRecent(120.0), nfb_apiRateLimitedRecent(60.0) ? 1 : 0, (unsigned long)gNFBApiResultCount,
         (long)gNFBNetPath, gNFBLastLoadSeconds, gNFBLastLoadOp ?: @"-", (unsigned long)gNFBTimelineResponses,
         gNFBLastTimelineResponseAt > 0.0 ? CACurrentMediaTime() - gNFBLastTimelineResponseAt : -1.0,
         gNFBLastLoadTimedOut ? 1 : 0, (unsigned long)gNFBConsecutiveBadLoads,
@@ -2475,6 +2562,10 @@ static NSString *nfb_buildDiagnosticReport(void) {
     [s appendFormat:@"%@\n", nfb_healthLine()];
     [s appendFormat:@"%@\n", nfb_netDiagLine()];
     [s appendFormat:@"%@\n", nfb_crashHandlerStatus()];
+    [s appendFormat:@"settings hide_custom_timelines=%d nfb_columns_enabled=%d host=%@ auto_stream=%d | %@\n",
+        [BHTSettings boolForKey:@"hide_custom_timelines"] ? 1 : 0, [BHTSettings boolForKey:@"nfb_columns_enabled"] ? 1 : 0,
+        [[NSUserDefaults standardUserDefaults] stringForKey:@"nfb_columns_host"] ?: @"(default)",
+        [BHTSettings boolForKey:@"auto_stream_timeline"] ? 1 : 0, NFBPinnedTimelinesDiag()];
     [s appendFormat:@"prevSession %@\n", gNFBPrevSessionVerdict ?: @"(none recorded: first launch with the black box)"];
     NSString *diagPage = nfb_currentSelectedTabPage();
     [s appendFormat:@"streaming on=%d interval=%ld page=%@ via=%s tabCtl=%d button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",

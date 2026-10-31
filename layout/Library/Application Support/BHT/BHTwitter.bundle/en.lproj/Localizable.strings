@@ -547,6 +547,7 @@
 "NFB_NET_OFFLINE" = "Offline";
 "NFB_NET_MEASURING" = "measuring…";
 "NFB_NET_X_OUTAGE" = "X outage?";
+"NFB_NET_X_LIMITED" = "X rate limit";
 "NFB_NET_X_NO_REPLY" = "X no reply";
 "NFB_NET_X_SECONDS" = "X %.1fs";
 "NFB_NET_SPEEDTEST" = "📶 Measure connection speed (~10 MB)";
