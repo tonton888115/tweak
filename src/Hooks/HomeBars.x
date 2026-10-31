@@ -112,7 +112,12 @@ static void SyncHomeAddTabButton(id container, BOOL hidden) {
 %hook _TtC32TwitterHomeFeatureImplementation31CachedPinnedTimelinesRepository
 
 - (void)updatePinnedTimelines:(id)timelines {
-    if (!PinnedTimelinesWriteBypass && [BHTSettings boolForKey:@"hide_custom_timelines"]) {
+    BOOL hide = [BHTSettings boolForKey:@"hide_custom_timelines"];
+    NFBLogEvent([NSString stringWithFormat:@"pinnedLists update count=%lu hide=%d bypass=%d%@",
+                                           (unsigned long)([timelines respondsToSelector:@selector(count)] ? [timelines count] : 0),
+                                           hide ? 1 : 0, PinnedTimelinesWriteBypass ? 1 : 0,
+                                           (!PinnedTimelinesWriteBypass && hide) ? @" (blocked)" : @""]);
+    if (!PinnedTimelinesWriteBypass && hide) {
         return;
     }
 

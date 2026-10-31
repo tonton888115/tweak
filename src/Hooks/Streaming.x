@@ -1105,6 +1105,9 @@ static struct sigaction gNFBPrevSigActions[sizeof(kNFBCrashSignals) / sizeof(int
 static char gNFBBlackboxPathC[1024];   // session black box (below); the crash handlers mark it
 
 static void nfb_uncaughtExceptionHandler(NSException *exception) {
+    static volatile int inHandler = 0;
+    if (inHandler) return;
+    inHandler = 1;
     @try {
         NSString *line = [NSString stringWithFormat:@"\n=== CRASH (uncaught exception) ===\nname: %@\nreason: %@\nstack:\n%@\n=== CRASH END ===\n",
             exception.name ?: @"?", exception.reason ?: @"?",
@@ -1492,6 +1495,11 @@ static void nfb_noteTimelineResponse(id info, id metrics, NSError *error) {
     }
 
     if (![path containsString:@"/graphql/"] || ![op hasSuffix:@"Timeline"]) return;
+    if ([op isEqualToString:@"PinTimeline"] || [op isEqualToString:@"UnpinTimeline"]) {
+        NSString *line = [NSString stringWithFormat:@"pinnedLists %@ status=%ld err=%@", op, (long)status, error.localizedDescription ?: @"-"];
+        dispatch_async(dispatch_get_main_queue(), ^{ NFBLogEvent(line); });
+        return;
+    }
     // Cancelled or otherwise failed requests without an answer say nothing about X.
     if (!bad && (status == 0 || seconds < 0.0)) return;
     NSString *opCopy = [op copy];
@@ -2378,6 +2386,12 @@ static void nfb_blackboxStart(void) {
     NSOperationQueue *main = NSOperationQueue.mainQueue;
     [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:main usingBlock:^(__unused NSNotification *n) {
         nfb_blackboxSetState(@"active", @"didBecomeActive");
+        NSUncaughtExceptionHandler *current = NSGetUncaughtExceptionHandler();
+        if (gNFBCrashLogPathC[0] && current != &nfb_uncaughtExceptionHandler) {
+            gNFBPreviousExceptionHandler = current;
+            NSSetUncaughtExceptionHandler(&nfb_uncaughtExceptionHandler);
+            NFBLogEvent([NSString stringWithFormat:@"crashHandlers exception re-installed (was %@)", current ? @"other" : @"none"]);
+        }
     }];
     [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:main usingBlock:^(__unused NSNotification *n) {
         nfb_blackboxSetState(@"inactive", @"willResignActive");
