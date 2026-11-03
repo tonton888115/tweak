@@ -16,7 +16,12 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest got no runner twice on 2026-11-03 (GitHub capacity): try others alongside it.
+        os: [macos-latest, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -68,6 +73,7 @@ jobs:
             ffmpeg-build
             main/deps/ffmpeg-kit-next/build
           key: ${{ steps.ffmpeg-key.outputs.key }}
+          restore-keys: ffmpeg-stack-
 
       - name: Build ffmpeg stack (first run only)
         run: |
@@ -106,7 +112,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: port-v73-sideload
+          name: port-v73-sideload-${{ matrix.os }}
           path: |
             out/BHTwitter.dylib
             out/BHTwitter.bundle.zip
