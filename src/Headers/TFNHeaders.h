@@ -164,6 +164,7 @@
 @end
 
 @interface UIFont (TFNUIFontGroup)
++ (BOOL)tfn_isChirpFontEnabled;
 - (UIFont*)tfn_withMonospacedDigits;
 @end
 

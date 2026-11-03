@@ -1116,9 +1116,6 @@ static const char *nfb_crashSignalName(int sig) {
     }
 }
 
-BOOL NFBIsKeptFont(uintptr_t pointer);   // Fonts.x
-int NFBKeptFontCount(void);               // Fonts.x
-
 static char gNFBCrashAltStack[64 * 1024];   // main thread: a stack overflow has no stack left to run on
 
 static void nfb_crashWriteHex(int fd, uintptr_t value) {
@@ -1178,14 +1175,14 @@ static void nfb_signalCrashHandler(int sig, siginfo_t *info, void *context) {
             nfb_crashWrite(fd, "address: ");
             nfb_crashWriteHex(fd, info ? (uintptr_t)info->si_addr : 0);
             if (uc && uc->uc_mcontext) {
-                // Messaging a freed object: is it one of the fonts Fonts.x keeps alive, and what is left in it?
+                // Messaging a freed object: which one, and what is left in it?
                 uintptr_t object = (uintptr_t)uc->uc_mcontext->__ss.__x[0];
                 uintptr_t words[2] = {0, 0};
                 vm_size_t read = 0;
                 vm_read_overwrite(mach_task_self(), (vm_address_t)object, sizeof(words), (vm_address_t)words, &read);
                 nfb_crashWrite(fd, "\nx0: ");
                 nfb_crashWriteHex(fd, object);
-                nfb_crashWrite(fd, NFBIsKeptFont(object) ? " kept font, first words " : " not a kept font, first words ");
+                nfb_crashWrite(fd, " first words ");
                 nfb_crashWriteHex(fd, words[0]);
                 nfb_crashWrite(fd, " ");
                 nfb_crashWriteHex(fd, words[1]);
@@ -2756,8 +2753,8 @@ static NSString *nfb_buildDiagnosticReport(void) {
         if ([BHTSettings boolForKey:key]) [settingsOn addObject:key];
     }
     [s appendFormat:@"settingsOn %@\n", settingsOn.count ? [settingsOn componentsJoinedByString:@","] : @"-"];
-    [s appendFormat:@"fonts regular=%@ bold=%@ kept=%d\n", [[NSUserDefaults standardUserDefaults] objectForKey:@"bhtwitter_font_1"] ?: @"-",
-        [[NSUserDefaults standardUserDefaults] objectForKey:@"bhtwitter_font_2"] ?: @"-", NFBKeptFontCount()];
+    [s appendFormat:@"fonts regular=%@ bold=%@ chirp=%d\n", [[NSUserDefaults standardUserDefaults] objectForKey:@"bhtwitter_font_1"] ?: @"-",
+        [[NSUserDefaults standardUserDefaults] objectForKey:@"bhtwitter_font_2"] ?: @"-", [UIFont tfn_isChirpFontEnabled]];
     [s appendFormat:@"prevSession %@\n", gNFBPrevSessionVerdict ?: @"(none recorded: first launch with the black box)"];
     NSString *diagPage = nfb_currentSelectedTabPage();
     [s appendFormat:@"streaming on=%d interval=%ld page=%@ via=%s tabCtl=%d button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",
