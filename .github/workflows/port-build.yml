@@ -16,12 +16,8 @@ concurrency:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        # macos-latest got no runner twice on 2026-11-03 (GitHub capacity): try others alongside it.
-        os: [macos-latest, macos-15, macos-15-intel]
-    runs-on: ${{ matrix.os }}
+    # macos-latest (macos-26-arm64) got no runner twice on 2026-11-03; macos-15 started at once.
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -112,7 +108,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: port-v73-sideload-${{ matrix.os }}
+          name: port-v73-sideload
           path: |
             out/BHTwitter.dylib
             out/BHTwitter.bundle.zip
