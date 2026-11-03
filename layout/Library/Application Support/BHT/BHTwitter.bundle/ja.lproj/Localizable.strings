@@ -547,3 +547,4 @@
 "NFB_AGO_SECONDS" = "%ld秒前";
 "NFB_AGO_MINUTES" = "%ld分前";
 "NFB_AGO_HOURS" = "%ld時間前";
+"NFB_VOICE_PLAY_FIRST" = "このボイスメッセージを一度再生してから、もう一度長押しすると保存できます。";

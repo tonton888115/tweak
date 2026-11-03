@@ -26,6 +26,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/ucontext.h>
+#include <sys/utsname.h>
 #include <stdio.h>
 #include <mach/mach.h>
 #include <pthread.h>
@@ -69,6 +71,8 @@ static void nfb_installNetBadge(void);
 static NSString *gNFBPrevSessionVerdict = nil;   // session black box (crash audit), set at launch
 NSString *NFBPinnedTimelinesDiag(void);            // HomeBars.x
 static NSString *gNFBPrevSessionText = nil;
+static NSString *nfb_olderSessionsText(void);
+static NSString *nfb_crashEvidenceText(void);
 void NFBNoteTabSelectionChanged(void);
 void NFBLogEvent(NSString *msg);
 NSString *NFBHeatSummary(void);   // HeatProbe.x
@@ -1057,8 +1061,11 @@ static NSString *nfb_crashRecords(void) {
 }
 
 // Crash capture: uncaught ObjC exceptions and fatal signals are appended to nfb_crashes.txt, read
-// back into the next diagnostics file. Installed lazily on the first Home appearance so the app's
-// own reporter is already in place; both chain to it.
+// back into the next diagnostics file. Installed when this library loads, before X starts
+// Crashlytics: Crashlytics takes memory faults and traps as Mach exceptions first, then puts back
+// the signal handlers it found when it started and lets the fault happen again, so a handler
+// installed after it never runs for those crashes (only abort() reached one). Installed before it,
+// ours is what it puts back.
 static NSUncaughtExceptionHandler *gNFBPreviousExceptionHandler = NULL;
 static char gNFBCrashLogPathC[1024];
 static char gNFBCrashImageInfoC[512];
@@ -1109,28 +1116,84 @@ static const char *nfb_crashSignalName(int sig) {
     }
 }
 
-// Async-signal-safe only: open/write/close + backtrace_symbols_fd on precomputed strings.
-static void nfb_signalCrashHandler(int sig, siginfo_t *info, void *context) {
-    int fd = open(gNFBCrashLogPathC, O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (fd >= 0) {
-        nfb_crashWrite(fd, "\n=== CRASH (signal) ===\nsignal: ");
-        nfb_crashWrite(fd, nfb_crashSignalName(sig));
-        nfb_crashWrite(fd, "\n");
-        nfb_crashWrite(fd, gNFBCrashImageInfoC);
-        nfb_crashWrite(fd, "stack:\n");
-        void *frames[64];
-        int n = backtrace(frames, 64);
-        backtrace_symbols_fd(frames, n, fd);
-        nfb_crashWrite(fd, "=== CRASH END ===\n");
-        close(fd);
+static char gNFBCrashAltStack[64 * 1024];   // main thread: a stack overflow has no stack left to run on
+
+static void nfb_crashWriteHex(int fd, uintptr_t value) {
+    char text[18] = {'0', 'x'};
+    int length = 2;
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        unsigned digit = (value >> shift) & 0xF;
+        if (digit == 0 && length == 2 && shift > 0) continue;
+        text[length++] = "0123456789abcdef"[digit];
     }
-    if (gNFBBlackboxPathC[0]) {
-        int bfd = open(gNFBBlackboxPathC, O_WRONLY | O_APPEND | O_CREAT, 0644);
-        if (bfd >= 0) {
-            nfb_crashWrite(bfd, "\n!!! CRASH signal=");
-            nfb_crashWrite(bfd, nfb_crashSignalName(sig));
-            nfb_crashWrite(bfd, "\n");
-            close(bfd);
+    write(fd, text, (size_t)length);
+}
+
+// The interrupted thread's own frames, from the signal context (backtrace() would start at this
+// handler, and on the alternate stack it finds nothing at all).
+static int nfb_crashFrames(ucontext_t *uc, void **frames, int maxFrames) {
+    const uintptr_t mask = 0x0000007fffffffffULL;   // strip pointer authentication bits
+    arm_thread_state64_t state = uc->uc_mcontext->__ss;
+    uintptr_t pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(state) & mask;
+    uintptr_t lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(state) & mask;
+    uintptr_t fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(state);
+    int count = 0;
+    if (pc) frames[count++] = (void *)pc;
+    if (lr > 0x4000 && count < maxFrames) frames[count++] = (void *)lr;
+    uintptr_t previous = 0;
+    while (count < maxFrames && fp && (fp & 0x7) == 0 && fp > previous) {
+        struct {
+            uintptr_t fp;
+            uintptr_t lr;
+        } record;
+        vm_size_t read = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof(record), (vm_address_t)&record, &read) != KERN_SUCCESS ||
+            read != sizeof(record)) break;
+        uintptr_t frameLR = record.lr & mask;
+        if (frameLR < 0x4000) break;
+        frames[count++] = (void *)frameLR;
+        previous = fp;
+        fp = record.fp;
+    }
+    return count;
+}
+
+// Async-signal-safe up to the symbol names: those need dladdr, which blocks if the crash hit inside
+// dyld, so the raw addresses are already on disk then and an alarm ends the process regardless.
+static void nfb_signalCrashHandler(int sig, siginfo_t *info, void *context) {
+    static volatile sig_atomic_t entries = 0;
+    if (entries++ < 2) {
+        ucontext_t *uc = context;
+        void *frames[128];
+        int n = (uc && uc->uc_mcontext) ? nfb_crashFrames(uc, frames, 128) : 0;
+        int fd = open(gNFBCrashLogPathC, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (fd >= 0) {
+            nfb_crashWrite(fd, "\n=== CRASH (signal) ===\nsignal: ");
+            nfb_crashWrite(fd, nfb_crashSignalName(sig));
+            nfb_crashWrite(fd, "\n");
+            nfb_crashWrite(fd, gNFBCrashImageInfoC);
+            nfb_crashWrite(fd, "address: ");
+            nfb_crashWriteHex(fd, info ? (uintptr_t)info->si_addr : 0);
+            nfb_crashWrite(fd, "\nframes:");
+            for (int i = 0; i < n; i++) {
+                nfb_crashWrite(fd, " ");
+                nfb_crashWriteHex(fd, (uintptr_t)frames[i]);
+            }
+            nfb_crashWrite(fd, "\nstack:\n");
+            alarm(5);
+            backtrace_symbols_fd(frames, n, fd);
+            alarm(0);
+            nfb_crashWrite(fd, "=== CRASH END ===\n");
+            close(fd);
+        }
+        if (gNFBBlackboxPathC[0]) {
+            int bfd = open(gNFBBlackboxPathC, O_WRONLY | O_APPEND | O_CREAT, 0644);
+            if (bfd >= 0) {
+                nfb_crashWrite(bfd, "\n!!! CRASH signal=");
+                nfb_crashWrite(bfd, nfb_crashSignalName(sig));
+                nfb_crashWrite(bfd, "\n");
+                close(bfd);
+            }
         }
     }
     for (size_t i = 0; i < sizeof(kNFBCrashSignals) / sizeof(int); i++) {
@@ -1159,17 +1222,74 @@ static void nfb_installCrashLoggerOnce(void) {
             snprintf(gNFBCrashImageInfoC, sizeof(gNFBCrashImageInfoC), "image: %s base: %p\n",
                      dlinfo.dli_fname ?: "?", dlinfo.dli_fbase);
         }
-        void *warm[4];
-        backtrace(warm, 4);   // pre-warm the unwinder so the first real backtrace is signal-safe
+        stack_t alternate;
+        memset(&alternate, 0, sizeof(alternate));
+        alternate.ss_sp = gNFBCrashAltStack;
+        alternate.ss_size = sizeof(gNFBCrashAltStack);
+        sigaltstack(&alternate, NULL);
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_sigaction = nfb_signalCrashHandler;
-        sa.sa_flags = SA_SIGINFO;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
         sigemptyset(&sa.sa_mask);
         for (size_t i = 0; i < sizeof(kNFBCrashSignals) / sizeof(int); i++) {
             sigaction(kNFBCrashSignals[i], &sa, &gNFBPrevSigActions[i]);
         }
     });
+}
+
+// X's Crashlytics writes every crash it catches to Library/Caches/com.crashlytics.data/.../<report>/
+// and sends and deletes the report at a later launch. It has not started yet when this library
+// loads: the crash files of the newest such report are copied for the diagnostics file (exception,
+// every thread's stack, loaded images), along with a listing of what was there.
+static NSString *gNFBCrashlyticsListing = nil;
+
+static NSString *nfb_crashlyticsCopyPath(void) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
+    return [dir stringByAppendingPathComponent:@"nfb_crashlytics_crash.txt"];
+}
+
+static void nfb_keepCrashlyticsRecords(void) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *root = [caches stringByAppendingPathComponent:@"com.crashlytics.data"];
+    NSArray<NSString *> *crashFiles = @[@"mach_exception.clsrecord", @"signal.clsrecord", @"exception.clsrecord"];
+    NSMutableString *listing = [NSMutableString string];
+    NSUInteger listed = 0;
+    NSString *newestFolder = nil;
+    NSDate *newestDate = nil;
+    for (NSString *relative in [fm enumeratorAtPath:root]) {
+        NSString *path = [root stringByAppendingPathComponent:relative];
+        NSDictionary *attributes = [fm attributesOfItemAtPath:path error:nil];
+        if (![attributes.fileType isEqualToString:NSFileTypeRegular]) continue;
+        if (listed++ < 40) [listing appendFormat:@"%@ %llu %@\n", relative, attributes.fileSize, attributes.fileModificationDate];
+        if ([crashFiles containsObject:relative.lastPathComponent] && attributes.fileSize > 0 &&
+            (!newestDate || [attributes.fileModificationDate compare:newestDate] == NSOrderedDescending)) {
+            newestDate = attributes.fileModificationDate;
+            newestFolder = path.stringByDeletingLastPathComponent;
+        }
+    }
+    gNFBCrashlyticsListing = listing.length ? [NSString stringWithFormat:@"%lu files under %@\n%@", (unsigned long)listed, root, listing] : nil;
+    if (!newestFolder) return;
+    NSMutableString *copy = [NSMutableString stringWithFormat:@"report %@ (%@)\n", newestFolder.lastPathComponent, newestDate];
+    for (NSString *name in [crashFiles arrayByAddingObject:@"binary_images.clsrecord"]) {
+        NSData *data = [NSData dataWithContentsOfFile:[newestFolder stringByAppendingPathComponent:name]];
+        if (!data.length) continue;
+        NSData *head = data.length > 300000 ? [data subdataWithRange:NSMakeRange(0, 300000)] : data;
+        NSString *text = [[NSString alloc] initWithData:head encoding:NSUTF8StringEncoding] ?: [[NSString alloc] initWithData:head encoding:NSISOLatin1StringEncoding];
+        [copy appendFormat:@"--- %@ (%lu bytes)\n%@\n", name, (unsigned long)data.length, text ?: @"-"];
+    }
+    [copy writeToFile:nfb_crashlyticsCopyPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+__attribute__((constructor)) static void nfb_crashLoggerAtLoad(void) {
+    @autoreleasepool {
+        nfb_installCrashLoggerOnce();
+        @try {
+            nfb_keepCrashlyticsRecords();
+        } @catch (NSException *e) {
+        }
+    }
 }
 
 #pragma mark - network / X response badge (fork b78-b79)
@@ -1780,9 +1900,9 @@ static NSString *nfb_speedStatusLine(void) {
     fmt.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *name = [NSString stringWithFormat:@"NeoFreeBird-diag-%@.txt", [fmt stringFromDate:[NSDate date]]];
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
-    NSString *text = [NSString stringWithFormat:@"%@\n\n=== recent events (this session) ===\n%@\n\n=== previous session (black box) ===\n%@\n\n=== crash records ===\n%@\n",
+    NSString *text = [NSString stringWithFormat:@"%@\n\n=== recent events (this session) ===\n%@\n\n=== previous session (black box) ===\n%@\n%@\n=== crash records ===\n%@\n%@",
         nfb_buildDiagnosticReport(), [gNFBRecentEvents componentsJoinedByString:@"\n"] ?: @"-", gNFBPrevSessionText ?: @"-",
-        nfb_crashRecords() ?: @"(none)"];
+        nfb_olderSessionsText(), nfb_crashRecords() ?: @"(none)", nfb_crashEvidenceText()];
     if (![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
         [self toast:nfb_loc(@"NFB_DIAG_SAVE_FAILED", @"Could not write the diagnostics file.")];
         return;
@@ -2321,8 +2441,22 @@ static NSString *nfb_crashHandlerStatus(void) {
             ((current.sa_handler == SIG_DFL) ? @"default" : @"other");
     }
     NSUncaughtExceptionHandler *exc = NSGetUncaughtExceptionHandler();
-    return [NSString stringWithFormat:@"crashHandlers signal=%@ exception=%@ logger=%d", sig,
-        exc == &nfb_uncaughtExceptionHandler ? @"ours" : (exc ? @"other" : @"none"), gNFBCrashLogPathC[0] ? 1 : 0];
+    // Who takes a memory fault before any signal (Crashlytics, when it is running).
+    exception_mask_t masks[EXC_TYPES_COUNT];
+    mach_port_t ports[EXC_TYPES_COUNT];
+    exception_behavior_t behaviors[EXC_TYPES_COUNT];
+    thread_state_flavor_t flavors[EXC_TYPES_COUNT];
+    mach_msg_type_number_t portCount = EXC_TYPES_COUNT;
+    NSUInteger machPorts = 0;
+    if (task_get_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, masks, &portCount, ports, behaviors, flavors) == KERN_SUCCESS) {
+        for (mach_msg_type_number_t i = 0; i < portCount; i++) {
+            if (!MACH_PORT_VALID(ports[i])) continue;
+            machPorts++;
+            mach_port_deallocate(mach_task_self(), ports[i]);
+        }
+    }
+    return [NSString stringWithFormat:@"crashHandlers signal=%@ exception=%@ logger=%d machPorts=%lu", sig,
+        exc == &nfb_uncaughtExceptionHandler ? @"ours" : (exc ? @"other" : @"none"), gNFBCrashLogPathC[0] ? 1 : 0, (unsigned long)machPorts];
 }
 
 static void nfb_blackboxWrite(NSString *reason) {
@@ -2350,7 +2484,13 @@ static void nfb_blackboxStart(void) {
     [fm removeItemAtPath:nfb_documentsFile(@"nfb_oplog.txt") error:nil];   // the removed log recorder's file
     NSString *prev = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     if (prev.length) {
-        [fm removeItemAtPath:prevPath error:nil];
+        // A few sessions back: a relaunch right after a crash must not erase the crashed session.
+        for (NSInteger age = 3; age >= 1; age--) {
+            NSString *older = nfb_documentsFile([NSString stringWithFormat:@"nfb_blackbox_prev%ld.txt", (long)(age + 1)]);
+            NSString *newer = age == 1 ? prevPath : nfb_documentsFile([NSString stringWithFormat:@"nfb_blackbox_prev%ld.txt", (long)age]);
+            [fm removeItemAtPath:older error:nil];
+            [fm moveItemAtPath:newer toPath:older error:nil];
+        }
         [fm moveItemAtPath:path toPath:prevPath error:nil];
         NSString *first = [prev componentsSeparatedByString:@"\n"].firstObject ?: @"";
         NSString *verdict;
@@ -2402,6 +2542,35 @@ static void nfb_blackboxStart(void) {
     }];
     timer.tolerance = 5.0;
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+}
+
+// Sessions before the previous one, newest first.
+static NSString *nfb_olderSessionsText(void) {
+    NSMutableString *text = [NSMutableString string];
+    for (NSInteger age = 2; age <= 4; age++) {
+        NSString *older = [NSString stringWithContentsOfFile:nfb_documentsFile([NSString stringWithFormat:@"nfb_blackbox_prev%ld.txt", (long)age])
+                                                    encoding:NSUTF8StringEncoding error:nil];
+        if (older.length) [text appendFormat:@"\n=== %ld sessions ago (black box) ===\n%@\n", (long)age, older];
+    }
+    return text;
+}
+
+NSString *NFBHeatStallRecords(void);      // HeatProbe.x
+NSString *NFBHeatMetricKitRecords(void);  // HeatProbe.x
+
+// What else knows about a crash: stacks taken during a freeze, X's own Crashlytics record, iOS's report.
+static NSString *nfb_crashEvidenceText(void) {
+    NSString *crashlytics = [NSString stringWithContentsOfFile:nfb_crashlyticsCopyPath() encoding:NSUTF8StringEncoding error:nil];
+    return [NSString stringWithFormat:@"\n=== main thread stalls ===\n%@\n\n=== Crashlytics files at launch ===\n%@\n=== Crashlytics crash record ===\n%@\n\n=== iOS reports (MetricKit) ===\n%@\n",
+        NFBHeatStallRecords() ?: @"(none)", gNFBCrashlyticsListing ?: @"(none)\n", crashlytics.length ? crashlytics : @"(none)",
+        NFBHeatMetricKitRecords() ?: @"(none)"];
+}
+
+// What was being opened when the app died: each step reaches the black box at once.
+static void nfb_noteScreenStep(NSString *step, id object) {
+    if (![NSThread isMainThread]) return;
+    NFBLogEvent([NSString stringWithFormat:@"screen %@ %@", step, object ? NSStringFromClass([object class]) : @"-"]);
+    if (gNFBBlackboxPathC[0]) nfb_blackboxWrite(step);   // once started: the first write replaces the last session's file
 }
 
 __attribute__((constructor)) static void nfb_blackboxAtLaunch(void) {
@@ -2549,6 +2718,11 @@ static NSString *nfb_buildDiagnosticReport(void) {
     NSUInteger buttonIndex = winSubviews ? [winSubviews indexOfObject:gStreamButton] : NSNotFound;
     [s appendFormat:@"NeoFreeBird port %s (%s) on X %@\n", NFB_VERSION_STRING, NFB_COMMIT_STRING,
         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?"];
+    struct utsname device;
+    uname(&device);
+    CGSize screen = UIScreen.mainScreen.bounds.size;
+    [s appendFormat:@"device %s iOS %@ screen=%.0fx%.0f process=%@\n", device.machine, UIDevice.currentDevice.systemVersion,
+        screen.width, screen.height, NSProcessInfo.processInfo.processName];
     [s appendFormat:@"%@\n", NFBHeatSummary()];
     [s appendFormat:@"%@\n", nfb_healthLine()];
     [s appendFormat:@"%@\n", nfb_netDiagLine()];
@@ -2557,6 +2731,13 @@ static NSString *nfb_buildDiagnosticReport(void) {
         [BHTSettings boolForKey:@"hide_custom_timelines"] ? 1 : 0, [BHTSettings boolForKey:@"nfb_columns_enabled"] ? 1 : 0,
         [[NSUserDefaults standardUserDefaults] stringForKey:@"nfb_columns_host"] ?: @"(default)",
         [BHTSettings boolForKey:@"auto_stream_timeline"] ? 1 : 0, NFBPinnedTimelinesDiag()];
+    NSMutableArray<NSString *> *settingsOn = [NSMutableArray array];
+    for (NSString *key in @[@"hide_grok_create", @"hide_grok_analyze", @"show_account_location", @"reply_in_webview", @"hide_view_count",
+                            @"hide_verified_tweets", @"hide_quote_tweets", @"hide_retweets", @"hide_blocked_retweets", @"hide_who_to_follow",
+                            @"hide_videos_for_you", @"hide_quick_compose", @"hide_made_on_x", @"custom_fonts", @"download_voice_messages"]) {
+        if ([BHTSettings boolForKey:key]) [settingsOn addObject:key];
+    }
+    [s appendFormat:@"settingsOn %@\n", settingsOn.count ? [settingsOn componentsJoinedByString:@","] : @"-"];
     [s appendFormat:@"prevSession %@\n", gNFBPrevSessionVerdict ?: @"(none recorded: first launch with the black box)"];
     NSString *diagPage = nfb_currentSelectedTabPage();
     [s appendFormat:@"streaming on=%d interval=%ld page=%@ via=%s tabCtl=%d button=%d/%d alpha=%.2f window=%d f=(%.0f,%.0f,%.0f,%.0f) z=%ld/%lu\n",
@@ -2652,7 +2833,6 @@ static NSString *nfb_buildDiagnosticReport(void) {
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    nfb_installCrashLoggerOnce();
     nfb_installButton(self.view.window);
 }
 
@@ -2685,6 +2865,45 @@ static NSString *nfb_buildDiagnosticReport(void) {
     gActiveItemsVC = self;
     nfb_noteActiveTimelineScroll(scrollView);
     nfb_visibilityForScroll(scrollView);
+}
+
+%end
+
+// The way into a tweet, for the black box (nfb_noteScreenStep).
+%hook TFNItemsDataViewController
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    nfb_noteScreenStep(@"tapRow", self);
+    %orig;
+}
+
+%end
+
+%hook UINavigationController
+
+- (void)pushViewController:(UIViewController *)controller animated:(BOOL)animated {
+    nfb_noteScreenStep(@"push", controller);
+    %orig;
+}
+
+- (void)setViewControllers:(NSArray *)controllers animated:(BOOL)animated {
+    nfb_noteScreenStep(@"setStack", controllers.lastObject);
+    %orig;
+}
+
+%end
+
+%hook T1ConversationContainerViewController
+
+- (void)viewDidLoad {
+    nfb_noteScreenStep(@"conversationLoad", self);
+    %orig;
+    nfb_noteScreenStep(@"conversationLoaded", self);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    nfb_noteScreenStep(@"conversationAppeared", self);
 }
 
 %end

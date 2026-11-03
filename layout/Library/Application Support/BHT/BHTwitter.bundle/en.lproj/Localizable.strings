@@ -549,3 +549,4 @@
 "NFB_AGO_SECONDS" = "%lds ago";
 "NFB_AGO_MINUTES" = "%ld min ago";
 "NFB_AGO_HOURS" = "%ld h ago";
+"NFB_VOICE_PLAY_FIRST" = "Play this voice message once, then long-press it again to save it.";

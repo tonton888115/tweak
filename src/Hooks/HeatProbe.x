@@ -14,14 +14,18 @@
 //  When one thread burns more than a third of a core, a few stack samples of
 //  it follow as image+offset frames, symbolised offline against the IPA.
 //  A main thread pass that runs for more than 0.5 s ("stall main" line) gets
-//  its stack sampled while it is still stuck.
+//  its stack sampled while it is still stuck, and iOS's own crash and hang
+//  reports (MetricKit) are kept for the diagnostics file.
 //
 
 #import "HookHelpers.h"
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <os/lock.h>
 #include <pthread.h>
+#include <unistd.h>
 
 void NFBLogEvent(NSString* msg);  // Streaming.x
 
@@ -257,6 +261,9 @@ static NSString* NFBHeatDescribeFrames(const uintptr_t* frames, int count) {
 
 // A main run loop pass still running after 0.5 s is a freeze the user feels. Its stack is taken
 // while it is stuck (again at 2 s if it lasts), at most 6 lines a minute. Sampler thread only.
+// The line goes straight to a file as well: a freeze that never ends never reaches the main
+// thread's log, and neither does the app's black box.
+static char NFBHeatStallPathC[1024];
 static uint64_t NFBHeatStallPass;
 static int NFBHeatStallPassSamples;
 static uint64_t NFBHeatStallMinute;
@@ -284,9 +291,102 @@ static void NFBHeatCheckStall(void) {
     int frameCount = NFBHeatCaptureStack(NFBHeatMainThread, frames, 40);
     NSString* line = [NSString stringWithFormat:@"stall main %.0fms (still running)%@", busy / 1e6,
                                                 frameCount > 0 ? NFBHeatDescribeFrames(frames, frameCount) : @" | no stack"];
+    if (NFBHeatStallPathC[0]) {
+        int fd = open(NFBHeatStallPathC, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (fd >= 0) {
+            NSString* stamped = [NSString stringWithFormat:@"%@ %@\n", NSDate.date, line];
+            const char* text = stamped.UTF8String;
+            if (text) write(fd, text, strlen(text));
+            close(fd);
+        }
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         NFBLogEvent(line);
     });
+}
+
+static NSString* NFBHeatDocumentsFile(NSString* name) {
+    NSString* dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
+    return [dir stringByAppendingPathComponent:name];
+}
+
+// This session's stalls and the previous session's (a freeze ends a session).
+static void NFBHeatStartStallFile(void) {
+    NSString* path = NFBHeatDocumentsFile(@"nfb_stalls.txt");
+    NSString* previous = NFBHeatDocumentsFile(@"nfb_stalls_prev.txt");
+    NSFileManager* fm = NSFileManager.defaultManager;
+    if ([fm fileExistsAtPath:path]) {
+        [fm removeItemAtPath:previous error:nil];
+        [fm moveItemAtPath:path toPath:previous error:nil];
+    }
+    const char* c = path.fileSystemRepresentation;
+    if (c) strlcpy(NFBHeatStallPathC, c, sizeof(NFBHeatStallPathC));
+}
+
+NSString* NFBHeatStallRecords(void) {
+    NSMutableString* records = [NSMutableString string];
+    for (NSArray<NSString*>* file in @[@[@"previous session", @"nfb_stalls_prev.txt"], @[@"this session", @"nfb_stalls.txt"]]) {
+        NSString* text = [NSString stringWithContentsOfFile:NFBHeatDocumentsFile(file[1]) encoding:NSUTF8StringEncoding error:nil];
+        if (!text.length) continue;
+        if (text.length > 30000) text = [text substringFromIndex:text.length - 30000];
+        [records appendFormat:@"--- %@\n%@", file[0], text];
+    }
+    return records.length ? records : nil;
+}
+
+// MARK: - iOS's own reports
+
+// MetricKit hands the app iOS's crash and hang reports for this process at a later launch, with the
+// call stacks; they also cover crashes no handler in the process gets to see. Crashes and hangs are
+// kept raw in a file for the diagnostics, newest last.
+static void NFBHeatSaveDiagnosticPayloads(NSArray* payloads, BOOL replace) {
+    NSString* path = NFBHeatDocumentsFile(@"nfb_metrickit.txt");
+    NSMutableData* out = replace ? [NSMutableData data] : ([NSMutableData dataWithContentsOfFile:path] ?: [NSMutableData data]);
+    NSUInteger kept = 0;
+    for (id payload in payloads) {
+        NSArray* crashes = [payload respondsToSelector:@selector(crashDiagnostics)] ? [payload performSelector:@selector(crashDiagnostics)] : nil;
+        NSArray* hangs = [payload respondsToSelector:@selector(hangDiagnostics)] ? [payload performSelector:@selector(hangDiagnostics)] : nil;
+        if (!crashes.count && !hangs.count) continue;
+        NSData* json = [payload respondsToSelector:@selector(JSONRepresentation)] ? [payload performSelector:@selector(JSONRepresentation)] : nil;
+        if (![json isKindOfClass:NSData.class] || !json.length) continue;
+        [out appendData:json];
+        [out appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+        kept++;
+    }
+    if (!kept) return;
+    const NSUInteger limit = 400000;
+    NSData* tail = out.length > limit ? [out subdataWithRange:NSMakeRange(out.length - limit, limit)] : out;
+    [tail writeToFile:path atomically:YES];
+}
+
+@interface NFBHeatMetricSubscriber : NSObject
+- (void)didReceiveDiagnosticPayloads:(NSArray*)payloads;
+@end
+
+@implementation NFBHeatMetricSubscriber
+- (void)didReceiveDiagnosticPayloads:(NSArray*)payloads {
+    NFBHeatSaveDiagnosticPayloads(payloads, NO);
+}
+@end
+
+static void NFBHeatInstallMetricKit(void) {
+    Class manager = NSClassFromString(@"MXMetricManager");
+    if (![manager respondsToSelector:@selector(sharedManager)]) return;
+    id shared = [manager performSelector:@selector(sharedManager)];
+    static NFBHeatMetricSubscriber* subscriber;
+    subscriber = [NFBHeatMetricSubscriber new];
+    Protocol* protocol = objc_getProtocol("MXMetricManagerSubscriber");
+    if (protocol) class_addProtocol(NFBHeatMetricSubscriber.class, protocol);
+    if ([shared respondsToSelector:@selector(addSubscriber:)]) [shared performSelector:@selector(addSubscriber:) withObject:subscriber];
+    if ([shared respondsToSelector:@selector(pastDiagnosticPayloads)]) {
+        NSArray* past = [shared performSelector:@selector(pastDiagnosticPayloads)];
+        if ([past isKindOfClass:NSArray.class]) NFBHeatSaveDiagnosticPayloads(past, YES);
+    }
+}
+
+NSString* NFBHeatMetricKitRecords(void) {
+    NSData* data = [NSData dataWithContentsOfFile:NFBHeatDocumentsFile(@"nfb_metrickit.txt")];
+    return data.length ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
 }
 
 static NSMutableDictionary<NSNumber*, NSNumber*>* NFBHeatLastThreadSeconds;  // sampler thread only
@@ -467,6 +567,11 @@ NSString* NFBHeatSummary(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NFBHeatMainThread = mach_thread_self();
         NFBHeatInstallRunLoopObservers();
+        NFBHeatStartStallFile();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NFBHeatInstallMetricKit();
+        });
         NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
         [center addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil
                              queue:nil usingBlock:^(__unused NSNotification* note) {

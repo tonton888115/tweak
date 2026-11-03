@@ -3,10 +3,39 @@
 //  NeoFreeBird
 //
 
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import "HookHelpers.h"
 
 static NSURL* nfbLastCapturedVoiceURL = nil;
+static BOOL nfbLastCapturedVoiceClaimed = NO;          // it is the audio of the bubble tapped just before
+static __weak UIView* nfbVoiceBubbleAwaitingAudio = nil;  // its play control was just tapped
+static CFTimeInterval nfbVoiceBubbleTappedAt = 0.0;
+static const void* kVoiceBubbleURLKey = &kVoiceBubbleURLKey;
+static const void* kVoiceBubbleMessageKey = &kVoiceBubbleMessageKey;
+
+// Bubbles are reused while scrolling. messageID (a Swift String's 16 raw bytes, only ever compared)
+// tells whether the audio remembered on a bubble is still its message's.
+static NSData* VoiceBubbleMessageFingerprint(UIView* bubble) {
+    Ivar ivar = class_getInstanceVariable(object_getClass(bubble), "messageID");
+    if (!ivar) {
+        return nil;
+    }
+    const uint8_t* bytes = (const uint8_t*)(__bridge void*)bubble + ivar_getOffset(ivar);
+    return [NSData dataWithBytes:bytes length:16];
+}
+
+// A tap on a bubble's play control is followed by X opening that bubble's audio. Without a tap the
+// audio is only known as "the last one", which is no answer once it belongs to another bubble.
+static NSURL* VoiceURLForBubble(UIView* bubble) {
+    NSURL* own = objc_getAssociatedObject(bubble, kVoiceBubbleURLKey);
+    NSData* ownMessage = objc_getAssociatedObject(bubble, kVoiceBubbleMessageKey);
+    NSData* message = VoiceBubbleMessageFingerprint(bubble);
+    if (own && (ownMessage == message || [ownMessage isEqual:message])) {
+        return own;
+    }
+    return nfbLastCapturedVoiceClaimed ? nil : nfbLastCapturedVoiceURL;
+}
 
 static BOOL IsVoiceMediaURL(NSURL* url) {
     if (url == nil) {
@@ -29,9 +58,24 @@ static void CaptureVoiceURL(NSURL* url, NSString* source) {
     }
     BOOL kept = IsVoiceMediaURL(url);
     NSLog(@"[NFB] voice capture (%@) %@: %@", source, kept ? @"kept" : @"ignored", url);
-    if (kept) {
-        nfbLastCapturedVoiceURL = url;
+    if (!kept) {
+        return;
     }
+    // AVFoundation objects are built on any thread.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (![url isEqual:nfbLastCapturedVoiceURL]) {
+            nfbLastCapturedVoiceClaimed = NO;
+        }
+        nfbLastCapturedVoiceURL = url;
+        UIView* bubble = nfbVoiceBubbleAwaitingAudio;
+        if (bubble && CACurrentMediaTime() - nfbVoiceBubbleTappedAt < 10.0) {
+            objc_setAssociatedObject(bubble, kVoiceBubbleURLKey, url, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(bubble, kVoiceBubbleMessageKey, VoiceBubbleMessageFingerprint(bubble),
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            nfbLastCapturedVoiceClaimed = YES;
+            nfbVoiceBubbleAwaitingAudio = nil;
+        }
+    });
 }
 
 %hook AVURLAsset
@@ -206,6 +250,17 @@ static void SetVoiceDownloadLongPressRecognizer(UIView* view,
     SetVoiceDownloadLongPressRecognizer(self, longPress);
 }
 
+// The bubble's only control is its play/pause button.
+- (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
+    UIView* hit = %orig;
+    if (event.type == UIEventTypeTouches && [hit isKindOfClass:[UIControl class]] &&
+        [BHTSettings boolForKey:@"download_voice_messages"]) {
+        nfbVoiceBubbleAwaitingAudio = self;
+        nfbVoiceBubbleTappedAt = CACurrentMediaTime();
+    }
+    return hit;
+}
+
 // The view overrides -gestureRecognizerShouldBegin: for its own waveform pan
 // gesture, and UIKit routes that override through for *every* recognizer
 // attached to the view -- ours included. Without this passthrough the long
@@ -223,8 +278,16 @@ static void SetVoiceDownloadLongPressRecognizer(UIView* view,
         return;
     }
 
-    NSURL* voiceURL = nfbLastCapturedVoiceURL;
+    NSURL* voiceURL = VoiceURLForBubble(self);
     if (voiceURL == nil) {
+        UIAlertController* hint = [UIAlertController
+            alertControllerWithTitle:nil
+                             message:[[BHTBundle sharedBundle] localizedStringForKey:@"NFB_VOICE_PLAY_FIRST"]
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [hint addAction:[UIAlertAction actionWithTitle:[[BHTBundle sharedBundle] localizedTwitterStringForKey:@"OK_ACTION_LABEL"]
+                                                 style:UIAlertActionStyleCancel
+                                               handler:nil]];
+        [topMostController() presentViewController:hint animated:YES completion:nil];
         return;
     }
 

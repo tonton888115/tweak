@@ -288,8 +288,8 @@
         for (UIView* subview in self.subviews) {
             subview.hidden = YES;
         }
+        // Not -layoutSubviews directly: this runs while UIKit walks the subviews into the window.
         [self.superview setNeedsLayout];
-        [self.superview layoutSubviews];
     }
 }
 %end
